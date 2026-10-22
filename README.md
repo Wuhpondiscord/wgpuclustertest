@@ -38,7 +38,7 @@ In another terminal, run `cargo run --manifest-path server/Cargo.toml`. The Vite
 
 - A browser creates an anonymous Mesh identity key and stores it in local storage. The server stores only its SHA-256 pseudonymous ID. Clearing local site data loses that identity; there is no email/password login or account recovery yet.
 - Users can create multiple clusters, invite others with seven-day bearer links, join clusters, rename/delete their own clusters, leave clusters they joined, view members, remove members, and revoke invite links as the owner.
-- A member can register a node and receive a private WebSocket URL/token. A node agent connects outbound to `/api/nodes/connect`; the coordinator tracks online state and sends pause/resume controls. A sample Rust or browser node agent still needs to be built.
+- A member can register a node. The current browser tab connects it over an outbound WebSocket, sends heartbeats, and receives pause/resume controls. Keep that tab open to keep the browser node online. The returned private WebSocket URL/token can also be used by a future native worker agent.
 - State is written as JSON to `MESH_DATA_FILE` (default `/tmp/mesh-state.json`). On Hugging Face that path is ephemeral. Attach durable storage and set `MESH_DATA_FILE` to its mount before using this with real clusters.
 
 The identity and node connection URLs are bearer credentials. Do not share screenshots or logs containing them. This prototype does not yet have a full security review, rate limits, or login recovery.
@@ -54,3 +54,4 @@ Good first workloads are independent batches with small inputs and outputs. Tigh
 Peer-to-peer WebRTC could move larger data directly between nodes, but still needs a rendezvous/signaling service and often a TURN fallback. Keep the Space authoritative for identity, membership, job leases, validation, and credits. Worker nodes should connect outbound to it, avoiding inbound ports and peer-to-peer trust for control. For larger scale, move job queues/identity and durable state to managed services; the Space should remain a replaceable web/control frontend.
 
 Hugging Face’s current overview describes CPU Basic as 2 vCPU/16 GB with 50 GB non-persistent disk and says free Spaces sleep when unused; its storage docs say restarts discard ephemeral files unless durable storage is attached. That is suitable for a prototype control plane, not a reliable always-on scheduler or data relay. See [Space limits](https://huggingface.co/docs/hub/en/spaces-overview) and [Space storage](https://huggingface.co/docs/hub/en/spaces-storage).
+
