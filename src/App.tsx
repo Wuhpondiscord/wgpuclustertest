@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Activity, ArrowRight, Boxes, Check, Copy, Cpu, Link2, LogOut, Pause, Play, Plus, RefreshCw, Settings, Shield, Trash2, Users, X } from 'lucide-react'
 
 type Cluster = { id: string; name: string; role: 'owner' | 'member'; members: number; nodes: number; online_nodes: number }
@@ -33,6 +33,7 @@ function App() {
   const [invite, setInvite] = useState<InvitePreview | null>(null)
   const [joinToken, setJoinToken] = useState(new URLSearchParams(window.location.search).get('invite') ?? '')
   const [nodeCredentials, setNodeCredentials] = useState<{ name: string; url: string } | null>(null)
+  const sockets = useRef(new Map<string, WebSocket>())
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -72,6 +73,8 @@ function App() {
     return () => window.clearInterval(timer)
   }, [activeId])
 
+  useEffect(() => () => { sockets.current.forEach(socket => socket.close()); sockets.current.clear() }, [])
+
   async function run(action: () => Promise<void>) {
     setError(''); setNotice('')
     try { await action() }
@@ -106,10 +109,28 @@ function App() {
     await run(async () => {
       const created = await api<NodeCreated>(`/api/clusters/${active.id}/nodes`, { method: 'POST', body: JSON.stringify({ name }) })
       const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      setNodeCredentials({ name, url: `${wsProto}//${location.host}/api/nodes/connect?token=${created.token}` })
+      const url = `${wsProto}//${location.host}/api/nodes/connect?token=${created.token}`
+      setNodeCredentials({ name, url })
+      connectBrowserNode(created.node.id, url)
       await refreshClusters(active.id)
     })
   }
+  function connectBrowserNode(id: string, url: string) {
+    const socket = new WebSocket(url)
+    sockets.current.set(id, socket)
+    let heartbeat = 0
+    socket.addEventListener('open', () => {
+      setNotice('This browser is connected as a node and sending heartbeats')
+      heartbeat = window.setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send('{"type":"heartbeat"}') }, 10000)
+      void refreshClusters(activeId)
+    })
+    socket.addEventListener('message', event => {
+      try { const message = JSON.parse(String(event.data)) as { type?: string; paused?: boolean }; if (message.type === 'control') setNotice(message.paused ? `${nameForNode(id)} paused` : `${nameForNode(id)} resumed`) } catch { /* Ignore unknown worker messages. */ }
+    })
+    socket.addEventListener('close', () => { window.clearInterval(heartbeat); if (sockets.current.get(id) === socket) { sockets.current.delete(id); void refreshClusters(activeId) } })
+    socket.addEventListener('error', () => setError('Could not connect the node WebSocket. Check that the coordinator is running.'))
+  }
+  function nameForNode(id: string) { return nodes.find(node => node.id === id)?.name ?? 'Node' }
   async function toggleNode(node: Node) {
     await run(async () => { await api(`/api/nodes/${node.id}/${node.paused ? 'resume' : 'pause'}`, { method: 'POST' }); await refreshClusters(active.id) })
   }

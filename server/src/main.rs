@@ -338,6 +338,12 @@ async fn main() {
 mod tests {
     use super::*;
 
+    fn test_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(IDENTITY_HEADER, token.parse().unwrap());
+        headers
+    }
+
     #[test]
     fn cluster_names_are_trimmed_and_bounded() {
         assert_eq!(cluster_name("  Research pool  ").as_deref(), Some("Research pool"));
@@ -362,5 +368,26 @@ mod tests {
         let second = Cluster { id: Uuid::new_v4(), name: "two".into(), owner_id: "user-b".into(), members };
         assert!(first.members.contains_key("user-a") && second.members.contains_key("user-a"));
     }
-}
 
+    #[tokio::test]
+    async fn owner_invites_member_and_can_revoke_invite() {
+        let file = std::env::temp_dir().join(format!("mesh-test-{}.json", Uuid::new_v4()));
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), data_file: Arc::new(file.clone()) };
+        let owner = test_headers("owner-identity-token-01234567890123456789");
+        let guest = test_headers("guest-identity-token-01234567890123456789");
+
+        let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "  Lab  ".into() })).await.unwrap();
+        assert_eq!(cluster.name, "Lab");
+        let (_, Json(invite)) = create_invite(State(state.clone()), Path(cluster.id), owner.clone()).await.unwrap();
+        let Json(preview) = preview_invite(State(state.clone()), Path(invite.token.clone())).await.unwrap();
+        assert_eq!(preview.cluster_id, cluster.id);
+        let Json(joined) = join_invite(State(state.clone()), guest.clone(), Json(JoinInvite { token: invite.token.clone() })).await.unwrap();
+        assert_eq!(joined.members, 2);
+        let Json(guest_clusters) = list_clusters(State(state.clone()), guest).await.unwrap();
+        assert_eq!(guest_clusters.len(), 1);
+        assert!(delete_cluster(State(state.clone()), Path(cluster.id), test_headers("stranger-identity-token-01234567890123456789")).await.is_err());
+        assert_eq!(revoke_invite(State(state.clone()), Path((cluster.id, invite.token.clone())), owner).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(preview_invite(State(state), Path(invite.token)).await.is_err());
+        let _ = std::fs::remove_file(file);
+    }
+}
