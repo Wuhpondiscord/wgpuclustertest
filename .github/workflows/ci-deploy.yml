@@ -1,0 +1,87 @@
+name: Test and deploy Space
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+
+  backend:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --manifest-path server/Cargo.toml
+
+  container:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: mesh-cluster:ci
+
+  deploy:
+    name: Deploy Hugging Face Docker Space
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [frontend, backend, container]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Upload tested source to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_REPO: ${{ secrets.repo }}
+        run: |
+          python -m pip install --disable-pip-version-check 'huggingface_hub>=0.32,<2'
+          python - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+          from huggingface_hub import HfApi
+
+          token = os.environ["HF_TOKEN"]
+          raw_repo = os.environ["HF_SPACE_REPO"].strip().rstrip("/")
+          path = urlsplit(raw_repo).path.strip("/") if "://" in raw_repo else raw_repo
+          parts = path.split("/")
+          if parts and parts[0] == "spaces":
+              parts = parts[1:]
+          if len(parts) != 2 or not all(parts):
+              raise SystemExit("The repo secret must be a Space URL or owner/name, such as https://huggingface.co/spaces/owner/name")
+
+          repo_id = "/".join(parts)
+          api = HfApi(token=token)
+          api.upload_folder(
+              folder_path=".",
+              repo_id=repo_id,
+              repo_type="space",
+              commit_message=f"Deploy GitHub {os.environ['GITHUB_SHA'][:7]}",
+              ignore_patterns=[".git/**", ".github/**", "node_modules/**", "server/target/**", "target/**", "work/**", "outputs/**"],
+          )
+          print(f"Deployed tested source to https://huggingface.co/spaces/{repo_id}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"## Hugging Face Space deployment\n\nUploaded tested commit `{os.environ['GITHUB_SHA']}` to [https://huggingface.co/spaces/{repo_id}](https://huggingface.co/spaces/{repo_id}). The Space now builds the Dockerfile.\n")
+          PY
