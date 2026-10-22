@@ -6,7 +6,7 @@ COPY index.html tsconfig.json tsconfig.app.json vite.config.ts ./
 COPY src ./src
 RUN npm run build
 
-FROM rust:1.85-slim AS backend
+FROM rust:1.89-slim AS backend
 WORKDIR /app
 COPY server/Cargo.toml ./Cargo.toml
 COPY server/src ./src
