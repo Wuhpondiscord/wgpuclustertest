@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const NODE_PING_INTERVAL_SECS: u64 = 15;
+const NODE_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,7 +46,7 @@ struct Node {
     last_seen: Option<u64>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct Store {
     clusters: HashMap<Uuid, Cluster>,
     invites: HashMap<String, Invite>,
@@ -59,6 +61,7 @@ struct AppState {
     data_file: Arc<PathBuf>,
     github: Option<Arc<GitHubStorage>>,
     github_file_sha: Arc<Mutex<Option<String>>>,
+    node_connections: Arc<Mutex<HashMap<Uuid, Uuid>>>,
 }
 
 #[derive(Deserialize)] struct CreateCluster { name: String }
@@ -235,8 +238,13 @@ async fn delete_cluster(State(state): State<AppState>, Path(id): Path<Uuid>, hea
     let user = identity(&headers)?;
     let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
     require_owner(&store, id, &user)?;
-    store.clusters.remove(&id); store.nodes.retain(|_, node| node.cluster_id != id); store.invites.retain(|_, inv| inv.cluster_id != id);
-    persist(&state, &store)?;
+    let removed_nodes: Vec<Uuid> = store.nodes.values().filter(|node| node.cluster_id == id).map(|node| node.id).collect();
+    let mut next = store.clone();
+    next.clusters.remove(&id); next.nodes.retain(|_, node| node.cluster_id != id); next.invites.retain(|_, inv| inv.cluster_id != id);
+    persist(&state, &next)?;
+    *store = next;
+    drop(store);
+    if let Ok(mut connections) = state.node_connections.lock() { for node_id in removed_nodes { connections.remove(&node_id); } }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn create_invite(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<(StatusCode, Json<InviteCreated>)> {
@@ -362,36 +370,69 @@ async fn node_socket(State(state): State<AppState>, Query(query): Query<NodeSock
         let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
         store.nodes.values().find(|n| n.token_hash == secret_hash(&query.token)).map(|n| n.id).ok_or(ApiError(StatusCode::UNAUTHORIZED, "Invalid node token".into()))?
     };
-    Ok(ws.on_upgrade(move |socket| run_node_socket(socket, state, node_id)))
+    let session_id = Uuid::new_v4();
+    Ok(ws.on_upgrade(move |socket| run_node_socket(socket, state, node_id, session_id)))
 }
-async fn run_node_socket(mut socket: WebSocket, state: AppState, id: Uuid) {
-    if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.online = true; node.last_seen = Some(now()); let _ = persist(&state, &store); } }
-    let mut tick = interval(Duration::from_secs(15));
+fn register_node_connection(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
+    if let Ok(mut connections) = state.node_connections.lock() { connections.insert(id, session_id); } else { return false; }
+    let registered = if let Ok(mut store) = state.store.lock() {
+        if let Some(node) = store.nodes.get_mut(&id) { node.online = true; node.last_seen = Some(now()); true } else { false }
+    } else { false };
+    if !registered { if let Ok(mut connections) = state.node_connections.lock() { if connections.get(&id) == Some(&session_id) { connections.remove(&id); } } }
+    registered
+}
+fn is_current_node_connection(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
+    state.node_connections.lock().map(|connections| connections.get(&id) == Some(&session_id)).unwrap_or(false)
+}
+fn update_node_heartbeat(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
+    if !is_current_node_connection(state, id, session_id) { return false; }
+    if let Ok(mut store) = state.store.lock() {
+        if let Some(node) = store.nodes.get_mut(&id) { node.online = true; node.last_seen = Some(now()); return true; }
+    }
+    false
+}
+fn disconnect_node(state: &AppState, id: Uuid, session_id: Uuid) {
+    let removed = if let Ok(mut connections) = state.node_connections.lock() {
+        if connections.get(&id) == Some(&session_id) { connections.remove(&id); true } else { false }
+    } else { false };
+    if removed { if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); } } }
+}
+async fn run_node_socket(mut socket: WebSocket, state: AppState, id: Uuid, session_id: Uuid) {
+    if !register_node_connection(&state, id, session_id) { return; }
+    let mut tick = interval(Duration::from_secs(NODE_PING_INTERVAL_SECS));
+    tick.tick().await;
+    let mut last_paused = None;
     loop {
         tokio::select! {
             message = socket.next() => match message {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(Message::Ping(bytes))) => {
-                    if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.last_seen = Some(now()); } }
+                    if !update_node_heartbeat(&state, id, session_id) { break; }
                     if socket.send(Message::Pong(bytes)).await.is_err() { break; }
                 }
                 Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {
-                    if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.last_seen = Some(now()); } }
+                    if !update_node_heartbeat(&state, id, session_id) { break; }
                 }
             },
             _ = tick.tick() => {
-                let paused = state.store.lock().ok().and_then(|s| s.nodes.get(&id).map(|n| n.paused));
-                match paused {
-                    Some(value) => {
-                        let message = serde_json::json!({"type": "control", "paused": value}).to_string();
-                        if socket.send(Message::Text(message)).await.is_err() { break; }
-                    },
+                if !is_current_node_connection(&state, id, session_id) { break; }
+                let status = state.store.lock().ok().and_then(|store| store.nodes.get(&id).map(|node| (node.paused, node.last_seen)));
+                match status {
+                    Some((paused, last_seen)) => {
+                        if now().saturating_sub(last_seen.unwrap_or_default()) > NODE_HEARTBEAT_TIMEOUT_SECS { break; }
+                        if socket.send(Message::Ping(Vec::new())).await.is_err() { break; }
+                        if last_paused != Some(paused) {
+                            let message = serde_json::json!({"type": "control", "paused": paused}).to_string();
+                            if socket.send(Message::Text(message)).await.is_err() { break; }
+                            last_paused = Some(paused);
+                        }
+                    }
                     None => break,
                 }
             }
         }
     }
-    if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); let _ = persist(&state, &store); } }
+    disconnect_node(&state, id, session_id);
 }
 
 #[tokio::main]
@@ -413,7 +454,7 @@ async fn main() {
         (store, None)
     };
     for node in store.nodes.values_mut() { node.online = false; }
-    let state = AppState { store: Arc::new(Mutex::new(store)), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)) };
+    let state = AppState { store: Arc::new(Mutex::new(store)), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/clusters", get(list_clusters).post(create_cluster))
@@ -483,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn owner_invites_member_and_can_revoke_invite() {
         let file = std::env::temp_dir().join(format!("mesh-test-{}.json", Uuid::new_v4()));
-        let state = AppState { store: Arc::new(Mutex::new(Store::default())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)) };
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
         let owner = test_headers("owner-identity-token-01234567890123456789");
         let guest = test_headers("guest-identity-token-01234567890123456789");
 
@@ -502,6 +543,63 @@ mod tests {
         assert_eq!(revoke_invite(State(state.clone()), Path((cluster.id, secret_hash(&invite.token))), owner).await.unwrap(), StatusCode::NO_CONTENT);
         assert!(preview_invite(State(state), Path(invite.token)).await.is_err());
         let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn deleting_cluster_removes_its_nodes_and_invites() {
+        let file = std::env::temp_dir().join(format!("mesh-delete-test-{}.json", Uuid::new_v4()));
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let owner = test_headers("delete-owner-identity-token-012345678901234567");
+        let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "Removable".into() })).await.unwrap();
+        let (_, Json(invite)) = create_invite(State(state.clone()), Path(cluster.id), owner.clone()).await.unwrap();
+        let (_, Json(node)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
+
+        assert_eq!(delete_cluster(State(state.clone()), Path(cluster.id), owner).await.unwrap(), StatusCode::NO_CONTENT);
+        let store = state.store.lock().unwrap();
+        assert!(!store.clusters.contains_key(&cluster.id));
+        assert!(!store.nodes.contains_key(&node.node.id));
+        assert!(!store.invites.contains_key(&secret_hash(&invite.token)));
+        drop(store);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn failed_cluster_delete_keeps_cluster_in_memory() {
+        let blocker = std::env::temp_dir().join(format!("mesh-delete-blocker-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let owner = "delete-owner-identity-token-012345678901234567";
+        let cluster_id = Uuid::new_v4();
+        let mut members = HashMap::new();
+        members.insert(secret_hash(owner), Role::Owner);
+        let mut store = Store::default();
+        store.clusters.insert(cluster_id, Cluster { id: cluster_id, name: "Keep me".into(), owner_id: secret_hash(owner), members });
+        let state = AppState { store: Arc::new(Mutex::new(store)), data_file: Arc::new(blocker.join("state.json")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+
+        assert!(delete_cluster(State(state.clone()), Path(cluster_id), test_headers(owner)).await.is_err());
+        assert!(state.store.lock().unwrap().clusters.contains_key(&cluster_id));
+        let _ = std::fs::remove_file(blocker);
+    }
+
+    #[test]
+    fn replaced_node_connection_cannot_mark_new_connection_offline() {
+        let node_id = Uuid::new_v4();
+        let cluster_id = Uuid::new_v4();
+        let mut members = HashMap::new();
+        members.insert("owner".to_owned(), Role::Owner);
+        let mut store = Store::default();
+        store.clusters.insert(cluster_id, Cluster { id: cluster_id, name: "test".into(), owner_id: "owner".into(), members });
+        store.nodes.insert(node_id, Node { id: node_id, cluster_id, name: "node".into(), owner_id: "owner".into(), token_hash: "hash".into(), paused: false, online: false, last_seen: None });
+        let state = AppState { store: Arc::new(Mutex::new(store)), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let old_session = Uuid::new_v4();
+        let new_session = Uuid::new_v4();
+
+        assert!(register_node_connection(&state, node_id, old_session));
+        assert!(register_node_connection(&state, node_id, new_session));
+        disconnect_node(&state, node_id, old_session);
+        assert!(is_current_node_connection(&state, node_id, new_session));
+        assert!(state.store.lock().unwrap().nodes.get(&node_id).unwrap().online);
+        disconnect_node(&state, node_id, new_session);
+        assert!(!state.store.lock().unwrap().nodes.get(&node_id).unwrap().online);
     }
 }
 
