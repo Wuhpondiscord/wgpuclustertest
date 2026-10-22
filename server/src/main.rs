@@ -19,6 +19,7 @@ const IDENTITY_HEADER: &str = "x-mesh-identity";
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const NODE_PING_INTERVAL_SECS: u64 = 15;
 const NODE_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
+const MAX_STORAGE_CONFLICT_RETRIES: usize = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,6 +96,10 @@ impl IntoResponse for ApiError {
 }
 type ApiResult<T> = Result<T, ApiError>;
 
+fn should_retry_storage_conflict(error: &ApiError, attempt: usize, github_configured: bool) -> bool {
+    github_configured && error.0 == StatusCode::CONFLICT && attempt < MAX_STORAGE_CONFLICT_RETRIES
+}
+
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 fn identity(headers: &HeaderMap) -> ApiResult<String> {
     let id = headers.get(IDENTITY_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("").trim();
@@ -149,11 +154,12 @@ fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
             .send_json(&body)
             .map_err(|error| {
                 let message = match error {
-                    ureq::Error::Status(409, _) | ureq::Error::Status(422, _) => "Cluster state changed in GitHub storage. Refresh and retry the operation.",
+                    ureq::Error::Status(409, _) | ureq::Error::Status(422, _) => "Cluster state revision conflict",
                     ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => "GitHub rejected the storage credentials or repository permissions.",
                     _ => "Could not save cluster state to the private GitHub storage repository. Check connectivity and retry.",
                 };
-                ApiError(StatusCode::SERVICE_UNAVAILABLE, message.into())
+                let status = if message == "Cluster state revision conflict" { StatusCode::CONFLICT } else { StatusCode::SERVICE_UNAVAILABLE };
+                ApiError(status, message.into())
             })?;
         let result: serde_json::Value = response.into_json().map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "GitHub returned an invalid storage response".into()))?;
         *file_sha = result.pointer("/content/sha").and_then(serde_json::Value::as_str).map(str::to_owned);
@@ -173,30 +179,58 @@ fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
 async fn mutate_store<R, F>(state: &AppState, change: F) -> ApiResult<R>
 where
     R: Send,
-    F: FnOnce(&mut Store) -> ApiResult<R>,
+    F: FnMut(&mut Store) -> ApiResult<R>,
 {
     let _mutation = state.mutation_lock.lock().await;
     let mut next = state.store.lock()
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?
         .clone();
-    let result = change(&mut next)?;
-    let persist_state = state.clone();
-    let persistence_snapshot = next.clone();
-    tokio::task::spawn_blocking(move || persist(&persist_state, &persistence_snapshot))
-        .await
-        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "Storage worker stopped unexpectedly".into()))??;
-
-    let mut current = state.store.lock()
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    // Heartbeats are runtime-only state. Preserve them when committing a durable snapshot.
-    for (id, node) in next.nodes.iter_mut() {
-        if let Some(runtime_node) = current.nodes.get(id) {
-            node.online = runtime_node.online;
-            node.last_seen = runtime_node.last_seen;
+    let mut change = change;
+    for attempt in 0..=MAX_STORAGE_CONFLICT_RETRIES {
+        let result = change(&mut next)?;
+        let persist_state = state.clone();
+        let persistence_snapshot = next.clone();
+        let persisted = tokio::task::spawn_blocking(move || persist(&persist_state, &persistence_snapshot))
+            .await
+            .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "Storage worker stopped unexpectedly".into()))?;
+        if let Err(error) = persisted {
+            if !should_retry_storage_conflict(&error, attempt, state.github.is_some()) {
+                return Err(error);
+            }
+            let config = state.github.clone().expect("GitHub storage is configured");
+            let (mut latest, latest_sha) = tokio::task::spawn_blocking(move || load_github_store(&config))
+                .await
+                .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "Storage worker stopped unexpectedly".into()))?
+                .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Could not reload the latest GitHub state after a write conflict".into()))?;
+            {
+                let current = state.store.lock()
+                    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
+                for (id, node) in latest.nodes.iter_mut() {
+                    if let Some(runtime_node) = current.nodes.get(id) {
+                        node.online = runtime_node.online;
+                        node.last_seen = runtime_node.last_seen;
+                    }
+                }
+            }
+            *state.github_file_sha.lock()
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Storage unavailable".into()))? = latest_sha;
+            next = latest;
+            continue;
         }
+
+        let mut current = state.store.lock()
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
+        // Heartbeats are runtime-only state. Preserve them when committing a durable snapshot.
+        for (id, node) in next.nodes.iter_mut() {
+            if let Some(runtime_node) = current.nodes.get(id) {
+                node.online = runtime_node.online;
+                node.last_seen = runtime_node.last_seen;
+            }
+        }
+        *current = next;
+        return Ok(result);
     }
-    *current = next;
-    Ok(result)
+    Err(ApiError(StatusCode::CONFLICT, "Cluster state kept changing. Please retry.".into()))
 }
 
 async fn refresh_invite_from_github(state: &AppState, token: &str) -> ApiResult<bool> {
@@ -274,7 +308,7 @@ async fn create_cluster(State(state): State<AppState>, headers: HeaderMap, Json(
     let name = cluster_name(&input.name).ok_or(ApiError(StatusCode::BAD_REQUEST, "Name must be 1–80 characters".into()))?;
     let result = mutate_store(&state, move |store| {
         let mut members = HashMap::new(); members.insert(user.clone(), Role::Owner);
-        let cluster = Cluster { id: Uuid::new_v4(), name, owner_id: user.clone(), members };
+        let cluster = Cluster { id: Uuid::new_v4(), name: name.clone(), owner_id: user.clone(), members };
         store.clusters.insert(cluster.id, cluster.clone());
         Ok(summary(&cluster, store, &user))
     }).await?;
@@ -286,7 +320,7 @@ async fn rename_cluster(State(state): State<AppState>, Path(id): Path<Uuid>, hea
     let result = mutate_store(&state, move |store| {
         require_owner(store, id, &user)?;
         let cluster = store.clusters.get_mut(&id).expect("checked above");
-        cluster.name = name;
+        cluster.name = name.clone();
         let cluster = cluster.clone();
         Ok(summary(&cluster, store, &user))
     }).await?;
@@ -401,10 +435,10 @@ async fn create_node(State(state): State<AppState>, Path(id): Path<Uuid>, header
     let token_for_response = token.clone();
     let result = mutate_store(&state, move |store| {
         require_member(store, id, &user)?;
-        let node = Node { id: node_id, cluster_id: id, name, owner_id: user, token_hash, paused: false, online: false, last_seen: None };
+        let node = Node { id: node_id, cluster_id: id, name: name.clone(), owner_id: user.clone(), token_hash: token_hash.clone(), paused: false, online: false, last_seen: None };
         let node_summary = node_summary(&node);
         store.nodes.insert(node.id, node);
-        Ok(NodeCreated { node: node_summary, token: token_for_response })
+        Ok(NodeCreated { node: node_summary, token: token_for_response.clone() })
     }).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -569,6 +603,17 @@ mod tests {
         assert_eq!(cluster_name("  Research pool  ").as_deref(), Some("Research pool"));
         assert_eq!(cluster_name(" "), None);
         assert_eq!(cluster_name(&"x".repeat(81)), None);
+    }
+
+    #[test]
+    fn github_revision_conflicts_retry_only_with_bounded_attempts() {
+        let conflict = ApiError(StatusCode::CONFLICT, "revision conflict".into());
+        let unavailable = ApiError(StatusCode::SERVICE_UNAVAILABLE, "offline".into());
+        assert!(should_retry_storage_conflict(&conflict, 0, true));
+        assert!(should_retry_storage_conflict(&conflict, MAX_STORAGE_CONFLICT_RETRIES - 1, true));
+        assert!(!should_retry_storage_conflict(&conflict, MAX_STORAGE_CONFLICT_RETRIES, true));
+        assert!(!should_retry_storage_conflict(&conflict, 0, false));
+        assert!(!should_retry_storage_conflict(&unavailable, 0, true));
     }
 
     #[test]
