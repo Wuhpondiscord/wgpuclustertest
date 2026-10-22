@@ -7,6 +7,7 @@ type Member = { id: string; role: 'owner' | 'member' }
 type ActiveInvite = { token: string; expires_at: number }
 type InvitePreview = { cluster_id: string; cluster_name: string; expires_at: number }
 type NodeCreated = { node: Node; token: string }
+type BrowserNodeConnection = { url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean }
 
 function getIdentity() {
   let token = localStorage.getItem('mesh.identity')
@@ -33,7 +34,7 @@ function App() {
   const [invite, setInvite] = useState<InvitePreview | null>(null)
   const [joinToken, setJoinToken] = useState(new URLSearchParams(window.location.search).get('invite') ?? '')
   const [nodeCredentials, setNodeCredentials] = useState<{ name: string; url: string } | null>(null)
-  const sockets = useRef(new Map<string, WebSocket>())
+  const sockets = useRef(new Map<string, BrowserNodeConnection>())
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -73,7 +74,21 @@ function App() {
     return () => window.clearInterval(timer)
   }, [activeId])
 
-  useEffect(() => () => { sockets.current.forEach(socket => socket.close()); sockets.current.clear() }, [])
+  useEffect(() => () => { for (const id of sockets.current.keys()) stopBrowserNode(id) }, [])
+
+  useEffect(() => {
+    const reconnect = () => {
+      for (const [id, connection] of sockets.current) {
+        if (connection.retryTimer !== null) window.clearTimeout(connection.retryTimer)
+        connection.retryTimer = null
+        if (!connection.socket || connection.socket.readyState === WebSocket.CLOSED) openBrowserNode(id, connection)
+      }
+    }
+    const offline = () => setNotice('This device is offline. Its node will reconnect when the network returns.')
+    window.addEventListener('online', reconnect)
+    window.addEventListener('offline', offline)
+    return () => { window.removeEventListener('online', reconnect); window.removeEventListener('offline', offline) }
+  }, [])
 
   async function run(action: () => Promise<void>) {
     setError(''); setNotice('')
@@ -116,19 +131,60 @@ function App() {
     })
   }
   function connectBrowserNode(id: string, url: string) {
-    const socket = new WebSocket(url)
-    sockets.current.set(id, socket)
-    let heartbeat = 0
+    stopBrowserNode(id)
+    const connection: BrowserNodeConnection = { url, socket: null, retryTimer: null, heartbeatTimer: null, stableTimer: null, attempts: 0, stopped: false }
+    sockets.current.set(id, connection)
+    openBrowserNode(id, connection)
+  }
+  function openBrowserNode(id: string, connection: BrowserNodeConnection) {
+    if (connection.stopped || sockets.current.get(id) !== connection || !navigator.onLine) return
+    let socket: WebSocket
+    try { socket = new WebSocket(connection.url) }
+    catch { scheduleBrowserReconnect(id, connection); return }
+    connection.socket = socket
     socket.addEventListener('open', () => {
-      setNotice('This browser is connected as a node and sending heartbeats')
-      heartbeat = window.setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send('{"type":"heartbeat"}') }, 10000)
-      void refreshClusters(activeId)
+      if (connection.stopped || sockets.current.get(id) !== connection) { socket.close(); return }
+      setNotice(`${nameForNode(id)} connected`)
+      if (connection.stableTimer !== null) window.clearTimeout(connection.stableTimer)
+      connection.stableTimer = window.setTimeout(() => { connection.attempts = 0; connection.stableTimer = null }, 60000)
+      connection.heartbeatTimer = window.setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send('{"type":"heartbeat"}') }, 15000)
+      void refreshClusters(activeId).catch(() => undefined)
     })
     socket.addEventListener('message', event => {
       try { const message = JSON.parse(String(event.data)) as { type?: string; paused?: boolean }; if (message.type === 'control') setNotice(message.paused ? `${nameForNode(id)} paused` : `${nameForNode(id)} resumed`) } catch { /* Ignore unknown worker messages. */ }
     })
-    socket.addEventListener('close', () => { window.clearInterval(heartbeat); if (sockets.current.get(id) === socket) { sockets.current.delete(id); void refreshClusters(activeId) } })
-    socket.addEventListener('error', () => setError('Could not connect the node WebSocket. Check that the coordinator is running.'))
+    socket.addEventListener('close', () => {
+      if (connection.heartbeatTimer !== null) window.clearInterval(connection.heartbeatTimer)
+      if (connection.stableTimer !== null) window.clearTimeout(connection.stableTimer)
+      connection.heartbeatTimer = null
+      connection.stableTimer = null
+      if (connection.socket === socket) connection.socket = null
+      if (connection.stopped || sockets.current.get(id) !== connection) return
+      setNotice(`${nameForNode(id)} disconnected; retrying automatically`)
+      void refreshClusters(activeId).catch(() => undefined)
+      scheduleBrowserReconnect(id, connection)
+    })
+    socket.addEventListener('error', () => socket.close())
+  }
+  function scheduleBrowserReconnect(id: string, connection: BrowserNodeConnection) {
+    if (connection.stopped || sockets.current.get(id) !== connection || !navigator.onLine || connection.retryTimer !== null) return
+    const baseDelay = Math.min(30000, 1000 * 2 ** Math.min(connection.attempts, 5))
+    const delay = Math.round(baseDelay * (0.8 + Math.random() * 0.4))
+    connection.attempts += 1
+    connection.retryTimer = window.setTimeout(() => {
+      connection.retryTimer = null
+      openBrowserNode(id, connection)
+    }, delay)
+  }
+  function stopBrowserNode(id: string) {
+    const connection = sockets.current.get(id)
+    if (!connection) return
+    connection.stopped = true
+    if (connection.retryTimer !== null) window.clearTimeout(connection.retryTimer)
+    if (connection.heartbeatTimer !== null) window.clearInterval(connection.heartbeatTimer)
+    if (connection.stableTimer !== null) window.clearTimeout(connection.stableTimer)
+    sockets.current.delete(id)
+    connection.socket?.close()
   }
   function nameForNode(id: string) { return nodes.find(node => node.id === id)?.name ?? 'Node' }
   async function toggleNode(node: Node) {
@@ -136,7 +192,7 @@ function App() {
   }
   async function removeNode(node: Node) {
     if (!window.confirm(`Remove node “${node.name}”? Its connection token will stop working.`)) return
-    await run(async () => { await api(`/api/nodes/${node.id}`, { method: 'DELETE' }); await refreshClusters(active.id) })
+    await run(async () => { await api(`/api/nodes/${node.id}`, { method: 'DELETE' }); stopBrowserNode(node.id); await refreshClusters(active.id) })
   }
   async function removeMember(member: Member) {
     if (!active || member.role === 'owner' || !window.confirm(`Remove ${member.id} from “${active.name}”?`)) return
@@ -146,22 +202,26 @@ function App() {
     if (!active || !window.confirm('Revoke this invite link? Anyone who has it will no longer be able to join.')) return
     await run(async () => { await api(`/api/clusters/${active.id}/invites/${inv.token}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Invite revoked') })
   }
-  async function manageCluster() {
-    if (!active) return
-    if (active.role === 'owner') {
-      const choice = window.prompt(`Manage “${active.name}”: enter a new name, or type DELETE to remove it.`)
-      if (!choice?.trim()) return
-      await run(async () => {
-        if (choice.trim().toLowerCase() === 'delete') {
-          if (!window.confirm(`Permanently delete “${active.name}”?`)) return
-          await api(`/api/clusters/${active.id}`, { method: 'DELETE' }); await refreshClusters(); setNotice('Cluster deleted')
-        } else {
-          const c = await api<Cluster>(`/api/clusters/${active.id}`, { method: 'PATCH', body: JSON.stringify({ name: choice.trim() }) }); await refreshClusters(c.id); setNotice('Cluster renamed')
-        }
-      })
-    } else if (window.confirm(`Leave “${active.name}”?`)) {
-      await run(async () => { await api(`/api/clusters/${active.id}/leave`, { method: 'POST' }); await refreshClusters(); setNotice('You left the cluster') })
-    }
+  async function renameCluster() {
+    if (!active || active.role !== 'owner') return
+    const name = window.prompt(`Rename “${active.name}”`, active.name)?.trim()
+    if (!name || name === active.name) return
+    await run(async () => { const c = await api<Cluster>(`/api/clusters/${active.id}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await refreshClusters(c.id); setNotice('Cluster renamed') })
+  }
+  async function deleteCluster() {
+    if (!active || active.role !== 'owner') return
+    if (window.prompt(`Permanently delete “${active.name}” and all its nodes and invites? Type DELETE to confirm.`) !== 'DELETE') return
+    const removedNodeIds = nodes.map(node => node.id)
+    await run(async () => {
+      await api(`/api/clusters/${active.id}`, { method: 'DELETE' })
+      removedNodeIds.forEach(stopBrowserNode)
+      await refreshClusters()
+      setNotice(`Deleted “${active.name}”`)
+    })
+  }
+  async function leaveCluster() {
+    if (!active || active.role !== 'member' || !window.confirm(`Leave “${active.name}”?`)) return
+    await run(async () => { await api(`/api/clusters/${active.id}/leave`, { method: 'POST' }); await refreshClusters(); setNotice('You left the cluster') })
   }
   async function copy(text: string) {
     await navigator.clipboard.writeText(text); setNotice('Copied to clipboard')
@@ -176,7 +236,7 @@ function App() {
       {busy ? <div className="empty-state">Connecting to coordinator…</div> : <div className="manage-layout">
         <aside className="cluster-rail"><div className="rail-title">YOUR CLUSTERS <span>{clusters.length}</span></div>{clusters.map(c=><button key={c.id} className={`rail-cluster ${active?.id===c.id?'active':''}`} onClick={()=>void run(()=>refreshClusters(c.id))}><span className="rail-icon">{c.name.slice(0,2).toUpperCase()}</span><span className="rail-label"><b>{c.name}</b><small>{c.role} · {c.members} members</small></span><span className={`rail-state ${c.online_nodes?'online':''}`}/></button>)}{!clusters.length&&<p className="rail-empty">No clusters yet.</p>}<button className="rail-create" onClick={() => void createCluster()}><Plus size={14}/>Create cluster</button><div className="identity-note"><Shield size={14}/><span>Your browser holds your private Mesh identity key. Clearing site data loses access to this anonymous account.</span></div></aside>
         <section className="cluster-content">{!active ? <div className="empty-state"><div className="empty-symbol"><Boxes size={22}/></div><h2>Start your first cluster</h2><p>Create a pool, then invite members and register their nodes.</p><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>Create cluster</button></div> : <>
-          <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions"><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button icon-only" title={active.role==='owner'?'Rename or delete cluster':'Leave cluster'} onClick={() => void manageCluster()}>{active.role==='owner'?<Settings size={16}/>:<LogOut size={16}/>}</button></div></div>
+          <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions">{active.role==='owner'?<><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button" onClick={() => void renameCluster()}><Settings size={15}/>Rename</button><button className="manage-button danger" onClick={() => void deleteCluster()}><Trash2 size={15}/>Delete cluster</button></>:<button className="manage-button" onClick={() => void leaveCluster()}><LogOut size={15}/>Leave cluster</button>}</div></div>
           <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.online?'Connected':n.paused?'Paused':'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
             <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.token.slice(0,10)}…</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
           <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages control; nodes do the compute.</b><span>Node registration and pause controls work now. A worker agent that performs WebGPU or native jobs is a separate next step.</span></div></div>
