@@ -5,6 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,7 +38,7 @@ struct Node {
     cluster_id: Uuid,
     name: String,
     owner_id: String,
-    token: String,
+    token_hash: String,
     paused: bool,
     online: bool,
     last_seen: Option<u64>,
@@ -51,7 +52,14 @@ struct Store {
 }
 
 #[derive(Clone)]
-struct AppState { store: Arc<Mutex<Store>>, data_file: Arc<PathBuf> }
+struct GitHubStorage { token: String, repo: String, branch: String, path: String }
+#[derive(Clone)]
+struct AppState {
+    store: Arc<Mutex<Store>>,
+    data_file: Arc<PathBuf>,
+    github: Option<Arc<GitHubStorage>>,
+    github_file_sha: Arc<Mutex<Option<String>>>,
+}
 
 #[derive(Deserialize)] struct CreateCluster { name: String }
 #[derive(Deserialize)] struct RenameCluster { name: String }
@@ -85,9 +93,9 @@ fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
 fn identity(headers: &HeaderMap) -> ApiResult<String> {
     let id = headers.get(IDENTITY_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("").trim();
     if id.len() < 32 || id.len() > 128 { return Err(ApiError(StatusCode::UNAUTHORIZED, "A valid Mesh identity is required".into())); }
-    let digest = Sha256::digest(id.as_bytes());
-    Ok(format!("{digest:x}"))
+    Ok(secret_hash(id))
 }
+fn secret_hash(value: &str) -> String { format!("{:x}", Sha256::digest(value.as_bytes())) }
 fn cluster_name(name: &str) -> Option<String> {
     let name = name.trim();
     (!name.is_empty() && name.chars().count() <= 80).then(|| name.to_owned())
@@ -117,8 +125,62 @@ fn node_summary(node: &Node) -> NodeSummary {
 }
 fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
     let serialized = serde_json::to_vec(store).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not serialize state".into()))?;
+    if let Some(github) = state.github.as_deref() {
+        let mut file_sha = state.github_file_sha.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Storage unavailable".into()))?;
+        let url = format!("https://api.github.com/repos/{}/contents/{}", github.repo, github.path);
+        let mut body = serde_json::json!({
+            "message": "Update Mesh cluster state",
+            "content": BASE64.encode(&serialized),
+            "branch": github.branch,
+        });
+        if let Some(sha) = file_sha.as_ref() { body["sha"] = serde_json::Value::String(sha.clone()); }
+        let response = ureq::put(&url)
+            .set("Authorization", &format!("Bearer {}", github.token))
+            .set("Accept", "application/vnd.github+json")
+            .set("X-GitHub-Api-Version", "2022-11-28")
+            .set("User-Agent", "mesh-cluster-coordinator")
+        .send_json(&body)
+            .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "Could not save cluster state to the private GitHub storage repository. Check GH_TOKEN permissions and retry.".into()))?;
+        let result: serde_json::Value = response.into_json().map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "GitHub returned an invalid storage response".into()))?;
+        *file_sha = result.pointer("content.sha").and_then(serde_json::Value::as_str).map(str::to_owned);
+        if file_sha.is_none() { return Err(ApiError(StatusCode::BAD_GATEWAY, "GitHub did not return the saved state file revision".into())); }
+        return Ok(());
+    }
     if let Some(parent) = state.data_file.parent().filter(|path| !path.as_os_str().is_empty()) { std::fs::create_dir_all(parent).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not create data directory".into()))?; }
     std::fs::write(state.data_file.as_path(), serialized).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not persist state".into()))
+}
+
+fn load_github_store(config: &GitHubStorage) -> Result<(Store, Option<String>), String> {
+    let repo_url = format!("https://api.github.com/repos/{}", config.repo);
+    let repo_response = ureq::get(&repo_url)
+        .set("Authorization", &format!("Bearer {}", config.token))
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", "2022-11-28")
+        .set("User-Agent", "mesh-cluster-coordinator")
+        .call()
+        .map_err(|_| "Could not access the configured GitHub storage repository. Check GH_TOKEN and MESH_STORAGE_REPO.".to_string())?;
+    let repo_info: serde_json::Value = repo_response.into_json().map_err(|_| "GitHub returned invalid repository metadata".to_string())?;
+    if repo_info.get("private").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("MESH_STORAGE_REPO must point to a private GitHub repository".into());
+    }
+    let url = format!("https://api.github.com/repos/{}/contents/{}?ref={}", config.repo, config.path, config.branch);
+    let response = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {}", config.token))
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", "2022-11-28")
+        .set("User-Agent", "mesh-cluster-coordinator")
+        .call();
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(404, _)) => return Ok((Store::default(), None)),
+        Err(_) => return Err("Could not load state from the private GitHub storage repository. Check GH_TOKEN permissions, repo name, and branch.".into()),
+    };
+    let result: serde_json::Value = response.into_json().map_err(|_| "GitHub returned an invalid storage response".to_string())?;
+    let encoded = result.get("content").and_then(serde_json::Value::as_str).ok_or_else(|| "GitHub state file has no content".to_string())?;
+    let bytes = BASE64.decode(encoded.replace('\n', "")).map_err(|_| "GitHub state file is not valid base64".to_string())?;
+    let store = serde_json::from_slice(&bytes).map_err(|_| "GitHub state file is not valid Mesh data".to_string())?;
+    let sha = result.get("sha").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| "GitHub state file has no revision".to_string())?;
+    Ok((store, Some(sha)))
 }
 
 async fn health() -> &'static str { "mesh coordinator ready" }
@@ -162,7 +224,7 @@ async fn create_invite(State(state): State<AppState>, Path(id): Path<Uuid>, head
     store.invites.retain(|_, invite| invite.expires_at > now());
     let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
     let expires_at = now() + INVITE_TTL_SECS;
-    store.invites.insert(token.clone(), Invite { cluster_id: id, expires_at });
+    store.invites.insert(secret_hash(&token), Invite { cluster_id: id, expires_at });
     persist(&state, &store)?;
     Ok((StatusCode::CREATED, Json(InviteCreated { token, expires_at })))
 }
@@ -170,9 +232,10 @@ async fn list_invites(State(state): State<AppState>, Path(id): Path<Uuid>, heade
     let user = identity(&headers)?;
     let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
     require_owner(&store, id, &user)?;
+    let invite_count = store.invites.len();
     store.invites.retain(|_, invite| invite.expires_at > now());
     let invites = store.invites.iter().filter(|(_, invite)| invite.cluster_id == id).map(|(token, invite)| InviteSummary { token: token.clone(), expires_at: invite.expires_at }).collect();
-    persist(&state, &store)?;
+    if store.invites.len() != invite_count { persist(&state, &store)?; }
     Ok(Json(invites))
 }
 async fn revoke_invite(State(state): State<AppState>, Path((id, token)): Path<(Uuid, String)>, headers: HeaderMap) -> ApiResult<StatusCode> {
@@ -186,14 +249,14 @@ async fn revoke_invite(State(state): State<AppState>, Path((id, token)): Path<(U
 }
 async fn preview_invite(State(state): State<AppState>, Path(token): Path<String>) -> ApiResult<Json<InvitePreview>> {
     let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let invite = store.invites.get(&token).filter(|i| i.expires_at > now()).ok_or(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()))?;
+    let invite = store.invites.get(&secret_hash(&token)).filter(|i| i.expires_at > now()).ok_or(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()))?;
     let cluster = store.clusters.get(&invite.cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?;
     Ok(Json(InvitePreview { cluster_id: cluster.id, cluster_name: cluster.name.clone(), expires_at: invite.expires_at }))
 }
 async fn join_invite(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<JoinInvite>) -> ApiResult<Json<ClusterSummary>> {
     let user = identity(&headers)?;
     let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let invite = store.invites.get(&input.token).filter(|i| i.expires_at > now()).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()))?;
+    let invite = store.invites.get(&secret_hash(&input.token)).filter(|i| i.expires_at > now()).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()))?;
     let cluster = store.clusters.get_mut(&invite.cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?;
     cluster.members.entry(user.clone()).or_insert(Role::Member);
     let cluster = cluster.clone();
@@ -239,7 +302,7 @@ async fn create_node(State(state): State<AppState>, Path(id): Path<Uuid>, header
     let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
     require_member(&store, id, &user)?;
     let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
-    let node = Node { id: Uuid::new_v4(), cluster_id: id, name, owner_id: user, token: token.clone(), paused: false, online: false, last_seen: None };
+    let node = Node { id: Uuid::new_v4(), cluster_id: id, name, owner_id: user, token_hash: secret_hash(&token), paused: false, online: false, last_seen: None };
     store.nodes.insert(node.id, node.clone());
     persist(&state, &store)?;
     Ok((StatusCode::CREATED, Json(NodeCreated { node: node_summary(&node), token })))
@@ -269,7 +332,7 @@ async fn delete_node(State(state): State<AppState>, Path(id): Path<Uuid>, header
 async fn node_socket(State(state): State<AppState>, Query(query): Query<NodeSocketQuery>, ws: WebSocketUpgrade) -> ApiResult<Response> {
     let node_id = {
         let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-        store.nodes.values().find(|n| n.token == query.token).map(|n| n.id).ok_or(ApiError(StatusCode::UNAUTHORIZED, "Invalid node token".into()))?
+        store.nodes.values().find(|n| n.token_hash == secret_hash(&query.token)).map(|n| n.id).ok_or(ApiError(StatusCode::UNAUTHORIZED, "Invalid node token".into()))?
     };
     Ok(ws.on_upgrade(move |socket| run_node_socket(socket, state, node_id)))
 }
@@ -306,9 +369,20 @@ async fn run_node_socket(mut socket: WebSocket, state: AppState, id: Uuid) {
 #[tokio::main]
 async fn main() {
     let data_file = PathBuf::from(std::env::var("MESH_DATA_FILE").unwrap_or_else(|_| "/tmp/mesh-state.json".into()));
-    let mut store: Store = std::fs::read(&data_file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    let github = std::env::var("GH_TOKEN").ok().filter(|token| !token.trim().is_empty()).map(|token| Arc::new(GitHubStorage {
+        token,
+        repo: std::env::var("MESH_STORAGE_REPO").unwrap_or_else(|_| "Wuhpondiscord/gpuclustertest-state".into()),
+        branch: std::env::var("MESH_STORAGE_BRANCH").unwrap_or_else(|_| "main".into()),
+        path: std::env::var("MESH_STORAGE_PATH").unwrap_or_else(|_| "mesh-state.json".into()),
+    }));
+    let (mut store, github_sha) = if let Some(config) = github.as_deref() {
+        load_github_store(config).expect("GitHub cluster storage is configured but could not be loaded")
+    } else {
+        let store = std::fs::read(&data_file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        (store, None)
+    };
     for node in store.nodes.values_mut() { node.online = false; }
-    let state = AppState { store: Arc::new(Mutex::new(store)), data_file: Arc::new(data_file) };
+    let state = AppState { store: Arc::new(Mutex::new(store)), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)) };
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/clusters", get(list_clusters).post(create_cluster))
@@ -372,13 +446,15 @@ mod tests {
     #[tokio::test]
     async fn owner_invites_member_and_can_revoke_invite() {
         let file = std::env::temp_dir().join(format!("mesh-test-{}.json", Uuid::new_v4()));
-        let state = AppState { store: Arc::new(Mutex::new(Store::default())), data_file: Arc::new(file.clone()) };
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)) };
         let owner = test_headers("owner-identity-token-01234567890123456789");
         let guest = test_headers("guest-identity-token-01234567890123456789");
 
         let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "  Lab  ".into() })).await.unwrap();
         assert_eq!(cluster.name, "Lab");
         let (_, Json(invite)) = create_invite(State(state.clone()), Path(cluster.id), owner.clone()).await.unwrap();
+        assert!(state.store.lock().unwrap().invites.contains_key(&secret_hash(&invite.token)));
+        assert!(!state.store.lock().unwrap().invites.contains_key(&invite.token));
         let Json(preview) = preview_invite(State(state.clone()), Path(invite.token.clone())).await.unwrap();
         assert_eq!(preview.cluster_id, cluster.id);
         let Json(joined) = join_invite(State(state.clone()), guest.clone(), Json(JoinInvite { token: invite.token.clone() })).await.unwrap();
@@ -386,8 +462,9 @@ mod tests {
         let Json(guest_clusters) = list_clusters(State(state.clone()), guest).await.unwrap();
         assert_eq!(guest_clusters.len(), 1);
         assert!(delete_cluster(State(state.clone()), Path(cluster.id), test_headers("stranger-identity-token-01234567890123456789")).await.is_err());
-        assert_eq!(revoke_invite(State(state.clone()), Path((cluster.id, invite.token.clone())), owner).await.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(revoke_invite(State(state.clone()), Path((cluster.id, secret_hash(&invite.token))), owner).await.unwrap(), StatusCode::NO_CONTENT);
         assert!(preview_invite(State(state), Path(invite.token)).await.is_err());
         let _ = std::fs::remove_file(file);
     }
 }
+
