@@ -291,7 +291,10 @@ async fn run_node_socket(mut socket: WebSocket, state: AppState, id: Uuid) {
             _ = tick.tick() => {
                 let paused = state.store.lock().ok().and_then(|s| s.nodes.get(&id).map(|n| n.paused));
                 match paused {
-                    Some(value) => if socket.send(Message::Text(format!("{{\"type\":\"control\",\"paused\":{value}}"))).await.is_err() { break; },
+                    Some(value) => {
+                        let message = serde_json::json!({"type": "control", "paused": value}).to_string();
+                        if socket.send(Message::Text(message)).await.is_err() { break; }
+                    },
                     None => break,
                 }
             }
