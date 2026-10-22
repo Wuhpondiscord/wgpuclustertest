@@ -142,7 +142,7 @@ fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
         .send_json(&body)
             .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "Could not save cluster state to the private GitHub storage repository. Check GH_TOKEN permissions and retry.".into()))?;
         let result: serde_json::Value = response.into_json().map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "GitHub returned an invalid storage response".into()))?;
-        *file_sha = result.pointer("content.sha").and_then(serde_json::Value::as_str).map(str::to_owned);
+        *file_sha = result.pointer("/content/sha").and_then(serde_json::Value::as_str).map(str::to_owned);
         if file_sha.is_none() { return Err(ApiError(StatusCode::BAD_GATEWAY, "GitHub did not return the saved state file revision".into())); }
         return Ok(());
     }
@@ -444,6 +444,12 @@ mod tests {
         let first = Cluster { id: Uuid::new_v4(), name: "one".into(), owner_id: "user-a".into(), members: members.clone() };
         let second = Cluster { id: Uuid::new_v4(), name: "two".into(), owner_id: "user-b".into(), members };
         assert!(first.members.contains_key("user-a") && second.members.contains_key("user-a"));
+    }
+
+    #[test]
+    fn github_file_revision_uses_contents_response_sha() {
+        let response = serde_json::json!({ "content": { "sha": "expected-blob-sha" } });
+        assert_eq!(response.pointer("/content/sha").and_then(serde_json::Value::as_str), Some("expected-blob-sha"));
     }
 
     #[tokio::test]
