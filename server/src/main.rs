@@ -272,29 +272,25 @@ async fn list_clusters(State(state): State<AppState>, headers: HeaderMap) -> Api
 async fn create_cluster(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<CreateCluster>) -> ApiResult<(StatusCode, Json<ClusterSummary>)> {
     let user = identity(&headers)?;
     let name = cluster_name(&input.name).ok_or(ApiError(StatusCode::BAD_REQUEST, "Name must be 1–80 characters".into()))?;
-    let result_user = user.clone();
     let result = mutate_store(&state, move |store| {
         let mut members = HashMap::new(); members.insert(user.clone(), Role::Owner);
         let cluster = Cluster { id: Uuid::new_v4(), name, owner_id: user.clone(), members };
         store.clusters.insert(cluster.id, cluster.clone());
-        Ok(cluster)
+        Ok(summary(&cluster, store, &user))
     }).await?;
-    let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let cluster = store.clusters.get(&result.id).expect("committed cluster exists");
-    Ok((StatusCode::CREATED, Json(summary(cluster, &store, &result_user))))
+    Ok((StatusCode::CREATED, Json(result)))
 }
 async fn rename_cluster(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap, Json(input): Json<RenameCluster>) -> ApiResult<Json<ClusterSummary>> {
     let user = identity(&headers)?;
     let name = cluster_name(&input.name).ok_or(ApiError(StatusCode::BAD_REQUEST, "Name must be 1–80 characters".into()))?;
-    let result_user = user.clone();
-    mutate_store(&state, move |store| {
+    let result = mutate_store(&state, move |store| {
         require_owner(store, id, &user)?;
-        store.clusters.get_mut(&id).expect("checked above").name = name;
-        Ok(())
+        let cluster = store.clusters.get_mut(&id).expect("checked above");
+        cluster.name = name;
+        let cluster = cluster.clone();
+        Ok(summary(&cluster, store, &user))
     }).await?;
-    let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let cluster = require_owner(&store, id, &result_user)?;
-    Ok(Json(summary(cluster, &store, &result_user)))
+    Ok(Json(result))
 }
 async fn delete_cluster(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<StatusCode> {
     let user = identity(&headers)?;
@@ -350,16 +346,14 @@ async fn join_invite(State(state): State<AppState>, headers: HeaderMap, Json(inp
     if !has_active_invite(&state, &input.token)? && !refresh_invite_from_github(&state, &input.token).await? {
         return Err(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()));
     }
-    let user_for_response = user.clone();
-    let cluster_id = mutate_store(&state, move |store| {
+    let result = mutate_store(&state, move |store| {
         let invite = store.invites.get(&secret_hash(&input.token)).filter(|i| i.expires_at > now()).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()))?;
         let cluster = store.clusters.get_mut(&invite.cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?;
-        cluster.members.entry(user).or_insert(Role::Member);
-        Ok(cluster.id)
+        cluster.members.entry(user.clone()).or_insert(Role::Member);
+        let cluster = cluster.clone();
+        Ok(summary(&cluster, store, &user))
     }).await?;
-    let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let cluster = require_member(&store, cluster_id, &user_for_response)?;
-    Ok(Json(summary(cluster, &store, &user_for_response)))
+    Ok(Json(result))
 }
 async fn leave_cluster(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<StatusCode> {
     let user = identity(&headers)?;
@@ -404,28 +398,27 @@ async fn create_node(State(state): State<AppState>, Path(id): Path<Uuid>, header
     let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
     let node_id = Uuid::new_v4();
     let token_hash = secret_hash(&token);
-    mutate_store(&state, move |store| {
+    let token_for_response = token.clone();
+    let result = mutate_store(&state, move |store| {
         require_member(store, id, &user)?;
         let node = Node { id: node_id, cluster_id: id, name, owner_id: user, token_hash, paused: false, online: false, last_seen: None };
+        let node_summary = node_summary(&node);
         store.nodes.insert(node.id, node);
-        Ok(())
+        Ok(NodeCreated { node: node_summary, token: token_for_response })
     }).await?;
-    let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let node = store.nodes.get(&node_id).expect("committed node exists");
-    Ok((StatusCode::CREATED, Json(NodeCreated { node: node_summary(node), token })))
+    Ok((StatusCode::CREATED, Json(result)))
 }
 async fn set_node_paused(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap, paused: bool) -> ApiResult<Json<NodeSummary>> {
     let user = identity(&headers)?;
-    mutate_store(&state, move |store| {
+    let result = mutate_store(&state, move |store| {
         let (cluster_id, node_owner) = store.nodes.get(&id).map(|node| (node.cluster_id, node.owner_id.clone())).ok_or(ApiError(StatusCode::NOT_FOUND, "Node not found".into()))?;
         let cluster_owner = store.clusters.get(&cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?.owner_id.clone();
         if cluster_owner != user && node_owner != user { return Err(ApiError(StatusCode::FORBIDDEN, "You cannot manage this node".into())); }
-        store.nodes.get_mut(&id).expect("checked above").paused = paused;
-        Ok(())
+        let node = store.nodes.get_mut(&id).expect("checked above");
+        node.paused = paused;
+        Ok(node_summary(node))
     }).await?;
-    let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let node = store.nodes.get(&id).ok_or(ApiError(StatusCode::NOT_FOUND, "Node not found".into()))?;
-    Ok(Json(node_summary(node)))
+    Ok(Json(result))
 }
 async fn pause_node(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<Json<NodeSummary>> { set_node_paused(State(state), Path(id), headers, true).await }
 async fn resume_node(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<Json<NodeSummary>> { set_node_paused(State(state), Path(id), headers, false).await }
