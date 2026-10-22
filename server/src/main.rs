@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
@@ -74,6 +74,7 @@ struct InviteSummary { token: String, expires_at: u64 }
 #[derive(Serialize)]
 struct InviteCreated { token: String, expires_at: u64 }
 
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response { (self.0, self.1).into_response() }
@@ -106,7 +107,7 @@ fn require_member<'a>(store: &'a Store, cluster_id: Uuid, user: &str) -> ApiResu
     store.clusters.get(&cluster_id).filter(|cluster| cluster.members.contains_key(user))
         .ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))
 }
-fn require_owner(store: &Store, cluster_id: Uuid, user: &str) -> ApiResult<&Cluster> {
+fn require_owner<'a>(store: &'a Store, cluster_id: Uuid, user: &str) -> ApiResult<&'a Cluster> {
     let cluster = require_member(store, cluster_id, user)?;
     if cluster.owner_id != user { return Err(ApiError(StatusCode::FORBIDDEN, "Only the cluster owner can do that".into())); }
     Ok(cluster)
@@ -246,9 +247,10 @@ async fn create_node(State(state): State<AppState>, Path(id): Path<Uuid>, header
 async fn set_node_paused(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap, paused: bool) -> ApiResult<Json<NodeSummary>> {
     let user = identity(&headers)?;
     let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
-    let node = store.nodes.get_mut(&id).ok_or(ApiError(StatusCode::NOT_FOUND, "Node not found".into()))?;
-    let cluster = store.clusters.get(&node.cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?;
-    if cluster.owner_id != user && node.owner_id != user { return Err(ApiError(StatusCode::FORBIDDEN, "You cannot manage this node".into())); }
+    let (cluster_id, node_owner) = store.nodes.get(&id).map(|node| (node.cluster_id, node.owner_id.clone())).ok_or(ApiError(StatusCode::NOT_FOUND, "Node not found".into()))?;
+    let cluster_owner = store.clusters.get(&cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?.owner_id.clone();
+    if cluster_owner != user && node_owner != user { return Err(ApiError(StatusCode::FORBIDDEN, "You cannot manage this node".into())); }
+    let node = store.nodes.get_mut(&id).expect("checked above");
     node.paused = paused;
     let node = node.clone();
     persist(&state, &store)?;
@@ -358,3 +360,4 @@ mod tests {
         assert!(first.members.contains_key("user-a") && second.members.contains_key("user-a"));
     }
 }
+
