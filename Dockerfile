@@ -18,6 +18,8 @@ WORKDIR /app
 COPY --from=backend /app/target/release/mesh-coordinator /usr/local/bin/mesh-coordinator
 COPY --from=frontend /app/dist ./dist
 ENV PORT=7860
+ENV MESH_REQUIRE_GITHUB_STORAGE=1
 EXPOSE 7860
 USER app
 CMD ["/usr/local/bin/mesh-coordinator"]
+
