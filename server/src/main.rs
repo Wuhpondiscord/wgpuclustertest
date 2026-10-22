@@ -375,6 +375,9 @@ async fn main() {
         branch: std::env::var("MESH_STORAGE_BRANCH").unwrap_or_else(|_| "main".into()),
         path: std::env::var("MESH_STORAGE_PATH").unwrap_or_else(|_| "mesh-state.json".into()),
     }));
+    if std::env::var("MESH_REQUIRE_GITHUB_STORAGE").as_deref() == Ok("1") && github.is_none() {
+        panic!("Set the GH_TOKEN secret on the Hugging Face Space to enable persistent cluster storage");
+    }
     let (mut store, github_sha) = if let Some(config) = github.as_deref() {
         load_github_store(config).expect("GitHub cluster storage is configured but could not be loaded")
     } else {
