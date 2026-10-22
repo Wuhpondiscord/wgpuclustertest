@@ -1,58 +1,169 @@
-import { useState } from 'react'
-import { Activity, ArrowUpRight, Boxes, Check, ChevronDown, CircleHelp, Clock3, Cpu, Ellipsis, Gauge, Grid2X2, Laptop, Link2, Menu, Plus, ShieldCheck, Users, Wallet, X } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Activity, ArrowRight, Boxes, Check, Copy, Cpu, Link2, LogOut, Pause, Play, Plus, RefreshCw, Settings, Shield, Trash2, Users, X } from 'lucide-react'
 
-type Modal = 'invite' | 'join' | 'new-cluster' | null
+type Cluster = { id: string; name: string; role: 'owner' | 'member'; members: number; nodes: number; online_nodes: number }
+type Node = { id: string; cluster_id: string; name: string; paused: boolean; online: boolean; last_seen: number | null }
+type Member = { id: string; role: 'owner' | 'member' }
+type ActiveInvite = { token: string; expires_at: number }
+type InvitePreview = { cluster_id: string; cluster_name: string; expires_at: number }
+type NodeCreated = { node: Node; token: string }
 
-const clusters = [
-  { name: 'Atlas research', code: 'AT', color: 'mint', role: 'Member', machines: 18, online: 15, credit: 64.8, load: 72, active: true },
-  { name: 'Studio render farm', code: 'SR', color: 'lilac', role: 'Admin', machines: 9, online: 7, credit: 21.3, load: 46, active: false },
-  { name: 'Weekend lab', code: 'WL', color: 'amber', role: 'Member', machines: 6, online: 4, credit: 8.6, load: 28, active: false },
-]
-const members = [
-  { initials: 'JM', name: 'Jordan Miller', device: 'MacBook Pro · M3 Max', rate: '1.42 TFLOPS', status: 'Computing', color: 'mint' },
-  { initials: 'AK', name: 'Ari Kim', device: 'Desktop · RTX 4080', rate: '8.16 TFLOPS', status: 'Computing', color: 'lilac' },
-  { initials: 'SP', name: 'Sam Patel', device: 'Windows PC · RTX 3070', rate: '4.28 TFLOPS', status: 'Computing', color: 'blue' },
-  { initials: 'LC', name: 'Lee Chen', device: 'MacBook Air · M2', rate: '0.88 TFLOPS', status: 'Idle', color: 'amber' },
-]
+function getIdentity() {
+  let token = localStorage.getItem('mesh.identity')
+  if (!token) { token = `${crypto.randomUUID().replace(/-/g, '')}${crypto.randomUUID().replace(/-/g, '')}`; localStorage.setItem('mesh.identity', token) }
+  return token
+}
+
+async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers)
+  headers.set('X-Mesh-Identity', getIdentity())
+  if (init.body) headers.set('Content-Type', 'application/json')
+  const response = await fetch(path, { ...init, headers })
+  if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`)
+  if (response.status === 204) return undefined as T
+  return response.json() as Promise<T>
+}
 
 function App() {
-  const [modal, setModal] = useState<Modal>(null)
-  const [toast, setToast] = useState('')
-  const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [contributing, setContributing] = useState(true)
-  const [selected, setSelected] = useState('Atlas research')
-  const activeCluster = clusters.find(c => c.name === selected) ?? clusters[0]
-  const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 2600) }
+  const [clusters, setClusters] = useState<Cluster[]>([])
+  const [activeId, setActiveId] = useState('')
+  const [nodes, setNodes] = useState<Node[]>([])
+  const [members, setMembers] = useState<Member[]>([])
+  const [invites, setInvites] = useState<ActiveInvite[]>([])
+  const [invite, setInvite] = useState<InvitePreview | null>(null)
+  const [joinToken, setJoinToken] = useState(new URLSearchParams(window.location.search).get('invite') ?? '')
+  const [nodeCredentials, setNodeCredentials] = useState<{ name: string; url: string } | null>(null)
+  const [busy, setBusy] = useState(true)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const active = clusters.find(c => c.id === activeId) ?? clusters[0]
 
-  return <div className="app-shell">
-    <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
-      <div className="brand"><div className="brand-mark"><Boxes size={19}/></div><span>mesh<span className="brand-dot">.</span></span><button className="mobile-close icon-button" onClick={() => setSidebarOpen(false)} aria-label="Close menu"><X size={18}/></button></div>
-      <div className="workspace-switch"><div className="workspace-avatar">J</div><div className="workspace-label"><b>Jordan’s workspace</b><span>Personal plan</span></div><ChevronDown size={15}/></div>
-      <div className="nav-group"><div className="nav-caption">WORKSPACE</div><button className="nav-item"><Grid2X2 size={17}/>Overview</button><button className="nav-item selected"><Boxes size={17}/>Clusters<span className="nav-count">3</span></button><button className="nav-item"><Activity size={17}/>Activity</button><button className="nav-item"><Wallet size={17}/>Compute credits</button></div>
-      <div className="cluster-list-head"><span className="nav-caption">YOUR CLUSTERS</span><button className="tiny-add" onClick={() => setModal('new-cluster')} aria-label="Create cluster"><Plus size={15}/></button></div>
-      <div className="cluster-nav">{clusters.map(c => <button key={c.name} onClick={() => setSelected(c.name)} className={`cluster-nav-item ${selected === c.name ? 'cluster-active' : ''}`}><span className={`cluster-icon ${c.color}`}>{c.code}</span><span className="cluster-nav-name">{c.name}</span><span className={`presence ${c.active ? 'online' : ''}`}/></button>)}</div>
-      <button className="invite-side" onClick={() => setModal('join')}><Plus size={16}/>Join a cluster</button>
-      <div className="sidebar-bottom"><div className="help-card"><div className="help-icon"><CircleHelp size={16}/></div><div><b>New to Mesh?</b><span>See how shared compute works.</span></div><ArrowUpRight size={14}/></div><button className="profile"><div className="profile-avatar">JM</div><div className="profile-name"><b>Jordan Miller</b><span>jordan@email.com</span></div><Ellipsis size={18}/></button></div>
-    </aside>
-    {sidebarOpen && <button className="scrim" onClick={() => setSidebarOpen(false)} aria-label="Close navigation"/>}
-    <main className="main-content">
-      <header className="topbar"><button className="mobile-menu icon-button" onClick={() => setSidebarOpen(true)} aria-label="Open menu"><Menu size={19}/></button><div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><b>Clusters</b></div><div className="top-actions"><div className="connection"><span className="connection-dot"/>All systems operational</div><button className="icon-button help-top" aria-label="Help"><CircleHelp size={18}/></button><div className="top-avatar">JM</div></div></header>
-      <div className="page-wrap">
-        <section className="page-heading"><div><div className="eyebrow"><span className="green-pip"/>YOUR COMPUTE NETWORK</div><h1>Clusters</h1><p>Bring your devices together. Share compute, earn credits, and build as a team.</p></div><div className="heading-actions"><button className="button button-secondary" onClick={() => setModal('join')}><Link2 size={16}/>Join with invite</button><button className="button button-primary" onClick={() => setModal('new-cluster')}><Plus size={17}/>New cluster</button></div></section>
-        <section className="overview-grid"><div className="overview-card hero-card"><div className="metric-top"><div className="metric-icon"><Boxes size={17}/></div><span className="metric-kicker">NETWORK OVERVIEW</span><button className="card-more"><Ellipsis size={18}/></button></div><div className="hero-stat">3 <span>clusters</span></div><div className="metric-foot"><span><i className="legend-dot bright"/>26 devices online</span><span className="subtle">across your network</span></div><div className="mini-bars" aria-hidden="true">{[27,38,34,46,42,59,48,67,53,76,62,83,70,94,72,60,88,73,96,80,68,87,75,97].map((h,i)=><span key={i} style={{height:`${h}%`,opacity:0.35+(h/170)}}/>)}</div></div>
-          <div className="overview-card"><div className="metric-top"><div className="metric-icon"><Gauge size={17}/></div><span className="metric-kicker">AVAILABLE COMPUTE</span><span className="live-label"><i/>LIVE</span></div><div className="metric-stat">14.8 <small>TFLOPS</small></div><div className="metric-description">Combined active GPU capacity</div><div className="metric-bottom"><span className="trend-up"><ArrowUpRight size={14}/> 12.4%</span><span className="subtle">vs. last week</span><div className="sparkline"><svg viewBox="0 0 110 32" preserveAspectRatio="none"><path d="M1 26 C12 24 13 20 22 22 S36 28 43 18 S57 19 62 14 S75 19 82 9 S96 12 109 3"/></svg></div></div></div>
-          <div className="overview-card"><div className="metric-top"><div className="metric-icon"><Clock3 size={17}/></div><span className="metric-kicker">YOUR CONTRIBUTION</span><button className="card-more"><Ellipsis size={18}/></button></div><div className="metric-stat">94.7 <small>HRS</small></div><div className="metric-description">Verified compute time this month</div><div className="metric-bottom"><span className="credit-pip"/> <b className="credit-balance">94.7 credits</b><span className="subtle">earned</span><span className="metric-mini-note">from verified work*</span></div></div>
-        </section>
-        <section className="cluster-section"><div className="section-heading"><div><h2>Your clusters <span className="heading-count">03</span></h2><p>Manage the pools you’re a part of.</p></div><button className="text-button" onClick={() => notify('Showing all your clusters')}>View all <ArrowUpRight size={14}/></button></div>
-          <div className="cluster-cards">{clusters.map((cluster) => <article className={`cluster-card ${selected === cluster.name ? 'focused-card' : ''}`} key={cluster.name} onClick={() => setSelected(cluster.name)}><div className="cluster-card-top"><div className={`cluster-icon large ${cluster.color}`}>{cluster.code}</div><div className="cluster-title"><h3>{cluster.name}</h3><div className="cluster-meta"><span className="role-pill">{cluster.role}</span><span className="member-meta"><Users size={13}/>{cluster.machines} members</span></div></div><button className="card-more" aria-label={`More options for ${cluster.name}`}><Ellipsis size={18}/></button></div><div className="cluster-usage"><div className="usage-copy"><span>Compute in use</span><b>{cluster.load}%</b></div><div className="usage-track"><i style={{width:`${cluster.load}%`}}/></div></div><div className="cluster-card-foot"><span className="online-count"><i/> {cluster.online} online</span><span className="card-credit"><Cpu size={14}/>{cluster.credit} credits</span><button className="open-cluster" onClick={(e) => {e.stopPropagation(); setSelected(cluster.name); notify(`Opened ${cluster.name}`)}}>Open <ArrowUpRight size={14}/></button></div></article>)}<button className="add-cluster-card" onClick={() => setModal('new-cluster')}><span className="add-circle"><Plus size={19}/></span><b>Create a cluster</b><span>Start a shared compute pool</span></button></div>
-        </section>
-        <section className="detail-grid"><div className="panel members-panel"><div className="panel-heading"><div><h2>{activeCluster.name} <span className="active-badge"><i/>ACTIVE</span></h2><p>People and devices contributing right now</p></div><button className="button button-secondary small-button" onClick={() => setModal('invite')}><Plus size={15}/>Invite</button></div><div className="members-table"><div className="table-header"><span>MEMBER / DEVICE</span><span>COMPUTE RATE</span><span>STATUS</span></div>{members.map(m=><div className="member-row" key={m.initials}><div className="member-cell"><div className={`member-avatar ${m.color}`}>{m.initials}</div><div className="member-info"><b>{m.name}</b><span><Laptop size={12}/>{m.device}</span></div></div><div className="rate-cell"><Cpu size={14}/>{m.rate}</div><div className={`status-cell ${m.status==='Idle'?'idle':''}`}><i/>{m.status}</div></div>)}</div><button className="table-footer" onClick={() => notify('Member directory opened')}>View all 18 members <ArrowUpRight size={14}/></button></div>
-          <div className="panel contribution-panel"><div className="panel-heading"><div><h2>Your contribution</h2><p>Your compute, fairly counted.</p></div><button className="card-more"><Ellipsis size={18}/></button></div><div className="contribution-highlight"><div className="contribution-orb"><Cpu size={20}/></div><div><b>MacBook Pro · M3 Max</b><span><i className="online-dot"/>Contributing to {activeCluster.name}</span></div><button className={`toggle ${contributing ? 'on' : ''}`} onClick={()=>setContributing(!contributing)} aria-label="Toggle compute contribution"><i/></button></div><div className="contribution-stats"><div><span>Earned this month</span><b>64.8 <small>credits</small></b></div><div><span>Verified work</span><b>32.4 <small>hours</small></b></div></div><div className="fair-note"><ShieldCheck size={15}/><span>Credits are based on verified compute delivered, adjusted for device performance.</span></div><button className="contribution-link" onClick={() => notify('Opening contribution history')}>See contribution history <ArrowUpRight size={14}/></button></div></section>
-        <footer className="page-footer"><span>Mesh is in early access</span><span><button onClick={() => notify('Documentation coming soon')}>Documentation</button><span className="footer-dot">·</span><button onClick={() => notify('Status: all systems operational')}>Status</button><span className="footer-dot">·</span><span>© 2025 Mesh Compute</span></span></footer>
-      </div>
+  async function refreshClusters(preferId?: string) {
+    const data = await api<Cluster[]>('/api/clusters')
+    setClusters(data)
+    const nextId = preferId && data.some(c => c.id === preferId) ? preferId : data.some(c => c.id === activeId) ? activeId : data[0]?.id ?? ''
+    setActiveId(nextId)
+    if (nextId) {
+      const [nextNodes, nextMembers] = await Promise.all([
+        api<Node[]>(`/api/clusters/${nextId}/nodes`),
+        api<Member[]>(`/api/clusters/${nextId}/members`),
+      ])
+      setNodes(nextNodes); setMembers(nextMembers)
+      const selected = data.find(c => c.id === nextId)
+      setInvites(selected?.role === 'owner' ? await api<ActiveInvite[]>(`/api/clusters/${nextId}/invites`) : [])
+    } else { setNodes([]); setMembers([]); setInvites([]) }
+  }
+
+  useEffect(() => {
+    getIdentity()
+    void (async () => {
+      try {
+        const token = new URLSearchParams(window.location.search).get('invite')
+        if (token) { setJoinToken(token); setInvite(await api<InvitePreview>(`/api/invites/${encodeURIComponent(token)}`)) }
+        await refreshClusters()
+      } catch (e) { setError(e instanceof Error ? e.message : 'Could not connect to the Mesh coordinator') }
+      finally { setBusy(false) }
+    })()
+  }, [])
+
+  useEffect(() => {
+    if (!activeId) return
+    const timer = window.setInterval(() => { void refreshClusters(activeId).catch(e => setError(e instanceof Error ? e.message : 'Refresh failed')) }, 12000)
+    return () => window.clearInterval(timer)
+  }, [activeId])
+
+  async function run(action: () => Promise<void>) {
+    setError(''); setNotice('')
+    try { await action() }
+    catch (e) { setError(e instanceof Error ? e.message : 'Request failed') }
+  }
+  async function createCluster() {
+    const name = window.prompt('Name your cluster')?.trim()
+    if (!name) return
+    await run(async () => { const c = await api<Cluster>('/api/clusters', { method: 'POST', body: JSON.stringify({ name }) }); await refreshClusters(c.id); setNotice(`Created “${c.name}”`) })
+  }
+  async function makeInvite() {
+    if (!active) return
+    await run(async () => {
+      const data = await api<{ token: string }>(`/api/clusters/${active.id}/invites`, { method: 'POST' })
+      const url = `${location.origin}/?invite=${data.token}`
+      await navigator.clipboard.writeText(url)
+      await refreshClusters(active.id)
+      setNotice('Seven day invite link copied')
+    })
+  }
+  async function join(token = joinToken) {
+    await run(async () => {
+      const joined = await api<Cluster>('/api/invites/join', { method: 'POST', body: JSON.stringify({ token }) })
+      setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname)
+      await refreshClusters(joined.id); setNotice(`Joined “${joined.name}”`)
+    })
+  }
+  async function createNode() {
+    if (!active) return
+    const name = window.prompt('Name this node (for example: Office GPU)')?.trim()
+    if (!name) return
+    await run(async () => {
+      const created = await api<NodeCreated>(`/api/clusters/${active.id}/nodes`, { method: 'POST', body: JSON.stringify({ name }) })
+      const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      setNodeCredentials({ name, url: `${wsProto}//${location.host}/api/nodes/connect?token=${created.token}` })
+      await refreshClusters(active.id)
+    })
+  }
+  async function toggleNode(node: Node) {
+    await run(async () => { await api(`/api/nodes/${node.id}/${node.paused ? 'resume' : 'pause'}`, { method: 'POST' }); await refreshClusters(active.id) })
+  }
+  async function removeNode(node: Node) {
+    if (!window.confirm(`Remove node “${node.name}”? Its connection token will stop working.`)) return
+    await run(async () => { await api(`/api/nodes/${node.id}`, { method: 'DELETE' }); await refreshClusters(active.id) })
+  }
+  async function removeMember(member: Member) {
+    if (!active || member.role === 'owner' || !window.confirm(`Remove ${member.id} from “${active.name}”?`)) return
+    await run(async () => { await api(`/api/clusters/${active.id}/members/${member.id}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Member removed') })
+  }
+  async function revokeInvite(inv: ActiveInvite) {
+    if (!active || !window.confirm('Revoke this invite link? Anyone who has it will no longer be able to join.')) return
+    await run(async () => { await api(`/api/clusters/${active.id}/invites/${inv.token}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Invite revoked') })
+  }
+  async function manageCluster() {
+    if (!active) return
+    if (active.role === 'owner') {
+      const choice = window.prompt(`Manage “${active.name}”: enter a new name, or type DELETE to remove it.`)
+      if (!choice?.trim()) return
+      await run(async () => {
+        if (choice.trim().toLowerCase() === 'delete') {
+          if (!window.confirm(`Permanently delete “${active.name}”?`)) return
+          await api(`/api/clusters/${active.id}`, { method: 'DELETE' }); await refreshClusters(); setNotice('Cluster deleted')
+        } else {
+          const c = await api<Cluster>(`/api/clusters/${active.id}`, { method: 'PATCH', body: JSON.stringify({ name: choice.trim() }) }); await refreshClusters(c.id); setNotice('Cluster renamed')
+        }
+      })
+    } else if (window.confirm(`Leave “${active.name}”?`)) {
+      await run(async () => { await api(`/api/clusters/${active.id}/leave`, { method: 'POST' }); await refreshClusters(); setNotice('You left the cluster') })
+    }
+  }
+  async function copy(text: string) {
+    await navigator.clipboard.writeText(text); setNotice('Copied to clipboard')
+  }
+
+  return <div className="manage-app">
+    <header className="manage-top"><a className="manage-brand" href="/"><span className="brand-glyph"><Boxes size={18}/></span>mesh<span className="brand-period">.</span></a><div className="control-badge"><i/>Coordinator connected</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button></header>
+    <main className="manage-main">
+      {invite && <div className="invite-banner"><div><b>Invitation to {invite.cluster_name}</b><span>Join this cluster with your current Mesh identity.</span></div><button className="manage-button primary" onClick={() => void join(joinToken)}>Join cluster <ArrowRight size={15}/></button><button className="dismiss-button" onClick={() => { setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname) }} aria-label="Dismiss"><X size={17}/></button></div>}
+      <div className="manage-heading"><div><div className="overline">COMPUTE NETWORK</div><h1>Clusters</h1><p>Manage cluster membership, invitations, and connected nodes.</p></div><div className="heading-buttons"><button className="manage-button" onClick={() => { const value = window.prompt('Paste a cluster invite URL or token'); if (value) { const token = value.includes('invite=') ? new URL(value, location.origin).searchParams.get('invite') ?? '' : value.trim(); setJoinToken(token); void run(async () => { setInvite(await api<InvitePreview>(`/api/invites/${encodeURIComponent(token)}`)) }) } }}><Link2 size={15}/>Join by invite</button><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>New cluster</button></div></div>
+      {error && <div className="feedback error">{error}</div>}{notice && <div className="feedback success"><Check size={14}/>{notice}</div>}
+      {busy ? <div className="empty-state">Connecting to coordinator…</div> : <div className="manage-layout">
+        <aside className="cluster-rail"><div className="rail-title">YOUR CLUSTERS <span>{clusters.length}</span></div>{clusters.map(c=><button key={c.id} className={`rail-cluster ${active?.id===c.id?'active':''}`} onClick={()=>void run(()=>refreshClusters(c.id))}><span className="rail-icon">{c.name.slice(0,2).toUpperCase()}</span><span className="rail-label"><b>{c.name}</b><small>{c.role} · {c.members} members</small></span><span className={`rail-state ${c.online_nodes?'online':''}`}/></button>)}{!clusters.length&&<p className="rail-empty">No clusters yet.</p>}<button className="rail-create" onClick={() => void createCluster()}><Plus size={14}/>Create cluster</button><div className="identity-note"><Shield size={14}/><span>Your browser holds your private Mesh identity key. Clearing site data loses access to this anonymous account.</span></div></aside>
+        <section className="cluster-content">{!active ? <div className="empty-state"><div className="empty-symbol"><Boxes size={22}/></div><h2>Start your first cluster</h2><p>Create a pool, then invite members and register their nodes.</p><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>Create cluster</button></div> : <>
+          <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions"><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button icon-only" title={active.role==='owner'?'Rename or delete cluster':'Leave cluster'} onClick={() => void manageCluster()}>{active.role==='owner'?<Settings size={16}/>:<LogOut size={16}/>}</button></div></div>
+          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.online?'Connected':n.paused?'Paused':'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
+            <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.token.slice(0,10)}…</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
+          <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages control; nodes do the compute.</b><span>Node registration and pause controls work now. A worker agent that performs WebGPU or native jobs is a separate next step.</span></div></div>
+        </>}</section>
+      </div>}
+      <footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
     </main>
-    {modal && <div className="modal-backdrop" onMouseDown={(e)=>{if(e.target===e.currentTarget)setModal(null)}}><div className="modal"><button className="modal-close icon-button" onClick={()=>setModal(null)} aria-label="Close"><X size={18}/></button>{modal==='invite'?<><div className="modal-symbol"><Link2 size={20}/></div><div className="eyebrow">GROW YOUR POOL</div><h2>Invite someone to {activeCluster.name}</h2><p>Anyone with this link can request to join your cluster. You can revoke it anytime.</p><label className="field-label">INVITE LINK</label><div className="invite-link"><span>mesh.network/join/atlas-k8f2q</span><button onClick={()=>notify('Invite link copied')}><Link2 size={15}/>Copy</button></div><div className="permission-row"><ShieldCheck size={16}/><span>New members join as contributors. Admins can change roles.</span></div><button className="button button-primary modal-submit" onClick={()=>{setModal(null);notify('Invite link copied')}}><Link2 size={16}/>Copy invite link</button></>:modal==='join'?<><div className="modal-symbol"><Link2 size={20}/></div><div className="eyebrow">JOIN A COMPUTE POOL</div><h2>Join a cluster</h2><p>Paste an invite URL to preview the cluster and request to join. You can belong to multiple clusters.</p><label className="field-label" htmlFor="invite-url">INVITE LINK</label><input id="invite-url" className="text-input" placeholder="https://mesh.network/join/…"/><div className="permission-row"><ShieldCheck size={16}/><span>You’ll review the cluster and permissions before joining.</span></div><button className="button button-primary modal-submit" onClick={()=>{const input=document.getElementById('invite-url') as HTMLInputElement;if(!input.value.trim()){input.focus();return}setModal(null);notify('Invite link accepted — cluster preview is ready')}}><Link2 size={16}/>Continue with invite</button></>:<><div className="modal-symbol"><Boxes size={20}/></div><div className="eyebrow">START A COMPUTE POOL</div><h2>Create a cluster</h2><p>Give your pool a name. You can invite people and add devices right after.</p><label className="field-label" htmlFor="cluster-name">CLUSTER NAME</label><input id="cluster-name" className="text-input" placeholder="e.g. Team render pool"/><label className="field-label visibility-label">VISIBILITY</label><div className="visibility-choice"><div className="visibility-icon"><Link2 size={16}/></div><div><b>Invite link</b><span>People join through your invite</span></div><Check size={16} className="choice-check"/></div><button className="button button-primary modal-submit" onClick={()=>{const input=document.getElementById('cluster-name') as HTMLInputElement;if(!input.value.trim()){input.focus();return}setModal(null);notify(`Cluster “${input.value.trim()}” created`)}}><Plus size={16}/>Create cluster</button></>}</div></div>}
-    {toast&&<div className="toast"><Check size={16}/>{toast}</div>}
+    {nodeCredentials && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setNodeCredentials(null)}}><section className="credentials-dialog"><button className="dialog-close" onClick={()=>setNodeCredentials(null)} aria-label="Close"><X size={17}/></button><div className="dialog-icon"><Cpu size={19}/></div><div className="overline">NODE REGISTERED</div><h2>{nodeCredentials.name}</h2><p>Use this private WebSocket URL in the node agent. It is a bearer credential: treat it like a password.</p><div className="credential-value">{nodeCredentials.url}</div><button className="manage-button primary full-width" onClick={()=>void copy(nodeCredentials.url)}><Copy size={15}/>Copy connection URL</button><div className="credential-hint">The node shows offline until an agent connects. This prototype accepts heartbeats and pause commands; it does not dispatch compute jobs yet.</div></section></div>}
   </div>
 }
 
