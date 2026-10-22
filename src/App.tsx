@@ -36,6 +36,7 @@ function App() {
   const [nodeCredentials, setNodeCredentials] = useState<{ name: string; url: string } | null>(null)
   const sockets = useRef(new Map<string, BrowserNodeConnection>())
   const [busy, setBusy] = useState(true)
+  const [coordinatorStatus, setCoordinatorStatus] = useState<'checking' | 'online' | 'offline'>('checking')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const active = clusters.find(c => c.id === activeId) ?? clusters[0]
@@ -66,6 +67,23 @@ function App() {
       } catch (e) { setError(e instanceof Error ? e.message : 'Could not connect to the Mesh coordinator') }
       finally { setBusy(false) }
     })()
+  }, [])
+
+  useEffect(() => {
+    let stopped = false
+    let timer = 0
+    const checkCoordinator = async () => {
+      try {
+        const response = await fetch('/health', { cache: 'no-store' })
+        if (!stopped) setCoordinatorStatus(response.ok ? 'online' : 'offline')
+      } catch {
+        if (!stopped) setCoordinatorStatus('offline')
+      } finally {
+        if (!stopped) timer = window.setTimeout(() => void checkCoordinator(), 10000)
+      }
+    }
+    void checkCoordinator()
+    return () => { stopped = true; window.clearTimeout(timer) }
   }, [])
 
   useEffect(() => {
@@ -228,7 +246,7 @@ function App() {
   }
 
   return <div className="manage-app">
-    <header className="manage-top"><a className="manage-brand" href="/"><span className="brand-glyph"><Boxes size={18}/></span>mesh<span className="brand-period">.</span></a><div className="control-badge"><i/>Coordinator connected</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button></header>
+    <header className="manage-top"><a className="manage-brand" href="/"><span className="brand-glyph"><Boxes size={18}/></span>mesh<span className="brand-period">.</span></a><div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button></header>
     <main className="manage-main">
       {invite && <div className="invite-banner"><div><b>Invitation to {invite.cluster_name}</b><span>Join this cluster with your current Mesh identity.</span></div><button className="manage-button primary" onClick={() => void join(joinToken)}>Join cluster <ArrowRight size={15}/></button><button className="dismiss-button" onClick={() => { setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname) }} aria-label="Dismiss"><X size={17}/></button></div>}
       <div className="manage-heading"><div><div className="overline">COMPUTE NETWORK</div><h1>Clusters</h1><p>Manage cluster membership, invitations, and connected nodes.</p></div><div className="heading-buttons"><button className="manage-button" onClick={() => { const value = window.prompt('Paste a cluster invite URL or token'); if (value) { const token = value.includes('invite=') ? new URL(value, location.origin).searchParams.get('invite') ?? '' : value.trim(); setJoinToken(token); void run(async () => { setInvite(await api<InvitePreview>(`/api/invites/${encodeURIComponent(token)}`)) }) } }}><Link2 size={15}/>Join by invite</button><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>New cluster</button></div></div>
