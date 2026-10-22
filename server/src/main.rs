@@ -150,6 +150,28 @@ fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
     std::fs::write(state.data_file.as_path(), serialized).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not persist state".into()))
 }
 
+fn refresh_invite_from_github(state: &AppState, token: &str) -> ApiResult<bool> {
+    let Some(config) = state.github.as_deref() else { return Ok(false); };
+    let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
+    let key = secret_hash(token);
+    if store.invites.get(&key).is_some_and(|invite| invite.expires_at > now()) { return Ok(true); }
+
+    let (fresh_store, fresh_sha) = load_github_store(config)
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Could not refresh invite state from GitHub storage".into()))?;
+    let found = fresh_store.invites.get(&key).is_some_and(|invite| invite.expires_at > now());
+    if found {
+        *store = fresh_store;
+        let mut file_sha = state.github_file_sha.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Storage unavailable".into()))?;
+        *file_sha = fresh_sha;
+    }
+    Ok(found)
+}
+
+fn has_active_invite(state: &AppState, token: &str) -> ApiResult<bool> {
+    let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
+    Ok(store.invites.get(&secret_hash(token)).is_some_and(|invite| invite.expires_at > now()))
+}
+
 fn load_github_store(config: &GitHubStorage) -> Result<(Store, Option<String>), String> {
     let repo_url = format!("https://api.github.com/repos/{}", config.repo);
     let repo_response = ureq::get(&repo_url)
@@ -248,6 +270,9 @@ async fn revoke_invite(State(state): State<AppState>, Path((id, token)): Path<(U
     Ok(StatusCode::NO_CONTENT)
 }
 async fn preview_invite(State(state): State<AppState>, Path(token): Path<String>) -> ApiResult<Json<InvitePreview>> {
+    if !has_active_invite(&state, &token)? && !refresh_invite_from_github(&state, &token)? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()));
+    }
     let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
     let invite = store.invites.get(&secret_hash(&token)).filter(|i| i.expires_at > now()).ok_or(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()))?;
     let cluster = store.clusters.get(&invite.cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?;
@@ -255,6 +280,9 @@ async fn preview_invite(State(state): State<AppState>, Path(token): Path<String>
 }
 async fn join_invite(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<JoinInvite>) -> ApiResult<Json<ClusterSummary>> {
     let user = identity(&headers)?;
+    if !has_active_invite(&state, &input.token)? && !refresh_invite_from_github(&state, &input.token)? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()));
+    }
     let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
     let invite = store.invites.get(&secret_hash(&input.token)).filter(|i| i.expires_at > now()).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Invite is invalid or expired".into()))?;
     let cluster = store.clusters.get_mut(&invite.cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?;
