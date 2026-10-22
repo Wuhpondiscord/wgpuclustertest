@@ -184,8 +184,9 @@ function App() {
       </div>}
       <footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
     </main>
-    {nodeCredentials && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setNodeCredentials(null)}}><section className="credentials-dialog"><button className="dialog-close" onClick={()=>setNodeCredentials(null)} aria-label="Close"><X size={17}/></button><div className="dialog-icon"><Cpu size={19}/></div><div className="overline">NODE REGISTERED</div><h2>{nodeCredentials.name}</h2><p>Use this private WebSocket URL in the node agent. It is a bearer credential: treat it like a password.</p><div className="credential-value">{nodeCredentials.url}</div><button className="manage-button primary full-width" onClick={()=>void copy(nodeCredentials.url)}><Copy size={15}/>Copy connection URL</button><div className="credential-hint">The node shows offline until an agent connects. This prototype accepts heartbeats and pause commands; it does not dispatch compute jobs yet.</div></section></div>}
+    {nodeCredentials && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setNodeCredentials(null)}}><section className="credentials-dialog"><button className="dialog-close" onClick={()=>setNodeCredentials(null)} aria-label="Close"><X size={17}/></button><div className="dialog-icon"><Cpu size={19}/></div><div className="overline">NODE REGISTERED</div><h2>{nodeCredentials.name}</h2><p>This browser tab connects to the node automatically. Do not open the WebSocket address as a webpage. It is only for a future native worker agent.</p><div className="credential-value">{nodeCredentials.url}</div><button className="manage-button primary full-width" onClick={()=>void copy(nodeCredentials.url)}><Copy size={15}/>Copy for native agent</button><div className="credential-hint">This prototype accepts heartbeats and pause commands; it does not dispatch compute jobs yet. Keep this tab open to keep the browser node connected.</div></section></div>}
   </div>
 }
 
 export default App
+
