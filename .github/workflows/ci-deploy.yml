@@ -34,6 +34,7 @@ jobs:
         run: |
           cargo run --manifest-path server/Cargo.toml --bin recovery-bench | tee recovery-benchmark.csv
           cargo run --manifest-path server/Cargo.toml --bin checkpoint-bench | tee checkpoint-policy-benchmark.csv
+          cargo run --manifest-path server/Cargo.toml --bin checkpoint-montecarlo | tee checkpoint-montecarlo.csv
           {
             echo '### Recovery policy simulation (modeled milliseconds and MB; not hardware measurements)'
             echo
@@ -45,6 +46,12 @@ jobs:
             echo
             echo '```csv'
             cat checkpoint-policy-benchmark.csv
+            echo '```'
+            echo
+            echo '### Seeded Monte Carlo checkpoint evaluation (assumed reliability and links; not hardware measurements)'
+            echo
+            echo '```csv'
+            cat checkpoint-montecarlo.csv
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
