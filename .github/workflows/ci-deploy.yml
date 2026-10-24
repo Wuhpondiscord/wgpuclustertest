@@ -29,12 +29,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --manifest-path server/Cargo.toml
-      - name: Run deterministic recovery policy benchmark
+      - name: Run recovery policy simulation
         shell: bash
         run: |
           cargo run --manifest-path server/Cargo.toml --bin recovery-bench | tee recovery-benchmark.csv
           {
-            echo '### Recovery policy model (logical units, not device throughput)'
+            echo '### Recovery policy simulation (modeled milliseconds and MB; not hardware measurements)'
             echo
             echo '```csv'
             cat recovery-benchmark.csv
