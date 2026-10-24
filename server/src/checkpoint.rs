@@ -3,6 +3,8 @@
 //! This module plans metadata only. Checkpoint bytes stay with workers and move
 //! directly between peers; the coordinator should retain leases and manifests.
 
+use std::collections::{HashMap, HashSet};
+
 #[derive(Clone, Debug)]
 pub struct CheckpointInput {
     pub full_bytes: u64,
@@ -70,6 +72,146 @@ pub struct ArtifactManifest {
     pub payload_bytes: u64,
     pub strategy: StorageStrategy,
     pub shards: Vec<ArtifactShard>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardReceipt {
+    pub checkpoint_id: String,
+    pub shard_index: usize,
+    pub node_id: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckpointError {
+    InvalidManifest,
+    StaleGeneration,
+    MissingBase,
+    UnknownTransaction,
+    UnknownShard,
+    WrongNode,
+    HashMismatch,
+    NotDurable,
+    DuplicateCheckpoint,
+    BrokenChain,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCheckpoint {
+    manifest: ArtifactManifest,
+    expected_hashes: Vec<String>,
+    receipts: HashSet<usize>,
+}
+
+/// Metadata-only two-phase checkpoint commit coordinator.
+///
+/// Workers stage and hash their own shards, then submit receipts. The catalog
+/// publishes a new head only once enough distinct shards are verified to meet
+/// the strategy's reconstruction threshold. This type never handles artifact
+/// bytes and is intended to sit beside a direct peer transport.
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointCatalog {
+    current_id: Option<String>,
+    committed: HashMap<String, ArtifactManifest>,
+    pending: HashMap<String, PendingCheckpoint>,
+}
+
+impl CheckpointCatalog {
+    pub fn current(&self) -> Option<&ArtifactManifest> {
+        self.current_id.as_ref().and_then(|id| self.committed.get(id))
+    }
+
+    /// Start staging a manifest. `expected_hashes` has one SHA-256 digest per
+    /// manifest shard, in shard-index order. A delta must extend the current
+    /// head; a full checkpoint (no base ID) can compact the chain.
+    pub fn begin(
+        &mut self,
+        manifest: ArtifactManifest,
+        expected_hashes: Vec<String>,
+    ) -> Result<(), CheckpointError> {
+        if self.pending.contains_key(&manifest.checkpoint_id) || self.committed.contains_key(&manifest.checkpoint_id) {
+            return Err(CheckpointError::DuplicateCheckpoint);
+        }
+        if manifest.shards.len() != manifest.strategy.total_shards()
+            || expected_hashes.len() != manifest.shards.len()
+            || expected_hashes.iter().any(|hash| !is_sha256(hash))
+            || manifest.shards.iter().enumerate().any(|(index, shard)| shard.index != index)
+            || manifest.shards.iter().any(|shard| shard.node_id.is_empty() || shard.bytes == 0)
+            || manifest.shards.iter().map(|shard| shard.node_id.as_str()).collect::<HashSet<_>>().len() != manifest.shards.len()
+        {
+            return Err(CheckpointError::InvalidManifest);
+        }
+
+        let expected_generation = self.current().map_or(1, |current| current.generation.saturating_add(1));
+        if manifest.generation != expected_generation { return Err(CheckpointError::StaleGeneration); }
+        match (&self.current_id, &manifest.base_checkpoint_id) {
+            (None, None) => {},
+            (Some(current), Some(base)) if current == base => {},
+            (Some(_), None) => {}, // full compaction
+            _ => return Err(CheckpointError::MissingBase),
+        }
+
+        self.pending.insert(manifest.checkpoint_id.clone(), PendingCheckpoint {
+            manifest,
+            expected_hashes,
+            receipts: HashSet::new(),
+        });
+        Ok(())
+    }
+
+    /// Accept a receipt only from the peer assigned to that shard, and only
+    /// when its digest matches the expected digest from the job manifest.
+    pub fn acknowledge(&mut self, receipt: ShardReceipt) -> Result<(), CheckpointError> {
+        let pending = self.pending.get_mut(&receipt.checkpoint_id).ok_or(CheckpointError::UnknownTransaction)?;
+        let shard = pending.manifest.shards.get(receipt.shard_index).ok_or(CheckpointError::UnknownShard)?;
+        if shard.node_id != receipt.node_id { return Err(CheckpointError::WrongNode); }
+        if !is_sha256(&receipt.sha256) || pending.expected_hashes[receipt.shard_index] != receipt.sha256 {
+            return Err(CheckpointError::HashMismatch);
+        }
+        pending.receipts.insert(receipt.shard_index);
+        Ok(())
+    }
+
+    /// Publish the staged manifest when enough receipts exist to reconstruct
+    /// it. Until then `current()` continues returning the previous good head.
+    pub fn commit(&mut self, checkpoint_id: &str) -> Result<&ArtifactManifest, CheckpointError> {
+        let pending = self.pending.get(checkpoint_id).ok_or(CheckpointError::UnknownTransaction)?;
+        // Require the complete desired replica/parity set before publishing.
+        // A later repair process may support degraded commits explicitly.
+        if pending.receipts.len() < pending.manifest.strategy.total_shards() {
+            return Err(CheckpointError::NotDurable);
+        }
+        let pending = self.pending.remove(checkpoint_id).expect("pending checkpoint was checked");
+        self.current_id = Some(checkpoint_id.to_owned());
+        self.committed.insert(checkpoint_id.to_owned(), pending.manifest);
+        Ok(self.committed.get(checkpoint_id).expect("checkpoint was inserted"))
+    }
+
+    /// Drop an incomplete transaction without changing the published head.
+    pub fn abort(&mut self, checkpoint_id: &str) -> bool {
+        self.pending.remove(checkpoint_id).is_some()
+    }
+
+    /// Return the committed full base followed by each delta through the head.
+    /// A missing parent means the artifact chain is incomplete and must not be
+    /// presented as recoverable.
+    pub fn restore_chain(&self) -> Result<Vec<&ArtifactManifest>, CheckpointError> {
+        let mut chain = Vec::new();
+        let mut cursor = self.current().ok_or(CheckpointError::BrokenChain)?;
+        loop {
+            chain.push(cursor);
+            match cursor.base_checkpoint_id.as_deref() {
+                Some(parent_id) => cursor = self.committed.get(parent_id).ok_or(CheckpointError::BrokenChain)?,
+                None => break,
+            }
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Young/Daly-style interval estimate using observed checkpoint wall time and
@@ -202,6 +344,91 @@ mod tests {
     fn manifest_contains_metadata_only_and_requires_enough_hosts() {
         let workers = vec![WorkerLink { node_id: "a".into(), failure_domain: "one".into(), bandwidth_mbps: 100, rtt_ms: 10 }];
         assert!(build_manifest("cp-1".into(), 1, None, 100, 100, StorageStrategy::Erasure2Plus1, &workers).is_none());
+    }
+
+    fn peers() -> Vec<WorkerLink> {
+        vec![
+            WorkerLink { node_id: "node-a".into(), failure_domain: "home-a".into(), bandwidth_mbps: 500, rtt_ms: 10 },
+            WorkerLink { node_id: "node-b".into(), failure_domain: "home-b".into(), bandwidth_mbps: 400, rtt_ms: 20 },
+            WorkerLink { node_id: "node-c".into(), failure_domain: "home-c".into(), bandwidth_mbps: 300, rtt_ms: 30 },
+            WorkerLink { node_id: "node-d".into(), failure_domain: "home-d".into(), bandwidth_mbps: 200, rtt_ms: 40 },
+        ]
+    }
+
+    fn manifest(id: &str, generation: u64, base: Option<&str>) -> ArtifactManifest {
+        build_manifest(id.into(), generation, base.map(str::to_owned), 100, 10,
+            StorageStrategy::Erasure2Plus1, &peers()).unwrap()
+    }
+
+    fn acknowledge(catalog: &mut CheckpointCatalog, id: &str, index: usize, hash: &str) {
+        let pending = catalog.pending.get(id).unwrap();
+        catalog.acknowledge(ShardReceipt {
+            checkpoint_id: id.into(),
+            shard_index: index,
+            node_id: pending.manifest.shards[index].node_id.clone(),
+            sha256: hash.into(),
+        }).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_head_moves_only_after_verified_durability_threshold() {
+        let mut catalog = CheckpointCatalog::default();
+        let hashes = vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        catalog.begin(manifest("base", 1, None), hashes.clone()).unwrap();
+        acknowledge(&mut catalog, "base", 0, &hashes[0]);
+        acknowledge(&mut catalog, "base", 1, &hashes[1]);
+        assert_eq!(catalog.commit("base").unwrap_err(), CheckpointError::NotDurable);
+        acknowledge(&mut catalog, "base", 2, &hashes[2]);
+        catalog.commit("base").unwrap();
+
+        catalog.begin(manifest("delta-1", 2, Some("base")), hashes.clone()).unwrap();
+        acknowledge(&mut catalog, "delta-1", 0, &hashes[0]);
+        acknowledge(&mut catalog, "delta-1", 1, &hashes[1]);
+        assert_eq!(catalog.commit("delta-1").unwrap_err(), CheckpointError::NotDurable);
+        assert_eq!(catalog.current().unwrap().checkpoint_id, "base");
+
+        acknowledge(&mut catalog, "delta-1", 2, &hashes[2]);
+        catalog.commit("delta-1").unwrap();
+        let chain = catalog.restore_chain().unwrap();
+        assert_eq!(chain.iter().map(|entry| entry.checkpoint_id.as_str()).collect::<Vec<_>>(), vec!["base", "delta-1"]);
+    }
+
+    #[test]
+    fn rejects_unassigned_or_corrupt_shard_receipts() {
+        let mut catalog = CheckpointCatalog::default();
+        let hashes = vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        catalog.begin(manifest("base", 1, None), hashes.clone()).unwrap();
+        assert_eq!(catalog.acknowledge(ShardReceipt {
+            checkpoint_id: "base".into(), shard_index: 0, node_id: "attacker".into(), sha256: hashes[0].clone(),
+        }), Err(CheckpointError::WrongNode));
+        let assigned_node = catalog.pending["base"].manifest.shards[0].node_id.clone();
+        assert_eq!(catalog.acknowledge(ShardReceipt {
+            checkpoint_id: "base".into(), shard_index: 0, node_id: assigned_node, sha256: "d".repeat(64),
+        }), Err(CheckpointError::HashMismatch));
+        assert!(catalog.current().is_none());
+    }
+
+    #[test]
+    fn abort_and_full_compaction_preserve_a_recoverable_chain() {
+        let mut catalog = CheckpointCatalog::default();
+        let hashes = vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        catalog.begin(manifest("base", 1, None), hashes.clone()).unwrap();
+        acknowledge(&mut catalog, "base", 0, &hashes[0]);
+        acknowledge(&mut catalog, "base", 1, &hashes[1]);
+        acknowledge(&mut catalog, "base", 2, &hashes[2]);
+        catalog.commit("base").unwrap();
+
+        catalog.begin(manifest("failed-delta", 2, Some("base")), hashes.clone()).unwrap();
+        assert!(catalog.abort("failed-delta"));
+        assert_eq!(catalog.current().unwrap().checkpoint_id, "base");
+
+        catalog.begin(manifest("compacted", 2, None), hashes.clone()).unwrap();
+        acknowledge(&mut catalog, "compacted", 0, &hashes[0]);
+        acknowledge(&mut catalog, "compacted", 1, &hashes[1]);
+        acknowledge(&mut catalog, "compacted", 2, &hashes[2]);
+        catalog.commit("compacted").unwrap();
+        let chain = catalog.restore_chain().unwrap();
+        assert_eq!(chain.iter().map(|entry| entry.checkpoint_id.as_str()).collect::<Vec<_>>(), vec!["compacted"]);
     }
 }
 
