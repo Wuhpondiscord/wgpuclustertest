@@ -15,6 +15,8 @@ use tokio::time::{interval, Duration};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
+mod recovery;
+
 const IDENTITY_HEADER: &str = "x-mesh-identity";
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const NODE_PING_INTERVAL_SECS: u64 = 15;

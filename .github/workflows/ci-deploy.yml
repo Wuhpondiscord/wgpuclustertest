@@ -29,6 +29,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --manifest-path server/Cargo.toml
+      - name: Run deterministic recovery policy benchmark
+        shell: bash
+        run: |
+          cargo run --manifest-path server/Cargo.toml --bin recovery-bench | tee recovery-benchmark.csv
+          {
+            echo '### Recovery policy model (logical units, not device throughput)'
+            echo
+            echo '```csv'
+            cat recovery-benchmark.csv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   container:
     name: Docker build
@@ -85,3 +96,4 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"## Hugging Face Space deployment\n\nUploaded tested commit `{os.environ['GITHUB_SHA']}` to [https://huggingface.co/spaces/{repo_id}](https://huggingface.co/spaces/{repo_id}). The Space now builds the Dockerfile.\n")
           PY
+
