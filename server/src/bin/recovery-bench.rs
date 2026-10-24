@@ -1,106 +1,176 @@
-//! Deterministic model benchmark for Mesh recovery policies.
+//! Deterministic recovery simulator for Mesh policies.
 //!
-//! This compares logical recovery/transfer costs under identical failures. It is
-//! not a hardware throughput benchmark; use real workers before choosing policy.
+//! Models heterogeneous link profiles, checkpoint traffic, peer failures, and
+//! reconstruction. Values are simulated; hardware runs are needed to calibrate
+//! worker rates and codec costs.
 
 #[path = "../recovery.rs"]
 mod recovery;
 
 use recovery::{RecoveryLedger, ResultCommit};
 
-const TASK_WORK: u64 = 100;
-const CHECKPOINT_SIZE_UNITS: u64 = 20;
-const FAILURE_POINTS: [u64; 3] = [25, 63, 99];
-const CHECKPOINT_INTERVALS: [u64; 3] = [10, 25, 50];
-const EVENT_BYTES: u64 = 256;
+const TASK_WORK: f64 = 100.0;
+const CHECKPOINT_MB: f64 = 64.0;
+const PRIMARY_WORK_PER_SEC: f64 = 1.0;
+const REPLACEMENT_WORK_PER_SEC: f64 = 0.8;
+const CHECKPOINT_INTERVALS: [f64; 3] = [10.0, 25.0, 50.0];
+const FAILURE_POINTS: [f64; 3] = [25.0, 63.0, 99.0];
+const CODEC_ENCODE_MS_PER_MB_PER_PARITY: f64 = 0.18;
+const CODEC_DECODE_MS_PER_MB: f64 = 0.30;
 
-fn print_header() {
-    println!("failure_at,method,checkpoint_interval,work_lost,post_failure_work,extra_compute,artifact_storage_units,network_units,metadata_bytes,max_artifact_node_losses");
+#[derive(Clone, Copy)]
+struct Network {
+    name: &'static str,
+    bandwidth_mbps: f64,
+    latency_ms: f64,
 }
 
-fn print_row(
-    failure_at: u64,
-    method: &str,
-    checkpoint_interval: u64,
-    work_lost: u64,
-    post_failure_work: u64,
-    extra_compute: u64,
-    artifact_storage_units: u64,
-    network_units: u64,
-    metadata_bytes: u64,
-    max_artifact_node_losses: u64,
-) {
-    println!("{failure_at},{method},{checkpoint_interval},{work_lost},{post_failure_work},{extra_compute},{artifact_storage_units},{network_units},{metadata_bytes},{max_artifact_node_losses}");
+const NETWORKS: [Network; 3] = [
+    Network { name: "lan", bandwidth_mbps: 800.0, latency_ms: 2.0 },
+    Network { name: "broadband", bandwidth_mbps: 80.0, latency_ms: 25.0 },
+    Network { name: "constrained", bandwidth_mbps: 12.0, latency_ms: 90.0 },
+];
+
+#[derive(Clone, Copy)]
+struct Outcome {
+    recovery_ms: f64,
+    total_ms: f64,
+    lost_work: f64,
+    transfer_mb: f64,
+    storage_mb: f64,
+    codec_ms: f64,
+    recoverable_peer_losses: u8,
+    success: bool,
 }
+
+fn transfer_ms(network: Network, megabytes: f64) -> f64 {
+    if megabytes <= 0.0 { 0.0 } else { network.latency_ms + megabytes * 8_000.0 / network.bandwidth_mbps }
+}
+
+fn fmt(value: f64) -> String { format!("{value:.2}") }
 
 fn main() {
-    // Smoke the exact lease/fencing implementation before generating comparison rows.
+    // Keep the real lease/fencing primitive in the benchmark's smoke path.
     let mut ledger = RecoveryLedger::default();
-    ledger.add_task("benchmark-task").expect("add benchmark task");
-    let lease = ledger.claim("benchmark-task", "worker-a", 0, 10).expect("claim benchmark task");
+    ledger.add_task("simulator-task").expect("add task");
+    let lease = ledger.claim("simulator-task", "worker-a", 0, 10).expect("claim task");
     assert_eq!(ledger.commit_result(&lease, 1, "sha256:accepted"), Ok(ResultCommit::Accepted));
     assert_eq!(ledger.commit_result(&lease, 2, "sha256:accepted"), Ok(ResultCommit::Duplicate));
 
-    print_header();
-    for failure_at in FAILURE_POINTS {
-        for checkpoint_interval in CHECKPOINT_INTERVALS {
-            // Lease + retry: the failed worker's completed prefix must be rerun.
-            print_row(failure_at, "lease_retry", checkpoint_interval, failure_at, TASK_WORK, 0, 0, 0, 0, 0);
-
-            // Duplicate: assume an equally fast independent copy was already
-            // running. It finishes after the primary drops; compute doubles.
-            print_row(failure_at, "duplicate_first_result", checkpoint_interval, 0, TASK_WORK - failure_at, TASK_WORK, 0, 0, 0, 0);
-
-            // A peer holds the latest complete checkpoint (two full copies total).
-            let saved_at = failure_at / checkpoint_interval * checkpoint_interval;
-            let missed_since_checkpoint = failure_at - saved_at;
-            let checkpoints_written = saved_at / checkpoint_interval;
-            let replicate_network = if saved_at > 0 {
-                checkpoints_written * CHECKPOINT_SIZE_UNITS + CHECKPOINT_SIZE_UNITS
-            } else {
-                0
-            };
-            print_row(
-                failure_at,
-                "checkpoint_replication_2x",
-                checkpoint_interval,
-                missed_since_checkpoint,
-                TASK_WORK - saved_at,
-                0,
-                if saved_at > 0 { CHECKPOINT_SIZE_UNITS * 2 } else { 0 },
-                replicate_network,
-                0,
-                if saved_at > 0 { 1 } else { 0 },
-            );
-
-            // Reed-Solomon-like artifact model: k=2 with m=1 or m=2. Checkpoint
-            // work recovered is the same; this row models stored bytes and shard
-            // fetch volume, not codec CPU time or peer transfer throughput.
-            for (parity_shards, label) in [(1_u64, "artifact_ec_2_1"), (2, "artifact_ec_2_2")] {
-                let total_shards = 2 + parity_shards;
-                let storage = if saved_at > 0 { CHECKPOINT_SIZE_UNITS * total_shards / 2 } else { 0 };
-                let write_network = storage;
-                let read_network = if saved_at > 0 { CHECKPOINT_SIZE_UNITS } else { 0 };
-                print_row(
-                    failure_at,
-                    label,
-                    checkpoint_interval,
-                    missed_since_checkpoint,
-                    TASK_WORK - saved_at,
-                    0,
-                    storage,
-                    write_network + read_network,
-                    0,
-                    if saved_at > 0 { parity_shards } else { 0 },
-                );
+    println!("network,policy,failure_progress_pct,checkpoint_interval_work,peer_losses,max_tolerated_peer_losses,recovery_ms,total_job_ms,lost_work_units,transfer_mb,stored_mb,codec_ms,recovers");
+    for network in NETWORKS {
+        for failure_pct in FAILURE_POINTS {
+            for interval in CHECKPOINT_INTERVALS {
+                for (policy, parity) in [("retry", 0_u8), ("replica_2x", 0), ("ec_2_1", 1), ("ec_2_2", 2)] {
+                    let max_peer_losses = if policy == "replica_2x" { 1_u8 } else { parity };
+                    for peer_losses in 0..=max_peer_losses {
+                        let outcome = simulate(network, policy, failure_pct, interval, peer_losses, parity);
+                        println!("{},{},{},{:.0},{},{},{},{},{},{},{},{},{}",
+                            network.name, policy, failure_pct, interval, peer_losses, outcome.recoverable_peer_losses,
+                            fmt(outcome.recovery_ms), fmt(outcome.total_ms), fmt(outcome.lost_work),
+                            fmt(outcome.transfer_mb), fmt(outcome.storage_mb), fmt(outcome.codec_ms), outcome.success);
+                    }
+                }
             }
-
-            // Lattice-inspired log keeps replicated metadata, not task state or
-            // checkpoints. It helps reconstruct history but cannot save compute.
-            let events = 3_u64; // assigned, checkpoint/result offered, coordinator acceptance
-            let metadata = events * EVENT_BYTES * 3; // coordinator + two peers
-            print_row(failure_at, "signed_event_log_3x", checkpoint_interval, failure_at, TASK_WORK, 0, 0, 0, metadata, 0);
         }
     }
 }
 
+fn simulate(network: Network, policy: &str, failure_pct: f64, interval: f64, peer_losses: u8, parity: u8) -> Outcome {
+    let progress_at_failure = TASK_WORK * failure_pct / 100.0;
+    let saved_progress = if policy == "retry" { 0.0 } else { (progress_at_failure / interval).floor() * interval };
+    let checkpoints = (saved_progress / interval).floor();
+    let has_checkpoint = checkpoints > 0.0;
+    let lost_work = progress_at_failure - saved_progress;
+
+    // Checkpoint uploads to peers run concurrently. The slowest peer link sets
+    // the stage duration represented here by the common profile.
+    let checkpoint_peers = match policy { "replica_2x" => 2_u8, "ec_2_1" => 3, "ec_2_2" => 4, _ => 0 };
+    let shard_mb = if parity == 0 { CHECKPOINT_MB } else { CHECKPOINT_MB / 2.0 };
+    let write_per_checkpoint = if checkpoint_peers == 0 || !has_checkpoint {
+        0.0
+    } else {
+        transfer_ms(network, shard_mb) + if parity > 0 {
+            CHECKPOINT_MB * CODEC_ENCODE_MS_PER_MB_PER_PARITY * f64::from(parity)
+        } else { 0.0 }
+    };
+    let write_elapsed = checkpoints * write_per_checkpoint;
+
+    let storage_mb = if has_checkpoint {
+        match policy {
+            "replica_2x" => CHECKPOINT_MB * 2.0,
+            "ec_2_1" => CHECKPOINT_MB * 1.5,
+            "ec_2_2" => CHECKPOINT_MB * 2.0,
+            _ => 0.0,
+        }
+    } else { 0.0 };
+    // This is cumulative traffic for every checkpoint persisted before failure.
+    let transfer_mb = if has_checkpoint { checkpoints * storage_mb } else { 0.0 };
+    let codec_write_ms = if parity > 0 && has_checkpoint {
+        checkpoints * CHECKPOINT_MB * CODEC_ENCODE_MS_PER_MB_PER_PARITY * f64::from(parity)
+    } else { 0.0 };
+
+    let mut success = true;
+    let mut restore_ms = 0.0;
+    let mut codec_read_ms = 0.0;
+    let mut restore_transfer_mb = 0.0;
+    if has_checkpoint && policy != "retry" {
+        success = peer_losses <= if policy == "replica_2x" { 1 } else { parity };
+        if success {
+            restore_transfer_mb = CHECKPOINT_MB;
+            restore_ms = transfer_ms(network, if parity == 0 { CHECKPOINT_MB } else { shard_mb * 2.0 });
+            if parity > 0 { codec_read_ms = CHECKPOINT_MB * CODEC_DECODE_MS_PER_MB; }
+        }
+    }
+
+    let post_failure_work = if success { TASK_WORK - saved_progress } else { TASK_WORK };
+    let recovery_ms = if success {
+        restore_ms + codec_read_ms + post_failure_work / REPLACEMENT_WORK_PER_SEC * 1_000.0
+    } else { TASK_WORK / REPLACEMENT_WORK_PER_SEC * 1_000.0 };
+    let pre_failure_ms = progress_at_failure / PRIMARY_WORK_PER_SEC * 1_000.0 + write_elapsed;
+
+    Outcome {
+        recovery_ms,
+        total_ms: pre_failure_ms + recovery_ms,
+        lost_work: if success { lost_work } else { progress_at_failure },
+        transfer_mb: transfer_mb + restore_transfer_mb,
+        storage_mb,
+        codec_ms: codec_write_ms + codec_read_ms,
+        recoverable_peer_losses: if has_checkpoint {
+            if policy == "replica_2x" { 1 } else { parity }
+        } else { 0 },
+        success,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn erasure_coding_recovers_with_parity_but_fails_beyond_it() {
+        let network = NETWORKS[1];
+        let one = simulate(network, "ec_2_1", 63.0, 10.0, 1, 1);
+        let two = simulate(network, "ec_2_2", 63.0, 10.0, 2, 2);
+        let too_many = simulate(network, "ec_2_1", 63.0, 10.0, 2, 1);
+        assert!(one.success && two.success);
+        assert!(!too_many.success);
+    }
+
+    #[test]
+    fn checkpoint_interval_changes_rework_and_transfer_cost() {
+        let network = NETWORKS[1];
+        let frequent = simulate(network, "replica_2x", 63.0, 10.0, 0, 0);
+        let sparse = simulate(network, "replica_2x", 63.0, 50.0, 0, 0);
+        assert!(frequent.lost_work < sparse.lost_work);
+        assert!(frequent.total_ms > sparse.total_ms);
+    }
+
+    #[test]
+    fn transfer_and_recovery_time_respond_to_network_profile() {
+        let fast = simulate(NETWORKS[0], "ec_2_1", 63.0, 10.0, 0, 1);
+        let slow = simulate(NETWORKS[2], "ec_2_1", 63.0, 10.0, 0, 1);
+        assert!(slow.recovery_ms > fast.recovery_ms);
+        assert_eq!(fast.storage_mb, slow.storage_mb);
+    }
+}
