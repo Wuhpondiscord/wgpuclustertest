@@ -8,6 +8,8 @@ type Member = { id: string; role: 'owner' | 'member' }
 type ActiveInvite = { token: string; expires_at: number }
 type InvitePreview = { cluster_id: string; cluster_name: string; expires_at: number }
 type NodeCreated = { node: Node; token: string }
+type ComputeJob = { id: string; cluster_id: string; created_at: number; total_units: number; batch_units: number; total_batches: number; completed_batches: number }
+type JobLease = { job_id: string; batch_index: number; start: number; end: number; lease: { task_id: string; worker_id: string; coordinator_epoch: number; generation: number; attempt_id: number; expires_at_ms: number } }
 type BrowserNodeConnection = { url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean; peerMesh: PeerMeshNode | null }
 
 function getSessionNodeTokens(): Record<string, string> {
@@ -19,6 +21,18 @@ function getIdentity() {
   let token = localStorage.getItem('mesh.identity')
   if (!token) { token = `${crypto.randomUUID().replace(/-/g, '')}${crypto.randomUUID().replace(/-/g, '')}`; localStorage.setItem('mesh.identity', token) }
   return token
+}
+
+function computeBatch(start: number, end: number) {
+  let accumulator = 0x811c9dc5
+  for (let value = start; value < end; value++) {
+    let mixed = (value ^ 0x9e3779b9) >>> 0
+    mixed = Math.imul(mixed ^ (mixed >>> 16), 0x85ebca6b) >>> 0
+    mixed = Math.imul(mixed ^ (mixed >>> 13), 0xc2b2ae35) >>> 0
+    mixed = (mixed ^ (mixed >>> 16)) >>> 0
+    accumulator = Math.imul(accumulator ^ mixed, 0x01000193) >>> 0
+  }
+  return accumulator.toString(16).padStart(8, '0')
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -37,6 +51,7 @@ function App() {
   const [nodes, setNodes] = useState<Node[]>([])
   const [members, setMembers] = useState<Member[]>([])
   const [invites, setInvites] = useState<ActiveInvite[]>([])
+  const [jobs, setJobs] = useState<ComputeJob[]>([])
   const [invite, setInvite] = useState<InvitePreview | null>(null)
   const [joinToken, setJoinToken] = useState(new URLSearchParams(window.location.search).get('invite') ?? '')
   const [nodeCredentials, setNodeCredentials] = useState<{ name: string; url: string } | null>(null)
@@ -57,7 +72,9 @@ function App() {
         api<Node[]>(`/api/clusters/${nextId}/nodes`),
         api<Member[]>(`/api/clusters/${nextId}/members`),
       ])
+      const nextJobs = await api<ComputeJob[]>(`/api/clusters/${nextId}/jobs`)
       setNodes(nextNodes); setMembers(nextMembers)
+      setJobs(nextJobs)
       const tokens = getSessionNodeTokens()
       for (const node of nextNodes) {
         const token = tokens[node.id]
@@ -68,7 +85,7 @@ function App() {
       }
       const selected = data.find(c => c.id === nextId)
       setInvites(selected?.role === 'owner' ? await api<ActiveInvite[]>(`/api/clusters/${nextId}/invites`) : [])
-    } else { setNodes([]); setMembers([]); setInvites([]) }
+    } else { setNodes([]); setMembers([]); setInvites([]); setJobs([]) }
   }
 
   useEffect(() => {
@@ -99,6 +116,14 @@ function App() {
     void checkCoordinator()
     return () => { stopped = true; window.clearTimeout(timer) }
   }, [])
+
+  useEffect(() => {
+    if (!activeId) return
+    const timer = window.setInterval(() => {
+      void api<ComputeJob[]>(`/api/clusters/${activeId}/jobs`).then(setJobs).catch(() => undefined)
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [activeId])
 
   useEffect(() => {
     if (!activeId) return
@@ -261,6 +286,57 @@ function App() {
       setNotice(`Peer transfer verified: ${result.bytes.toLocaleString()} bytes, SHA-256 ${result.sha256.slice(0, 16)}…`)
     } catch (e) { setError(e instanceof Error ? e.message : 'Peer transfer failed') }
   }
+  async function createComputeJob() {
+    if (!active) return
+    await run(async () => {
+      await api<ComputeJob>(`/api/clusters/${active.id}/jobs`, { method: 'POST', body: JSON.stringify({ total_units: 1_200_000, batch_units: 100_000 }) })
+      setJobs(await api<ComputeJob[]>(`/api/clusters/${active.id}/jobs`))
+      setNotice('Created a 12-batch recoverable compute demo')
+    })
+  }
+  async function runComputeJob(job: ComputeJob) {
+    if (!active) return
+    const tokens = getSessionNodeTokens()
+    const workers = [...sockets.current.entries()].filter(([nodeId, connection]) =>
+      Object.prototype.hasOwnProperty.call(tokens, nodeId) && nodes.some(node => node.id === nodeId && node.cluster_id === active.id && node.online && !node.paused)
+      && connection.socket?.readyState === WebSocket.OPEN && connection.peerMesh)
+    const source = workers[0]
+    const replicas = nodes.filter(node => node.cluster_id === active.id && node.online && !node.paused && node.id !== source?.[0])
+    if (!source?.[1].peerMesh || !replicas.length) { setError('Connect one node owned by this browser and a second online node in the cluster.'); return }
+    setError(''); setNotice('Worker is claiming and processing job batches…')
+    await run(async () => {
+      let idlePolls = 0
+      while (idlePolls < 60) {
+        const claim = await api<JobLease | null>(`/api/jobs/${job.id}/claim`, { method: 'POST', body: JSON.stringify({ node_id: source[0] }) })
+        if (!claim) {
+          const current = await api<ComputeJob[]>(`/api/clusters/${job.cluster_id}/jobs`)
+          setJobs(current)
+          const updated = current.find(item => item.id === job.id)
+          if (!updated || updated.completed_batches >= updated.total_batches) { setNotice('All job batches are complete'); return }
+          idlePolls++
+          await new Promise(resolve => window.setTimeout(resolve, 1000))
+          continue
+        }
+        idlePolls = 0
+        const result = computeBatch(claim.start, claim.end)
+        const artifact = new TextEncoder().encode(JSON.stringify({
+          type: 'mesh-compute-checkpoint-v1', job_id: job.id, batch_index: claim.batch_index,
+          start: claim.start, end: claim.end, result, worker_node_id: source[0], generation: claim.lease.generation,
+        }))
+        const replica = replicas[claim.batch_index % replicas.length]
+        const transfer = await source[1].peerMesh.sendArtifact(replica.id, `job-${job.id}-batch-${claim.batch_index}`, artifact)
+        await api(`/api/jobs/${job.id}/commit`, { method: 'POST', body: JSON.stringify({
+          lease: claim.lease, replica_node_id: replica.id, sha256: transfer.sha256, bytes: transfer.bytes,
+        }) })
+        const current = await api<ComputeJob[]>(`/api/clusters/${job.cluster_id}/jobs`)
+        setJobs(current)
+        const updated = current.find(item => item.id === job.id)
+        setNotice(`Checkpointed batch ${claim.batch_index + 1} of ${job.total_batches} to ${replica.name}`)
+        if (updated && updated.completed_batches >= updated.total_batches) { setNotice('All job batches completed and replicated'); return }
+      }
+      throw new Error('No batches became available before the worker wait limit. You can run the job again after active leases expire.')
+    })
+  }
   async function removeMember(member: Member) {
     if (!active || member.role === 'owner' || !window.confirm(`Remove ${member.id} from “${active.name}”?`)) return
     await run(async () => { await api(`/api/clusters/${active.id}/members/${member.id}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Member removed') })
@@ -306,7 +382,8 @@ function App() {
           <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions">{active.role==='owner'?<><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button" onClick={() => void renameCluster()}><Settings size={15}/>Rename</button><button className="manage-button danger" onClick={() => void deleteCluster()}><Trash2 size={15}/>Delete cluster</button></>:<button className="manage-button" onClick={() => void leaveCluster()}><LogOut size={15}/>Leave cluster</button>}</div></div>
           <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.online?'Connected':n.paused?'Paused':'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
             <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.token.slice(0,10)}…</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
-          <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages control; artifact bytes move peer to peer.</b><span>Nodes negotiate direct WebRTC data channels through same-cluster signaling. Use Test P2P to send and verify a local checkpoint artifact. General job dispatch and automatic recovery are still being built.</span></div></div>
+          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Compute jobs</h3><p>Leased batches are retried after worker failure; each result is peer-replicated before commit.</p></div><button className="manage-button small primary" onClick={() => void createComputeJob()}>Create demo job</button></div>{jobs.length===0?<div className="table-empty">No jobs yet. Create a bounded compute demo to exercise leases and replicated checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);return <div className="job-row" key={job.id}><div className="job-title"><b>Deterministic batch workload</b><small>{job.total_units.toLocaleString()} units · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}</small><div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><button className="manage-button small" disabled={done||nodes.filter(node=>node.online&&!node.paused).length<2} onClick={() => void runComputeJob(job)}>{done?'Complete':'Run on this node'}</button></div>})}</div>}</article>
+          <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages leases; checkpoints move peer to peer.</b><span>The demo uses small independent CPU batches, SHA-256 verified transfers, and one online peer replica before each batch commit. It demonstrates retryable orchestration, not GPU acceleration, arbitrary code execution, or compute rewards.</span></div></div>
         </>}</section>
       </div>}
       <footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
