@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Activity, ArrowRight, Boxes, Check, Copy, Cpu, Link2, LogOut, Pause, Play, Plus, RefreshCw, Settings, Shield, Trash2, Users, X } from 'lucide-react'
 import { PeerMeshNode } from './peer'
+import { createVectorAddWorker, digestVectorAddResult, runVectorAddCpu } from './webgpu'
 
 type Cluster = { id: string; name: string; role: 'owner' | 'member'; members: number; nodes: number; online_nodes: number }
 type Node = { id: string; cluster_id: string; name: string; paused: boolean; online: boolean; last_seen: number | null }
@@ -8,7 +9,7 @@ type Member = { id: string; role: 'owner' | 'member' }
 type ActiveInvite = { token: string; expires_at: number }
 type InvitePreview = { cluster_id: string; cluster_name: string; expires_at: number }
 type NodeCreated = { node: Node; token: string }
-type ComputeJob = { id: string; cluster_id: string; created_at: number; total_units: number; batch_units: number; total_batches: number; completed_batches: number }
+type ComputeJob = { id: string; cluster_id: string; created_at: number; workload: 'cpu-hash' | 'vector-add'; total_units: number; batch_units: number; total_batches: number; completed_batches: number }
 type JobLease = { job_id: string; batch_index: number; start: number; end: number; lease: { task_id: string; worker_id: string; coordinator_epoch: number; generation: number; attempt_id: number; expires_at_ms: number } }
 type BrowserNodeConnection = { url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean; peerMesh: PeerMeshNode | null }
 
@@ -286,12 +287,12 @@ function App() {
       setNotice(`Peer transfer verified: ${result.bytes.toLocaleString()} bytes, SHA-256 ${result.sha256.slice(0, 16)}…`)
     } catch (e) { setError(e instanceof Error ? e.message : 'Peer transfer failed') }
   }
-  async function createComputeJob() {
+  async function createComputeJob(workload: ComputeJob['workload']) {
     if (!active) return
     await run(async () => {
-      await api<ComputeJob>(`/api/clusters/${active.id}/jobs`, { method: 'POST', body: JSON.stringify({ total_units: 1_200_000, batch_units: 100_000 }) })
+      await api<ComputeJob>(`/api/clusters/${active.id}/jobs`, { method: 'POST', body: JSON.stringify({ workload, total_units: 1_200_000, batch_units: 100_000 }) })
       setJobs(await api<ComputeJob[]>(`/api/clusters/${active.id}/jobs`))
-      setNotice('Created a 12-batch recoverable compute demo')
+      setNotice(workload === 'vector-add' ? 'Created a 12-batch WebGPU vector-add job (workers without WebGPU use the bounded CPU fallback)' : 'Created a 12-batch recoverable CPU demo')
     })
   }
   async function runComputeJob(job: ComputeJob) {
@@ -305,10 +306,17 @@ function App() {
     if (!source?.[1].peerMesh || !replicas.length) { setError('Connect one node owned by this browser and a second online node in the cluster.'); return }
     const peerMesh = source[1].peerMesh
     if (!peerMesh) { setError('The worker peer transport is not ready.'); return }
-    setError(''); setNotice('Worker is claiming and processing job batches…')
+    let gpuWorker: Awaited<ReturnType<typeof createVectorAddWorker>> = null
+    let executionMode: 'webgpu' | 'cpu-fallback' | 'cpu' = 'cpu'
+    if (job.workload === 'vector-add') {
+      try { gpuWorker = await createVectorAddWorker() } catch { gpuWorker = null }
+      executionMode = gpuWorker ? 'webgpu' : 'cpu-fallback'
+    }
+    setError(''); setNotice(gpuWorker ? 'WebGPU worker is claiming and processing job batches…' : job.workload === 'vector-add' ? 'WebGPU is unavailable; using the bounded CPU fallback…' : 'CPU worker is claiming and processing job batches…')
     await run(async () => {
-      let idlePolls = 0
-      while (idlePolls < 60) {
+      try {
+       let idlePolls = 0
+       while (idlePolls < 60) {
         const claim = await api<JobLease | null>(`/api/jobs/${job.id}/claim`, { method: 'POST', body: JSON.stringify({ node_id: source[0] }) })
         if (!claim) {
           const current = await api<ComputeJob[]>(`/api/clusters/${job.cluster_id}/jobs`)
@@ -320,10 +328,15 @@ function App() {
           continue
         }
         idlePolls = 0
-        const result = computeBatch(claim.start, claim.end)
+        const vectorResult = job.workload === 'vector-add'
+          ? (gpuWorker ? await gpuWorker.run(claim.start, claim.end) : runVectorAddCpu(claim.start, claim.end))
+          : null
+        const result = vectorResult ? await digestVectorAddResult(vectorResult) : computeBatch(claim.start, claim.end)
         const artifact = new TextEncoder().encode(JSON.stringify({
-          type: 'mesh-compute-checkpoint-v1', job_id: job.id, batch_index: claim.batch_index,
-          start: claim.start, end: claim.end, result, worker_node_id: source[0], generation: claim.lease.generation,
+          type: 'mesh-compute-checkpoint-v2', workload: job.workload, execution_mode: executionMode,
+          job_id: job.id, batch_index: claim.batch_index, start: claim.start, end: claim.end,
+          result_digest: result, output: vectorResult ? Array.from(vectorResult) : undefined,
+          worker_node_id: source[0], generation: claim.lease.generation,
         }))
         const replica = replicas[claim.batch_index % replicas.length]
         const transfer = await peerMesh.sendArtifact(replica.id, `job-${job.id}-batch-${claim.batch_index}`, artifact)
@@ -333,10 +346,11 @@ function App() {
         const current = await api<ComputeJob[]>(`/api/clusters/${job.cluster_id}/jobs`)
         setJobs(current)
         const updated = current.find(item => item.id === job.id)
-        setNotice(`Checkpointed batch ${claim.batch_index + 1} of ${job.total_batches} to ${replica.name}`)
+        setNotice(`Checkpointed ${job.workload === 'vector-add' ? 'vector-add' : 'CPU'} batch ${claim.batch_index + 1} of ${job.total_batches} to ${replica.name}`)
         if (updated && updated.completed_batches >= updated.total_batches) { setNotice('All job batches completed and replicated'); return }
       }
       throw new Error('No batches became available before the worker wait limit. You can run the job again after active leases expire.')
+      } finally { gpuWorker?.close() }
     })
   }
   async function removeMember(member: Member) {
@@ -384,8 +398,8 @@ function App() {
           <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions">{active.role==='owner'?<><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button" onClick={() => void renameCluster()}><Settings size={15}/>Rename</button><button className="manage-button danger" onClick={() => void deleteCluster()}><Trash2 size={15}/>Delete cluster</button></>:<button className="manage-button" onClick={() => void leaveCluster()}><LogOut size={15}/>Leave cluster</button>}</div></div>
           <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.online?'Connected':n.paused?'Paused':'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
             <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.token.slice(0,10)}…</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
-          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Compute jobs</h3><p>Leased batches are retried after worker failure; each result is peer-replicated before commit.</p></div><button className="manage-button small primary" onClick={() => void createComputeJob()}>Create demo job</button></div>{jobs.length===0?<div className="table-empty">No jobs yet. Create a bounded compute demo to exercise leases and replicated checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);return <div className="job-row" key={job.id}><div className="job-title"><b>Deterministic batch workload</b><small>{job.total_units.toLocaleString()} units · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}</small><div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><button className="manage-button small" disabled={done||nodes.filter(node=>node.online&&!node.paused).length<2} onClick={() => void runComputeJob(job)}>{done?'Complete':'Run on this node'}</button></div>})}</div>}</article>
-          <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages leases; checkpoints move peer to peer.</b><span>The demo uses small independent CPU batches, SHA-256 verified transfers, and one online peer replica before each batch commit. It demonstrates retryable orchestration, not GPU acceleration, arbitrary code execution, or compute rewards.</span></div></div>
+          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Compute jobs</h3><p>Leased batches are retried after worker failure; each result is peer-replicated before commit.</p></div><div className="heading-buttons"><button className="manage-button small" onClick={() => void createComputeJob('cpu-hash')}>Create CPU demo</button><button className="manage-button small primary" onClick={() => void createComputeJob('vector-add')}>Create WebGPU job</button></div></div>{jobs.length===0?<div className="table-empty">Create a bounded CPU or WebGPU vector-add workload to exercise leases and replicated checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);return <div className="job-row" key={job.id}><div className="job-title"><b>{job.workload==='vector-add'?'Vector addition (WebGPU with CPU fallback)':'Deterministic CPU hash'}</b><small>{job.total_units.toLocaleString()} elements · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}</small><div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><button className="manage-button small" disabled={done||nodes.filter(node=>node.online&&!node.paused).length<2} onClick={() => void runComputeJob(job)}>{done?'Complete':'Run on this node'}</button></div>})}</div>}</article>
+          <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages leases; checkpoints move peer to peer.</b><span>Vector-add batches run on WebGPU where available, otherwise use a bounded CPU fallback. The worker hashes each result, replicates the checkpoint to one peer, and commits only after the peer ACK. This is an execution prototype, not a trusted compute or rewards system.</span></div></div>
         </>}</section>
       </div>}
       <footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
