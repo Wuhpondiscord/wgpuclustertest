@@ -217,6 +217,7 @@ export class PeerMeshNode {
     }
     const receivedHash = await acknowledged
     if (receivedHash !== sha256) throw new Error('Peer acknowledged a different artifact digest')
+    await persistArtifact(`local:${transferId}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
     return { transferId, sha256, bytes: bytes.length }
   }
 
