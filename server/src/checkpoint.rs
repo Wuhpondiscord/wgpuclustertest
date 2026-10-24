@@ -78,7 +78,7 @@ pub fn adaptive_interval(input: &CheckpointInput) -> f64 {
     let min = input.min_interval_seconds.max(0.1);
     let max = input.max_interval_seconds.max(min);
     let checkpoint_cost = (input.observed_transfer_ms / 1_000.0).max(0.001);
-    let mttf = input.estimated_mttf_seconds.max(checkpoint_cost);
+    let mttf = input.estimated_mttf_seconds.max(0.1);
     let estimate = (2.0 * checkpoint_cost * mttf).sqrt();
     estimate.clamp(min, max)
 }
