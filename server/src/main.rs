@@ -24,6 +24,10 @@ const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const NODE_PING_INTERVAL_SECS: u64 = 15;
 const NODE_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
 const MAX_STORAGE_CONFLICT_RETRIES: usize = 3;
+const JOB_LEASE_DURATION_MS: u64 = 45_000;
+const MAX_JOB_UNITS: u64 = 10_000_000;
+const MAX_JOB_BATCHES: u64 = 256;
+const MAX_PEER_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +61,29 @@ struct Store {
     clusters: HashMap<Uuid, Cluster>,
     invites: HashMap<String, Invite>,
     nodes: HashMap<Uuid, Node>,
+    #[serde(default)]
+    jobs: HashMap<Uuid, ComputeJob>,
+    #[serde(default)]
+    recovery: recovery::RecoveryLedger,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ComputeJob {
+    id: Uuid,
+    cluster_id: Uuid,
+    created_at: u64,
+    total_units: u64,
+    batch_units: u64,
+    outputs: HashMap<u64, BatchOutput>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct BatchOutput {
+    sha256: String,
+    bytes: u64,
+    worker_node_id: Uuid,
+    replica_node_id: Uuid,
+    committed_at: u64,
 }
 
 #[derive(Clone)]
@@ -82,6 +109,9 @@ struct NodeConnection {
 #[derive(Deserialize)] struct CreateCluster { name: String }
 #[derive(Deserialize)] struct RenameCluster { name: String }
 #[derive(Deserialize)] struct CreateNode { name: String }
+#[derive(Deserialize)] struct CreateJob { total_units: u64, batch_units: u64 }
+#[derive(Deserialize)] struct ClaimJob { node_id: Uuid }
+#[derive(Deserialize)] struct CommitBatch { lease: recovery::TaskLease, replica_node_id: Uuid, sha256: String, bytes: u64 }
 #[derive(Deserialize)] struct JoinInvite { token: String }
 #[derive(Deserialize)] struct NodeSocketQuery { token: String }
 #[derive(Serialize)]
@@ -90,6 +120,10 @@ struct ClusterSummary { id: Uuid, name: String, role: Role, members: usize, node
 struct NodeSummary { id: Uuid, cluster_id: Uuid, name: String, paused: bool, online: bool, last_seen: Option<u64> }
 #[derive(Serialize)]
 struct NodeCreated { node: NodeSummary, token: String }
+#[derive(Serialize)]
+struct JobSummary { id: Uuid, cluster_id: Uuid, created_at: u64, total_units: u64, batch_units: u64, total_batches: u64, completed_batches: usize }
+#[derive(Serialize)]
+struct JobLease { job_id: Uuid, batch_index: u64, start: u64, end: u64, lease: recovery::TaskLease }
 #[derive(Serialize)]
 struct InvitePreview { cluster_id: Uuid, cluster_name: String, expires_at: u64 }
 #[derive(Serialize)]
@@ -143,6 +177,10 @@ fn require_owner<'a>(store: &'a Store, cluster_id: Uuid, user: &str) -> ApiResul
 }
 fn node_summary(node: &Node) -> NodeSummary {
     NodeSummary { id: node.id, cluster_id: node.cluster_id, name: node.name.clone(), paused: node.paused, online: node.online, last_seen: node.last_seen }
+}
+fn job_summary(job: &ComputeJob) -> JobSummary {
+    JobSummary { id: job.id, cluster_id: job.cluster_id, created_at: job.created_at, total_units: job.total_units,
+        batch_units: job.batch_units, total_batches: job.total_units.div_ceil(job.batch_units), completed_batches: job.outputs.len() }
 }
 fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
     let serialized = serde_json::to_vec(store).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not serialize state".into()))?;
@@ -336,11 +374,108 @@ async fn rename_cluster(State(state): State<AppState>, Path(id): Path<Uuid>, hea
     }).await?;
     Ok(Json(result))
 }
+async fn list_jobs(State(state): State<AppState>, Path(cluster_id): Path<Uuid>, headers: HeaderMap) -> ApiResult<Json<Vec<JobSummary>>> {
+    let user = identity(&headers)?;
+    let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
+    require_member(&store, cluster_id, &user)?;
+    Ok(Json(store.jobs.values().filter(|job| job.cluster_id == cluster_id).map(job_summary).collect()))
+}
+async fn create_job(State(state): State<AppState>, Path(cluster_id): Path<Uuid>, headers: HeaderMap, Json(input): Json<CreateJob>) -> ApiResult<(StatusCode, Json<JobSummary>)> {
+    let user = identity(&headers)?;
+    if input.total_units == 0 || input.total_units > MAX_JOB_UNITS || input.batch_units < 1_000 || input.batch_units > 500_000
+        || input.total_units.div_ceil(input.batch_units) > MAX_JOB_BATCHES {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "Job must contain 1–10,000,000 units, batches of 1,000–500,000 units, and at most 256 batches".into()));
+    }
+    let job_id = Uuid::new_v4();
+    let total_units = input.total_units;
+    let batch_units = input.batch_units;
+    let result = mutate_store(&state, move |store| {
+        require_member(store, cluster_id, &user)?;
+        let total_batches = total_units.div_ceil(batch_units);
+        for index in 0..total_batches {
+            store.recovery.add_task(format!("{job_id}:{index}"))
+                .map_err(|_| ApiError(StatusCode::CONFLICT, "Could not register a job batch".into()))?;
+        }
+        let job = ComputeJob { id: job_id, cluster_id, created_at: now(), total_units, batch_units, outputs: HashMap::new() };
+        let summary = job_summary(&job);
+        store.jobs.insert(job_id, job);
+        Ok(summary)
+    }).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+async fn claim_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid>, headers: HeaderMap, Json(input): Json<ClaimJob>) -> ApiResult<Json<Option<JobLease>>> {
+    let user = identity(&headers)?;
+    let node_id = input.node_id;
+    let result = mutate_store(&state, move |store| {
+        let job = store.jobs.get(&job_id).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Job not found".into()))?;
+        require_member(store, job.cluster_id, &user)?;
+        let node = store.nodes.get(&node_id).filter(|node| node.cluster_id == job.cluster_id && node.owner_id == user)
+            .ok_or(ApiError(StatusCode::FORBIDDEN, "This node is not owned by your Mesh identity in this cluster".into()))?;
+        if !node.online || node.paused { return Err(ApiError(StatusCode::CONFLICT, "The worker node must be online and active".into())); }
+        let now_ms = now().saturating_mul(1_000);
+        let total_batches = job.total_units.div_ceil(job.batch_units);
+        for batch_index in 0..total_batches {
+            if job.outputs.contains_key(&batch_index) { continue; }
+            let task_id = format!("{job_id}:{batch_index}");
+            match store.recovery.claim(&task_id, node_id.to_string(), now_ms, JOB_LEASE_DURATION_MS) {
+                Ok(lease) => {
+                    let start = batch_index.saturating_mul(job.batch_units);
+                    let end = start.saturating_add(job.batch_units).min(job.total_units);
+                    return Ok(Some(JobLease { job_id, batch_index, start, end, lease }));
+                }
+                Err(recovery::LeaseError::LeaseBusy | recovery::LeaseError::AlreadyComplete) => continue,
+                Err(_) => return Err(ApiError(StatusCode::CONFLICT, "Could not lease this job batch".into())),
+            }
+        }
+        Ok(None)
+    }).await?;
+    Ok(Json(result))
+}
+async fn commit_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid>, headers: HeaderMap, Json(input): Json<CommitBatch>) -> ApiResult<StatusCode> {
+    let user = identity(&headers)?;
+    if input.bytes == 0 || input.bytes > MAX_PEER_ARTIFACT_BYTES || input.sha256.len() != 64 || !input.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "Checkpoint artifact metadata is invalid".into()));
+    }
+    let result = mutate_store(&state, move |store| {
+        let job = store.jobs.get(&job_id).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Job not found".into()))?;
+        require_member(store, job.cluster_id, &user)?;
+        let worker_id = Uuid::parse_str(&input.lease.worker_id).map_err(|_| ApiError(StatusCode::FORBIDDEN, "Invalid lease worker".into()))?;
+        let worker = store.nodes.get(&worker_id).filter(|node| node.cluster_id == job.cluster_id && node.owner_id == user)
+            .ok_or(ApiError(StatusCode::FORBIDDEN, "The lease worker is not owned by your Mesh identity".into()))?;
+        let replica = store.nodes.get(&input.replica_node_id).filter(|node| node.cluster_id == job.cluster_id && node.id != worker.id && !node.paused && node.online)
+            .ok_or(ApiError(StatusCode::CONFLICT, "A second active cluster node must hold the checkpoint artifact".into()))?;
+        let prefix = format!("{job_id}:");
+        let batch_index = input.lease.task_id.strip_prefix(&prefix).and_then(|value| value.parse::<u64>().ok())
+            .ok_or(ApiError(StatusCode::BAD_REQUEST, "Lease does not belong to this job".into()))?;
+        if batch_index >= job.total_units.div_ceil(job.batch_units) { return Err(ApiError(StatusCode::BAD_REQUEST, "Lease batch is out of range".into())); }
+        if let Some(existing) = job.outputs.get(&batch_index) {
+            return if existing.sha256 == input.sha256 { Ok(()) } else { Err(ApiError(StatusCode::CONFLICT, "This batch already committed a different artifact".into())) };
+        }
+        store.recovery.commit_result(&input.lease, now().saturating_mul(1_000), input.sha256.clone())
+            .map_err(|error| match error {
+                recovery::LeaseError::LeaseExpired => ApiError(StatusCode::CONFLICT, "The worker lease expired; claim the batch again".into()),
+                recovery::LeaseError::StaleLease => ApiError(StatusCode::CONFLICT, "This worker lease is stale".into()),
+                _ => ApiError(StatusCode::CONFLICT, "The result could not be committed".into()),
+            })?;
+        store.jobs.get_mut(&job_id).expect("job was checked").outputs.insert(batch_index, BatchOutput {
+            sha256: input.sha256.clone(), bytes: input.bytes, worker_node_id: worker_id,
+            replica_node_id: replica.id, committed_at: now(),
+        });
+        Ok(())
+    }).await?;
+    let _ = result;
+    Ok(StatusCode::NO_CONTENT)
+}
 async fn delete_cluster(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<StatusCode> {
     let user = identity(&headers)?;
     let removed_nodes = mutate_store(&state, move |store| {
         require_owner(store, id, &user)?;
         let removed_nodes: Vec<Uuid> = store.nodes.values().filter(|node| node.cluster_id == id).map(|node| node.id).collect();
+        let removed_jobs = store.jobs.values().filter(|job| job.cluster_id == id).cloned().collect::<Vec<_>>();
+        for job in removed_jobs {
+            for index in 0..job.total_units.div_ceil(job.batch_units) { store.recovery.remove_task(&format!("{}:{index}", job.id)); }
+        }
+        store.jobs.retain(|_, job| job.cluster_id != id);
         store.clusters.remove(&id); store.nodes.retain(|_, node| node.cluster_id != id); store.invites.retain(|_, inv| inv.cluster_id != id);
         Ok(removed_nodes)
     }).await?;
@@ -660,12 +795,16 @@ async fn main() {
         let store = std::fs::read(&data_file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         (store, None)
     };
+    let _ = store.recovery.restart_coordinator();
     for node in store.nodes.values_mut() { node.online = false; }
     let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/clusters", get(list_clusters).post(create_cluster))
         .route("/api/clusters/:id", axum::routing::patch(rename_cluster).delete(delete_cluster))
+        .route("/api/clusters/:id/jobs", get(list_jobs).post(create_job))
+        .route("/api/jobs/:id/claim", post(claim_job_batch))
+        .route("/api/jobs/:id/commit", post(commit_job_batch))
         .route("/api/clusters/:id/invites", get(list_invites).post(create_invite))
         .route("/api/clusters/:id/invites/:token", axum::routing::delete(revoke_invite))
         .route("/api/clusters/:id/leave", post(leave_cluster))
@@ -946,6 +1085,46 @@ mod tests {
         let Message::Text(joined) = active_rx.try_recv().unwrap() else { panic!("expected peer joined event"); };
         assert_eq!(serde_json::from_str::<serde_json::Value>(&joined).unwrap()["peer_node_id"], current_id.to_string());
         assert!(paused_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn job_batches_require_a_live_owned_worker_and_replicated_checkpoint_before_commit() {
+        let file = std::env::temp_dir().join(format!("mesh-job-test-{}.json", Uuid::new_v4()));
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let owner_token = "job-owner-identity-token-012345678901234567890";
+        let owner_headers = test_headers(owner_token);
+        let stranger_headers = test_headers("job-stranger-identity-token-01234567890123456789");
+        let (_, Json(cluster)) = create_cluster(State(state.clone()), owner_headers.clone(), Json(CreateCluster { name: "Compute".into() })).await.unwrap();
+        let (_, Json(worker)) = create_node(State(state.clone()), Path(cluster.id), owner_headers.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
+        let (_, Json(replica)) = create_node(State(state.clone()), Path(cluster.id), owner_headers.clone(), Json(CreateNode { name: "Replica".into() })).await.unwrap();
+        for node_id in [worker.node.id, replica.node.id] { state.store.lock().unwrap().nodes.get_mut(&node_id).unwrap().online = true; }
+        let (status, Json(job)) = create_job(State(state.clone()), Path(cluster.id), owner_headers.clone(), Json(CreateJob { total_units: 2_500, batch_units: 1_000 })).await.unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(job.total_batches, 3);
+        assert!(claim_job_batch(State(state.clone()), Path(job.id), stranger_headers, Json(ClaimJob { node_id: worker.node.id })).await.is_err());
+
+        let Json(Some(claim)) = claim_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(ClaimJob { node_id: worker.node.id })).await.unwrap() else { panic!("expected an available batch"); };
+        assert_eq!((claim.start, claim.end), (0, 1_000));
+        let digest = "a".repeat(64);
+        state.store.lock().unwrap().nodes.get_mut(&replica.node.id).unwrap().online = false;
+        assert!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease.clone(), replica_node_id: replica.node.id, sha256: digest.clone(), bytes: 128 })).await.is_err());
+        state.store.lock().unwrap().nodes.get_mut(&replica.node.id).unwrap().online = true;
+        let commit = CommitBatch { lease: claim.lease.clone(), replica_node_id: replica.node.id, sha256: digest.clone(), bytes: 128 };
+        assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(commit)).await.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease, replica_node_id: replica.node.id, sha256: digest, bytes: 128 })).await.unwrap(), StatusCode::NO_CONTENT);
+
+        let Json(jobs) = list_jobs(State(state.clone()), Path(cluster.id), owner_headers).await.unwrap();
+        assert_eq!(jobs[0].completed_batches, 1);
+        let Json(Some(next)) = claim_job_batch(State(state.clone()), Path(job.id), test_headers(owner_token), Json(ClaimJob { node_id: worker.node.id })).await.unwrap() else { panic!("expected the next independent batch"); };
+        assert_eq!((next.start, next.end), (1_000, 2_000));
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn older_cluster_snapshots_load_with_empty_job_state() {
+        let store: Store = serde_json::from_str(r#"{"clusters":{},"invites":{},"nodes":{}}"#).unwrap();
+        assert!(store.jobs.is_empty());
+        assert!(!store.recovery.is_complete("missing"));
     }
 }
 

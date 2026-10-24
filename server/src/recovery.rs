@@ -64,6 +64,10 @@ impl RecoveryLedger {
         Ok(())
     }
 
+    pub fn remove_task(&mut self, task_id: &str) -> bool {
+        self.tasks.remove(task_id).is_some()
+    }
+
     /// Claim an unassigned or expired task. A new generation fences every prior
     /// worker attempt; unrelated task records are unaffected.
     pub fn claim(
