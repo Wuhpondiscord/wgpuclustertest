@@ -15,6 +15,8 @@ use tokio::time::{interval, Duration};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
+#[allow(dead_code)]
+mod checkpoint;
 mod recovery;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";

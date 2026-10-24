@@ -33,11 +33,18 @@ jobs:
         shell: bash
         run: |
           cargo run --manifest-path server/Cargo.toml --bin recovery-bench | tee recovery-benchmark.csv
+          cargo run --manifest-path server/Cargo.toml --bin checkpoint-bench | tee checkpoint-policy-benchmark.csv
           {
             echo '### Recovery policy simulation (modeled milliseconds and MB; not hardware measurements)'
             echo
             echo '```csv'
             cat recovery-benchmark.csv
+            echo '```'
+            echo
+            echo '### Adaptive checkpoint policy comparison (modeled values; not hardware measurements)'
+            echo
+            echo '```csv'
+            cat checkpoint-policy-benchmark.csv
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
