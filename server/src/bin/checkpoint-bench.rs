@@ -21,7 +21,7 @@ struct Scenario {
 
 const SCENARIOS: [Scenario; 2] = [
     Scenario { name: "stable_fast", bandwidth_mbps: 250, rtt_ms: 10, mttf_seconds: 3_600.0 },
-    Scenario { name: "unreliable_slow", bandwidth_mbps: 18, rtt_ms: 80, mttf_seconds: 20.0 },
+    Scenario { name: "unreliable_slow", bandwidth_mbps: 18, rtt_ms: 80, mttf_seconds: 12.0 },
 ];
 
 fn main() {
