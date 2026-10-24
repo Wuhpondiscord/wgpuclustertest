@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs::OpenOptions, io::Write, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
@@ -69,7 +69,14 @@ struct AppState {
     data_file: Arc<PathBuf>,
     github: Option<Arc<GitHubStorage>>,
     github_file_sha: Arc<Mutex<Option<String>>>,
-    node_connections: Arc<Mutex<HashMap<Uuid, Uuid>>>,
+    node_connections: Arc<Mutex<HashMap<Uuid, NodeConnection>>>,
+}
+
+#[derive(Clone)]
+struct NodeConnection {
+    session_id: Uuid,
+    cluster_id: Uuid,
+    sender: tokio::sync::mpsc::Sender<Message>,
 }
 
 #[derive(Deserialize)] struct CreateCluster { name: String }
@@ -77,7 +84,6 @@ struct AppState {
 #[derive(Deserialize)] struct CreateNode { name: String }
 #[derive(Deserialize)] struct JoinInvite { token: String }
 #[derive(Deserialize)] struct NodeSocketQuery { token: String }
-
 #[derive(Serialize)]
 struct ClusterSummary { id: Uuid, name: String, role: Role, members: usize, nodes: usize, online_nodes: usize }
 #[derive(Serialize)]
@@ -456,6 +462,24 @@ async fn set_node_paused(State(state): State<AppState>, Path(id): Path<Uuid>, he
         node.paused = paused;
         Ok(node_summary(node))
     }).await?;
+    let (node_session, peers) = if let Ok(connections) = state.node_connections.lock() {
+        let node_session = connections.get(&id).map(|connection| {
+            let control = serde_json::json!({"type":"control","paused":paused}).to_string();
+            let _ = connection.sender.try_send(Message::Text(control));
+            connection.session_id
+        });
+        let peers = connections.values().filter(|connection| connection.cluster_id == result.cluster_id)
+            .filter(|connection| Some(connection.session_id) != node_session)
+            .map(|connection| connection.sender.clone()).collect::<Vec<_>>();
+        (node_session, peers)
+    } else { (None, Vec::new()) };
+    if paused {
+        let event = serde_json::json!({"type":"peer_left","peer_node_id":id}).to_string();
+        for peer in peers { let _ = peer.try_send(Message::Text(event.clone())); }
+    } else {
+        let _ = node_session;
+        announce_peer_presence(&state, id, true);
+    }
     Ok(Json(result))
 }
 async fn pause_node(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<Json<NodeSummary>> { set_node_paused(State(state), Path(id), headers, true).await }
@@ -484,17 +508,30 @@ async fn node_socket(State(state): State<AppState>, Query(query): Query<NodeSock
     Ok(ws.max_message_size(64 * 1024).max_frame_size(16 * 1024)
         .on_upgrade(move |socket| run_node_socket(socket, state, node_id, session_id)))
 }
-fn register_node_connection(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
-    if let Ok(mut connections) = state.node_connections.lock() { connections.insert(id, session_id); } else { return false; }
-    let registered = if let Ok(mut store) = state.store.lock() {
-        if let Some(node) = store.nodes.get_mut(&id) { node.online = true; node.last_seen = Some(now()); true } else { false }
+fn register_node_connection(state: &AppState, id: Uuid, session_id: Uuid, sender: tokio::sync::mpsc::Sender<Message>) -> bool {
+    let cluster_id = if let Ok(store) = state.store.lock() {
+        if let Some(node) = store.nodes.get(&id) { node.cluster_id } else { return false; }
+    } else { return false; };
+    let inserted = if let Ok(mut connections) = state.node_connections.lock() {
+        connections.insert(id, NodeConnection { session_id, cluster_id, sender });
+        true
     } else { false };
-    if !registered { if let Ok(mut connections) = state.node_connections.lock() { if connections.get(&id) == Some(&session_id) { connections.remove(&id); } } }
-    registered
+    if !inserted { return false; }
+    if let Ok(mut store) = state.store.lock() {
+        if let Some(node) = store.nodes.get_mut(&id) { node.online = true; node.last_seen = Some(now()); true }
+        else {
+            if let Ok(mut connections) = state.node_connections.lock() {
+                if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id); }
+            }
+            false
+        }
+    } else { false }
 }
+
 fn is_current_node_connection(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
-    state.node_connections.lock().map(|connections| connections.get(&id) == Some(&session_id)).unwrap_or(false)
+    state.node_connections.lock().map(|connections| connections.get(&id).is_some_and(|connection| connection.session_id == session_id)).unwrap_or(false)
 }
+
 fn update_node_heartbeat(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
     if !is_current_node_connection(state, id, session_id) { return false; }
     if let Ok(mut store) = state.store.lock() {
@@ -502,28 +539,87 @@ fn update_node_heartbeat(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
     }
     false
 }
-fn disconnect_node(state: &AppState, id: Uuid, session_id: Uuid) {
-    let removed = if let Ok(mut connections) = state.node_connections.lock() {
-        if connections.get(&id) == Some(&session_id) { connections.remove(&id); true } else { false }
-    } else { false };
-    if removed { if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); } } }
+
+fn announce_peer_presence(state: &AppState, id: Uuid, joined: bool) {
+    let active_ids = state.store.lock().ok().map(|store| store.nodes.values().filter(|node| !node.paused).map(|node| node.id).collect::<std::collections::HashSet<_>>()).unwrap_or_default();
+    let Ok(connections) = state.node_connections.lock() else { return; };
+    let Some(current) = connections.get(&id) else { return; };
+    let cluster_id = current.cluster_id;
+    let peers = connections.iter().filter(|(peer_id, connection)| **peer_id != id && connection.cluster_id == cluster_id && active_ids.contains(peer_id))
+        .map(|(peer_id, connection)| (*peer_id, connection.sender.clone())).collect::<Vec<_>>();
+    let peer_ids = peers.iter().map(|(peer_id, _)| *peer_id).collect::<Vec<_>>();
+    if let Ok(payload) = serde_json::to_string(&serde_json::json!({"type":"peer_list","peer_node_ids":peer_ids})) {
+        let _ = current.sender.try_send(Message::Text(payload));
+    }
+    let event_type = if joined { "peer_joined" } else { "peer_left" };
+    let event = serde_json::json!({"type":event_type,"peer_node_id":id}).to_string();
+    for (_, sender) in peers { let _ = sender.try_send(Message::Text(event.clone())); }
 }
-async fn run_node_socket(mut socket: WebSocket, state: AppState, id: Uuid, session_id: Uuid) {
-    if !register_node_connection(&state, id, session_id) { return; }
+
+fn disconnect_node(state: &AppState, id: Uuid, session_id: Uuid) {
+    let removed_cluster = if let Ok(mut connections) = state.node_connections.lock() {
+        if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id).map(|connection| connection.cluster_id) } else { None }
+    } else { None };
+    if let Some(cluster_id) = removed_cluster {
+        if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); } }
+        // Tell remaining same-cluster workers to close stale peer channels.
+        let event = serde_json::json!({"type":"peer_left","peer_node_id":id}).to_string();
+        if let Ok(connections) = state.node_connections.lock() {
+            for connection in connections.values().filter(|connection| connection.cluster_id == cluster_id) {
+                let _ = connection.sender.try_send(Message::Text(event.clone()));
+            }
+        }
+    }
+}
+
+async fn route_peer_signal(state: &AppState, from_id: Uuid, session_id: Uuid, text: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return; };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("signal") { return; }
+    let Some(peer_id) = value.get("peer_node_id").and_then(serde_json::Value::as_str).and_then(|id| Uuid::parse_str(id).ok()) else { return; };
+    let Some(payload) = value.get("payload") else { return; };
+    if serde_json::to_vec(payload).map_or(true, |bytes| bytes.len() > 32 * 1024) { return; }
+    let same_active_cluster = state.store.lock().ok().is_some_and(|store| {
+        store.nodes.get(&from_id).is_some_and(|from| {
+            !from.paused && store.nodes.get(&peer_id).is_some_and(|to| !to.paused && to.cluster_id == from.cluster_id)
+        })
+    });
+    if !same_active_cluster { return; }
+    let Ok(connections) = state.node_connections.lock() else { return; };
+    let Some(from) = connections.get(&from_id).filter(|connection| connection.session_id == session_id) else { return; };
+    let Some(to) = connections.get(&peer_id).filter(|connection| connection.cluster_id == from.cluster_id) else { return; };
+    let sender = to.sender.clone();
+    drop(connections);
+    let forwarded = serde_json::json!({"type":"signal","peer_node_id":from_id,"payload":payload}).to_string();
+    let _ = sender.try_send(Message::Text(forwarded));
+}
+
+async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_id: Uuid) {
+    let (outbound, mut queued) = tokio::sync::mpsc::channel::<Message>(128);
+    if !register_node_connection(&state, id, session_id, outbound.clone()) { return; }
+    announce_peer_presence(&state, id, true);
+    let (mut sink, mut stream) = socket.split();
     let mut tick = interval(Duration::from_secs(NODE_PING_INTERVAL_SECS));
     tick.tick().await;
     let mut last_paused = None;
     loop {
         tokio::select! {
-            message = socket.next() => match message {
+            message = stream.next() => match message {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(Message::Ping(bytes))) => {
                     if !update_node_heartbeat(&state, id, session_id) { break; }
-                    if socket.send(Message::Pong(bytes)).await.is_err() { break; }
+                    if sink.send(Message::Pong(bytes)).await.is_err() { break; }
                 }
-                Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {
+                Some(Ok(Message::Text(text))) => {
+                    if !update_node_heartbeat(&state, id, session_id) { break; }
+                    route_peer_signal(&state, id, session_id, &text).await;
+                }
+                Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {
                     if !update_node_heartbeat(&state, id, session_id) { break; }
                 }
+            },
+            outgoing = queued.recv() => match outgoing {
+                Some(message) => if sink.send(message).await.is_err() { break; },
+                None => break,
             },
             _ = tick.tick() => {
                 if !is_current_node_connection(&state, id, session_id) { break; }
@@ -531,10 +627,10 @@ async fn run_node_socket(mut socket: WebSocket, state: AppState, id: Uuid, sessi
                 match status {
                     Some((paused, last_seen)) => {
                         if now().saturating_sub(last_seen.unwrap_or_default()) > NODE_HEARTBEAT_TIMEOUT_SECS { break; }
-                        if socket.send(Message::Ping(Vec::new())).await.is_err() { break; }
+                        if sink.send(Message::Ping(Vec::new())).await.is_err() { break; }
                         if last_paused != Some(paused) {
                             let message = serde_json::json!({"type": "control", "paused": paused}).to_string();
-                            if socket.send(Message::Text(message)).await.is_err() { break; }
+                            if sink.send(Message::Text(message)).await.is_err() { break; }
                             last_paused = Some(paused);
                         }
                     }
@@ -776,13 +872,80 @@ mod tests {
         let old_session = Uuid::new_v4();
         let new_session = Uuid::new_v4();
 
-        assert!(register_node_connection(&state, node_id, old_session));
-        assert!(register_node_connection(&state, node_id, new_session));
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+        assert!(register_node_connection(&state, node_id, old_session, old_tx));
+        assert!(register_node_connection(&state, node_id, new_session, new_tx));
         disconnect_node(&state, node_id, old_session);
         assert!(is_current_node_connection(&state, node_id, new_session));
         assert!(state.store.lock().unwrap().nodes.get(&node_id).unwrap().online);
         disconnect_node(&state, node_id, new_session);
         assert!(!state.store.lock().unwrap().nodes.get(&node_id).unwrap().online);
+    }
+
+    #[tokio::test]
+    async fn peer_signals_are_forwarded_only_inside_the_same_cluster() {
+        let cluster_a = Uuid::new_v4();
+        let cluster_b = Uuid::new_v4();
+        let sender_id = Uuid::new_v4();
+        let same_cluster_id = Uuid::new_v4();
+        let other_cluster_id = Uuid::new_v4();
+        let mut store = Store::default();
+        for (id, cluster_id) in [(sender_id, cluster_a), (same_cluster_id, cluster_a), (other_cluster_id, cluster_b)] {
+            store.nodes.insert(id, Node { id, cluster_id, name: "node".into(), owner_id: "owner".into(), token_hash: "hash".into(), paused: false, online: false, last_seen: None });
+        }
+        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let sender_session = Uuid::new_v4();
+        let same_session = Uuid::new_v4();
+        let other_session = Uuid::new_v4();
+        let (sender_tx, _sender_rx) = tokio::sync::mpsc::channel(8);
+        let (same_tx, mut same_rx) = tokio::sync::mpsc::channel(8);
+        let (other_tx, mut other_rx) = tokio::sync::mpsc::channel(8);
+        assert!(register_node_connection(&state, sender_id, sender_session, sender_tx));
+        assert!(register_node_connection(&state, same_cluster_id, same_session, same_tx));
+        assert!(register_node_connection(&state, other_cluster_id, other_session, other_tx));
+
+        let signal = serde_json::json!({"type":"signal","peer_node_id":same_cluster_id,"payload":{"description":{"type":"offer","sdp":"test"}}}).to_string();
+        route_peer_signal(&state, sender_id, sender_session, &signal).await;
+        let Message::Text(forwarded) = same_rx.try_recv().unwrap() else { panic!("expected forwarded peer signal"); };
+        let forwarded: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+        assert_eq!(forwarded["peer_node_id"], sender_id.to_string());
+        assert!(other_rx.try_recv().is_err());
+
+        let cross_cluster = serde_json::json!({"type":"signal","peer_node_id":other_cluster_id,"payload":{"description":{"type":"offer","sdp":"test"}}}).to_string();
+        route_peer_signal(&state, sender_id, sender_session, &cross_cluster).await;
+        assert!(other_rx.try_recv().is_err());
+
+        state.store.lock().unwrap().nodes.get_mut(&same_cluster_id).unwrap().paused = true;
+        route_peer_signal(&state, sender_id, sender_session, &signal).await;
+        assert!(same_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn peer_discovery_excludes_paused_nodes() {
+        let cluster_id = Uuid::new_v4();
+        let current_id = Uuid::new_v4();
+        let active_id = Uuid::new_v4();
+        let paused_id = Uuid::new_v4();
+        let mut store = Store::default();
+        for (id, paused) in [(current_id, false), (active_id, false), (paused_id, true)] {
+            store.nodes.insert(id, Node { id, cluster_id, name: "node".into(), owner_id: "owner".into(), token_hash: "hash".into(), paused, online: false, last_seen: None });
+        }
+        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let (current_tx, mut current_rx) = tokio::sync::mpsc::channel(8);
+        let (active_tx, mut active_rx) = tokio::sync::mpsc::channel(8);
+        let (paused_tx, mut paused_rx) = tokio::sync::mpsc::channel(8);
+        assert!(register_node_connection(&state, current_id, Uuid::new_v4(), current_tx));
+        assert!(register_node_connection(&state, active_id, Uuid::new_v4(), active_tx));
+        assert!(register_node_connection(&state, paused_id, Uuid::new_v4(), paused_tx));
+
+        announce_peer_presence(&state, current_id, true);
+        let Message::Text(peer_list) = current_rx.try_recv().unwrap() else { panic!("expected peer list"); };
+        let peer_list: serde_json::Value = serde_json::from_str(&peer_list).unwrap();
+        assert_eq!(peer_list["peer_node_ids"], serde_json::json!([active_id]));
+        let Message::Text(joined) = active_rx.try_recv().unwrap() else { panic!("expected peer joined event"); };
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&joined).unwrap()["peer_node_id"], current_id.to_string());
+        assert!(paused_rx.try_recv().is_err());
     }
 }
 
