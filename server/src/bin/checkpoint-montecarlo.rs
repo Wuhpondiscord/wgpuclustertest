@@ -7,7 +7,6 @@ use checkpoint::{adaptive_interval, build_manifest, choose_storage_strategy, pay
 const MIB: u64 = 1024 * 1024;
 const TASK_WORK: f64 = 100.0;
 const WORKER_RATE: f64 = 1.0;
-const REPLACEMENT_RATE: f64 = 0.8;
 const FULL_BYTES: u64 = 256 * MIB;
 const DELTA_BYTES: u64 = 51 * MIB;
 const TRIALS: usize = 2_000;
@@ -26,7 +25,7 @@ const SCENARIOS: [Scenario; 2] = [
 struct Policy { name: &'static str, interval: f64, delta: bool, strategy: StorageStrategy }
 
 #[derive(Default, Clone, Copy)]
-struct Metrics { elapsed_ms: f64, traffic_mb: f64, wasted_work: f64, codec_ms: f64, peak_storage_mb: f64, failures: usize, data_loss: bool, finished: bool }
+struct Metrics { elapsed_ms: f64, traffic_mb: f64, wasted_work: f64, codec_ms: f64, peak_storage_mb: f64, failures: usize, data_loss: bool, finished: bool, capped: bool }
 
 #[derive(Clone, Copy)]
 struct Rng(u64);
@@ -42,16 +41,18 @@ impl Rng {
 }
 
 fn main() {
-    println!("scenario,policy,trials,checkpoint_interval_s,p50_total_s,p95_total_s,mean_total_s,mean_traffic_mb,mean_wasted_work,mean_failures,data_loss_trials_pct,mean_codec_s,peak_storage_mb,peer_domains,finished_pct");
+    println!("scenario,policy,trials,checkpoint_interval_s,p50_total_s,p95_total_s,mean_total_s,mean_traffic_mb,mean_wasted_work,mean_failures,data_loss_trials_pct,mean_codec_s,peak_storage_mb,peer_domains,capped_trials_pct,finished_pct");
     for (scenario_index, scenario) in SCENARIOS.iter().enumerate() {
         let peers = worker_links(*scenario);
         for policy in policies(*scenario) {
             let mut samples = Vec::with_capacity(TRIALS);
             let mut total = Metrics::default();
             let mut data_loss_trials = 0;
+            let mut capped_trials = 0;
             let mut finished = 0;
             for i in 0..TRIALS {
-                let seed = 0x6d65_7368_7265_636f_u64 ^ ((scenario_index as u64) << 48) ^ ((policy_index(policy.name) as u64) << 32) ^ i as u64;
+                // Use the same base stream per scenario/trial across policies.
+                let seed = 0x6d65_7368_7265_636f_u64 ^ ((scenario_index as u64) << 48) ^ i as u64;
                 let metrics = simulate(*scenario, &peers, policy, Rng(seed));
                 samples.push(metrics.elapsed_ms / 1_000.0);
                 total.elapsed_ms += metrics.elapsed_ms;
@@ -61,23 +62,22 @@ fn main() {
                 total.peak_storage_mb = total.peak_storage_mb.max(metrics.peak_storage_mb);
                 total.failures += metrics.failures;
                 if metrics.data_loss { data_loss_trials += 1; }
+                if metrics.capped { capped_trials += 1; }
                 if metrics.finished { finished += 1; }
             }
             samples.sort_by(f64::total_cmp);
             let domains = peers.iter().map(|w| w.failure_domain.as_str()).collect::<std::collections::HashSet<_>>().len();
-            println!("{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.3},{:.2},{:.2},{},{}",
+            println!("{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.3},{:.2},{:.2},{},{:.2},{}",
                 scenario.name, policy.name, TRIALS, policy.interval,
                 percentile(&samples, 0.50), percentile(&samples, 0.95), total.elapsed_ms / TRIALS as f64 / 1_000.0,
                 total.traffic_mb / TRIALS as f64, total.wasted_work / TRIALS as f64,
                 total.failures as f64 / TRIALS as f64,
                 data_loss_trials as f64 * 100.0 / TRIALS as f64,
                 total.codec_ms / TRIALS as f64 / 1_000.0,
-                total.peak_storage_mb, domains, finished * 100 / TRIALS);
+                total.peak_storage_mb, domains, capped_trials as f64 * 100.0 / TRIALS as f64, finished * 100 / TRIALS);
         }
     }
 }
-
-fn policy_index(name: &str) -> usize { match name { "fixed_full_replica" => 0, "fixed_delta_replica" => 1, "adaptive_full_replica" => 2, "adaptive_delta" => 3, _ => 4 } }
 
 fn policies(s: Scenario) -> Vec<Policy> {
     let base_input = CheckpointInput { full_bytes: FULL_BYTES, changed_bytes: DELTA_BYTES, has_base_checkpoint: true,
@@ -102,7 +102,7 @@ fn simulate(s: Scenario, peers: &[WorkerLink], policy: Policy, mut rng: Rng) -> 
     let manifest = build_manifest("sim-checkpoint".into(), 0, None, FULL_BYTES, FULL_BYTES, policy.strategy, peers);
     let Some(manifest) = manifest else { return out; };
     let (base_ms, base_codec) = write_cost(s, peers, &manifest, FULL_BYTES, policy.strategy);
-    out.elapsed_ms += base_ms + base_codec;
+    out.elapsed_ms += base_ms;
     out.traffic_mb += coded_mb(FULL_BYTES, policy.strategy);
     out.codec_ms += base_codec;
     out.peak_storage_mb = coded_mb(FULL_BYTES, policy.strategy);
@@ -158,6 +158,7 @@ fn simulate(s: Scenario, peers: &[WorkerLink], policy: Policy, mut rng: Rng) -> 
         out.peak_storage_mb = out.peak_storage_mb.max(coded_mb(latest_logical_bytes, policy.strategy));
     }
     out.finished = progress >= TASK_WORK;
+    out.capped = !out.finished && out.failures >= MAX_FAILURES_PER_TRIAL;
     out
 }
 
