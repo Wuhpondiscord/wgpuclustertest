@@ -303,6 +303,8 @@ function App() {
     const source = workers[0]
     const replicas = nodes.filter(node => node.cluster_id === active.id && node.online && !node.paused && node.id !== source?.[0])
     if (!source?.[1].peerMesh || !replicas.length) { setError('Connect one node owned by this browser and a second online node in the cluster.'); return }
+    const peerMesh = source[1].peerMesh
+    if (!peerMesh) { setError('The worker peer transport is not ready.'); return }
     setError(''); setNotice('Worker is claiming and processing job batches…')
     await run(async () => {
       let idlePolls = 0
@@ -324,7 +326,7 @@ function App() {
           start: claim.start, end: claim.end, result, worker_node_id: source[0], generation: claim.lease.generation,
         }))
         const replica = replicas[claim.batch_index % replicas.length]
-        const transfer = await source[1].peerMesh.sendArtifact(replica.id, `job-${job.id}-batch-${claim.batch_index}`, artifact)
+        const transfer = await peerMesh.sendArtifact(replica.id, `job-${job.id}-batch-${claim.batch_index}`, artifact)
         await api(`/api/jobs/${job.id}/commit`, { method: 'POST', body: JSON.stringify({
           lease: claim.lease, replica_node_id: replica.id, sha256: transfer.sha256, bytes: transfer.bytes,
         }) })
