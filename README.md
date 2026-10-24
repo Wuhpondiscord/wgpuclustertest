@@ -10,7 +10,7 @@ pinned: false
 
 # Mesh — cluster management prototype
 
-Mesh now has a working Rust coordinator for cluster creation, invite links, membership, node registration, and node presence/control over outbound WebSockets. The React dashboard calls that API instead of using the old sample cluster data. Compute jobs and WebGPU execution are not implemented yet.
+Mesh has a Rust coordinator for cluster and node management, plus bounded leased compute jobs whose results are replicated directly to peers. The React dashboard includes a deterministic CPU workload and a constrained WebGPU vector-add workload.
 
 ## GitHub → Hugging Face
 
@@ -52,7 +52,9 @@ Run `cargo run --manifest-path server/Cargo.toml --bin recovery-bench` to emit a
 
 `checkpoint-bench` compares fixed full replication with adaptive plans. `checkpoint-montecarlo` runs seeded repeated-failure trials and reports average, median, and p95 job time, traffic, rework, and shard-loss rates. These simulations use assumed worker, network, and codec costs, not hardware measurements. Browser nodes exchange same-cluster WebRTC signaling through Rust and move artifact bytes directly over ordered data channels. The **Create demo job** action creates a deterministic CPU batch workload; **Run on this node** claims batches, computes them, sends each checkpoint to a second cluster node, and commits only after the peer acknowledges its SHA-256 and both browsers save local IndexedDB copies. The coordinator stores job metadata and client-reported artifact metadata, not artifact bytes; it cannot independently attest that browser storage remains available.
 
-The new job path demonstrates retryable independent batches and replicated result artifacts; it does not yet use the adaptive `CheckpointCatalog`, resume a partially executed batch, or run arbitrary programs. The demo is CPU-only and is not a WebGPU benchmark. The scheduler does not yet validate untrusted work, so it must not issue credits or treat results as trusted. GitHub snapshots receive each job/lease/commit mutation, which is suitable for this low-volume prototype but will not support high-throughput queues. There is no TURN relay fallback, so some restrictive NAT/firewall combinations will fail to establish a direct channel.
+The dashboard can create deterministic CPU hash jobs or vector-add jobs. Vector-add runs a bounded WGSL compute kernel in the browser when WebGPU is available, validates sample outputs, and includes the result values and digest in the peer-replicated batch artifact. Browsers without a usable WebGPU adapter run the same vector-add workload through a CPU fallback. Batches are capped at 500,000 elements by the worker and the current UI creates 100,000-element batches. WebGPU device loss fails the attempt; its lease expires and can be retried by a worker.
+
+Each independently committed batch is the current checkpoint/recovery boundary; checkpoint cadence and batch size are fixed for a job. The adaptive `CheckpointCatalog` remains a metadata-only prototype and is not yet wired into durable batch commits, deltas, or erasure coding. The browser worker validates only a small sample of vector results. The scheduler cannot attest to the claimed execution mode or verify the whole output, so it must not issue credits or treat results as trusted. GitHub snapshots receive each job/lease/commit mutation, which is suitable for this low-volume prototype but will not support high-throughput queues. There is no TURN relay fallback, so some restrictive NAT/firewall combinations will fail to establish a direct channel.
 
 The identity and node connection URLs are bearer credentials. Do not share screenshots or logs containing them. This prototype does not yet have a full security review, rate limits, or login recovery.
 
