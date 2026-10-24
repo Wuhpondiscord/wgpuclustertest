@@ -72,9 +72,19 @@ struct ComputeJob {
     id: Uuid,
     cluster_id: Uuid,
     created_at: u64,
+    #[serde(default)]
+    workload: ComputeWorkload,
     total_units: u64,
     batch_units: u64,
     outputs: HashMap<u64, BatchOutput>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ComputeWorkload {
+    #[default]
+    CpuHash,
+    VectorAdd,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -109,7 +119,7 @@ struct NodeConnection {
 #[derive(Deserialize)] struct CreateCluster { name: String }
 #[derive(Deserialize)] struct RenameCluster { name: String }
 #[derive(Deserialize)] struct CreateNode { name: String }
-#[derive(Deserialize)] struct CreateJob { total_units: u64, batch_units: u64 }
+#[derive(Deserialize)] struct CreateJob { #[serde(default)] workload: ComputeWorkload, total_units: u64, batch_units: u64 }
 #[derive(Deserialize)] struct ClaimJob { node_id: Uuid }
 #[derive(Deserialize)] struct CommitBatch { lease: recovery::TaskLease, replica_node_id: Uuid, sha256: String, bytes: u64 }
 #[derive(Deserialize)] struct JoinInvite { token: String }
@@ -121,7 +131,7 @@ struct NodeSummary { id: Uuid, cluster_id: Uuid, name: String, paused: bool, onl
 #[derive(Serialize)]
 struct NodeCreated { node: NodeSummary, token: String }
 #[derive(Serialize)]
-struct JobSummary { id: Uuid, cluster_id: Uuid, created_at: u64, total_units: u64, batch_units: u64, total_batches: u64, completed_batches: usize }
+struct JobSummary { id: Uuid, cluster_id: Uuid, created_at: u64, workload: ComputeWorkload, total_units: u64, batch_units: u64, total_batches: u64, completed_batches: usize }
 #[derive(Serialize)]
 struct JobLease { job_id: Uuid, batch_index: u64, start: u64, end: u64, lease: recovery::TaskLease }
 #[derive(Serialize)]
@@ -179,7 +189,7 @@ fn node_summary(node: &Node) -> NodeSummary {
     NodeSummary { id: node.id, cluster_id: node.cluster_id, name: node.name.clone(), paused: node.paused, online: node.online, last_seen: node.last_seen }
 }
 fn job_summary(job: &ComputeJob) -> JobSummary {
-    JobSummary { id: job.id, cluster_id: job.cluster_id, created_at: job.created_at, total_units: job.total_units,
+    JobSummary { id: job.id, cluster_id: job.cluster_id, created_at: job.created_at, workload: job.workload, total_units: job.total_units,
         batch_units: job.batch_units, total_batches: job.total_units.div_ceil(job.batch_units), completed_batches: job.outputs.len() }
 }
 fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
@@ -387,6 +397,7 @@ async fn create_job(State(state): State<AppState>, Path(cluster_id): Path<Uuid>,
         return Err(ApiError(StatusCode::BAD_REQUEST, "Job must contain 1–10,000,000 units, batches of 1,000–500,000 units, and at most 256 batches".into()));
     }
     let job_id = Uuid::new_v4();
+    let workload = input.workload;
     let total_units = input.total_units;
     let batch_units = input.batch_units;
     let result = mutate_store(&state, move |store| {
@@ -396,7 +407,7 @@ async fn create_job(State(state): State<AppState>, Path(cluster_id): Path<Uuid>,
             store.recovery.add_task(format!("{job_id}:{index}"))
                 .map_err(|_| ApiError(StatusCode::CONFLICT, "Could not register a job batch".into()))?;
         }
-        let job = ComputeJob { id: job_id, cluster_id, created_at: now(), total_units, batch_units, outputs: HashMap::new() };
+        let job = ComputeJob { id: job_id, cluster_id, created_at: now(), workload, total_units, batch_units, outputs: HashMap::new() };
         let summary = job_summary(&job);
         store.jobs.insert(job_id, job);
         Ok(summary)
@@ -838,6 +849,32 @@ mod tests {
     }
 
     #[test]
+    fn old_job_snapshots_and_create_requests_default_to_cpu_hash() {
+        let old_request: CreateJob = serde_json::from_value(serde_json::json!({
+            "total_units": 1000,
+            "batch_units": 1000
+        })).unwrap();
+        assert_eq!(old_request.workload, ComputeWorkload::CpuHash);
+
+        let old_snapshot: ComputeJob = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(),
+            "cluster_id": Uuid::nil(),
+            "created_at": 1,
+            "total_units": 1000,
+            "batch_units": 1000,
+            "outputs": {}
+        })).unwrap();
+        assert_eq!(old_snapshot.workload, ComputeWorkload::CpuHash);
+
+        let vector_add: CreateJob = serde_json::from_value(serde_json::json!({
+            "workload": "vector-add",
+            "total_units": 1000,
+            "batch_units": 1000
+        })).unwrap();
+        assert_eq!(vector_add.workload, ComputeWorkload::VectorAdd);
+    }
+
+    #[test]
     fn cluster_names_are_trimmed_and_bounded() {
         assert_eq!(cluster_name("  Research pool  ").as_deref(), Some("Research pool"));
         assert_eq!(cluster_name(" "), None);
@@ -1098,7 +1135,7 @@ mod tests {
         let (_, Json(worker)) = create_node(State(state.clone()), Path(cluster.id), owner_headers.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
         let (_, Json(replica)) = create_node(State(state.clone()), Path(cluster.id), owner_headers.clone(), Json(CreateNode { name: "Replica".into() })).await.unwrap();
         for node_id in [worker.node.id, replica.node.id] { state.store.lock().unwrap().nodes.get_mut(&node_id).unwrap().online = true; }
-        let (status, Json(job)) = create_job(State(state.clone()), Path(cluster.id), owner_headers.clone(), Json(CreateJob { total_units: 2_500, batch_units: 1_000 })).await.unwrap();
+        let (status, Json(job)) = create_job(State(state.clone()), Path(cluster.id), owner_headers.clone(), Json(CreateJob { workload: ComputeWorkload::CpuHash, total_units: 2_500, batch_units: 1_000 })).await.unwrap();
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(job.total_batches, 3);
         assert!(claim_job_batch(State(state.clone()), Path(job.id), stranger_headers, Json(ClaimJob { node_id: worker.node.id })).await.is_err());
