@@ -21,7 +21,7 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: 'cargo run --manifest-path server/Cargo.toml',
+      command: 'cargo run --manifest-path server/Cargo.toml --bin mesh-coordinator',
       url: 'http://127.0.0.1:7860/health',
       timeout: 180_000,
       reuseExistingServer: !process.env.CI,
