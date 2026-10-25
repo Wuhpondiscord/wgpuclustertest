@@ -55,6 +55,19 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  browser-integration:
+    name: Browser WebRTC and shard recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
   container:
     name: Docker build
     runs-on: ubuntu-latest
@@ -70,7 +83,7 @@ jobs:
   deploy:
     name: Deploy Hugging Face Docker Space
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [frontend, backend, container]
+    needs: [frontend, backend, container, browser-integration]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
