@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Activity, ArrowRight, Boxes, Check, Copy, Cpu, Link2, LogOut, Pause, Play, Plus, RefreshCw, Settings, Shield, Trash2, Users, X } from 'lucide-react'
 import { PeerMeshNode } from './peer'
 import { createVectorAddWorker, digestVectorAddResult, runVectorAddCpu } from './webgpu'
@@ -15,6 +15,9 @@ type ComputeCheckpoint = { batch_index: number; sha256: string; bytes: number; s
 type ComputeJob = { id: string; cluster_id: string; created_at: number; workload: 'cpu-hash' | 'vector-add'; total_units: number; batch_units: number; total_batches: number; completed_batches: number; checkpoints: ComputeCheckpoint[] }
 type JobLease = { job_id: string; batch_index: number; start: number; end: number; lease: { task_id: string; worker_id: string; coordinator_epoch: number; generation: number; attempt_id: number; expires_at_ms: number } }
 type BrowserNodeConnection = { url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean; peerMesh: PeerMeshNode | null }
+type UiDialog =
+  | { kind: 'input'; title: string; description: string; label: string; value: string; placeholder?: string; submitLabel: string; onSubmit: (value: string) => void }
+  | { kind: 'confirm'; title: string; description: string; confirmLabel: string; requiredValue?: string; onConfirm: () => void }
 
 function getSessionNodeTokens(): Record<string, string> {
   try { return JSON.parse(sessionStorage.getItem('mesh.node-tokens') ?? '{}') as Record<string, string> }
@@ -59,6 +62,8 @@ function App() {
   const [invite, setInvite] = useState<InvitePreview | null>(null)
   const [joinToken, setJoinToken] = useState(new URLSearchParams(window.location.search).get('invite') ?? '')
   const [nodeCredentials, setNodeCredentials] = useState<{ name: string; url: string } | null>(null)
+  const [dialog, setDialog] = useState<UiDialog | null>(null)
+  const [dialogValue, setDialogValue] = useState('')
   const sockets = useRef(new Map<string, BrowserNodeConnection>())
   const [busy, setBusy] = useState(true)
   const [coordinatorStatus, setCoordinatorStatus] = useState<'checking' | 'online' | 'offline'>('checking')
@@ -156,10 +161,32 @@ function App() {
     try { await action() }
     catch (e) { setError(e instanceof Error ? e.message : 'Request failed') }
   }
+  function openInputDialog(options: Omit<Extract<UiDialog, { kind: 'input' }>, 'kind'>) {
+    setDialogValue(options.value)
+    setDialog({ kind: 'input', ...options })
+  }
+  function openConfirmDialog(options: Omit<Extract<UiDialog, { kind: 'confirm' }>, 'kind'>) {
+    setDialogValue('')
+    setDialog({ kind: 'confirm', ...options })
+  }
+  function submitDialog(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!dialog) return
+    if (dialog.kind === 'input') {
+      const value = dialogValue.trim()
+      if (!value) return
+      const submit = dialog.onSubmit
+      setDialog(null)
+      submit(value)
+      return
+    }
+    if (dialog.requiredValue && dialogValue !== dialog.requiredValue) return
+    const confirm = dialog.onConfirm
+    setDialog(null)
+    confirm()
+  }
   async function createCluster() {
-    const name = window.prompt('Name your cluster')?.trim()
-    if (!name) return
-    await run(async () => { const c = await api<Cluster>('/api/clusters', { method: 'POST', body: JSON.stringify({ name }) }); await refreshClusters(c.id); setNotice(`Created “${c.name}”`) })
+    openInputDialog({ title: 'Create a cluster', description: 'Choose a name for this compute pool.', label: 'Cluster name', placeholder: 'Research pool', value: '', submitLabel: 'Create cluster', onSubmit: name => { void run(async () => { const c = await api<Cluster>('/api/clusters', { method: 'POST', body: JSON.stringify({ name }) }); await refreshClusters(c.id); setNotice(`Created “${c.name}”`) }) } })
   }
   async function makeInvite() {
     if (!active) return
@@ -178,11 +205,17 @@ function App() {
       await refreshClusters(joined.id); setNotice(`Joined “${joined.name}”`)
     })
   }
+  function openInviteDialog() {
+    openInputDialog({ title: 'Join by invite', description: 'Paste a cluster invite URL or its token to preview and join.', label: 'Invite URL or token', placeholder: 'https://…?invite=…', value: joinToken, submitLabel: 'Preview invite', onSubmit: value => {
+      const token = value.includes('invite=') ? new URL(value, location.origin).searchParams.get('invite') ?? '' : value.trim()
+      if (!token) { setError('Enter a valid invite URL or token.'); return }
+      setJoinToken(token)
+      void run(async () => { setInvite(await api<InvitePreview>(`/api/invites/${encodeURIComponent(token)}`)) })
+    } })
+  }
   async function createNode() {
     if (!active) return
-    const name = window.prompt('Name this node (for example: Office GPU)')?.trim()
-    if (!name) return
-    await run(async () => {
+    openInputDialog({ title: 'Add a node', description: 'Register this browser or machine with the selected cluster.', label: 'Node name', placeholder: 'Office GPU', value: '', submitLabel: 'Add node', onSubmit: name => { void run(async () => {
       const created = await api<NodeCreated>(`/api/clusters/${active.id}/nodes`, { method: 'POST', body: JSON.stringify({ name }) })
       const tokens = getSessionNodeTokens()
       tokens[created.node.id] = created.token
@@ -192,7 +225,7 @@ function App() {
       setNodeCredentials({ name, url })
       connectBrowserNode(created.node.id, url)
       await refreshClusters(active.id)
-    })
+    }) } })
   }
   function connectBrowserNode(id: string, url: string) {
     stopBrowserNode(id)
@@ -275,8 +308,7 @@ function App() {
     await run(async () => { await api(`/api/nodes/${node.id}/${node.paused ? 'resume' : 'pause'}`, { method: 'POST' }); await refreshClusters(active.id) })
   }
   async function removeNode(node: Node) {
-    if (!window.confirm(`Remove node “${node.name}”? Its connection token will stop working.`)) return
-    await run(async () => { await api(`/api/nodes/${node.id}`, { method: 'DELETE' }); stopBrowserNode(node.id); const tokens = getSessionNodeTokens(); delete tokens[node.id]; sessionStorage.setItem('mesh.node-tokens', JSON.stringify(tokens)); await refreshClusters(active.id) })
+    openConfirmDialog({ title: 'Remove node?', description: `Remove “${node.name}” from this cluster? Its connection token will stop working.`, confirmLabel: 'Remove node', onConfirm: () => { void run(async () => { await api(`/api/nodes/${node.id}`, { method: 'DELETE' }); stopBrowserNode(node.id); const tokens = getSessionNodeTokens(); delete tokens[node.id]; sessionStorage.setItem('mesh.node-tokens', JSON.stringify(tokens)); await refreshClusters(active.id) }) } })
   }
   async function testPeerTransfer() {
     if (!active) return
@@ -415,33 +447,31 @@ function App() {
     })
   }
   async function removeMember(member: Member) {
-    if (!active || member.role === 'owner' || !window.confirm(`Remove ${member.id} from “${active.name}”?`)) return
-    await run(async () => { await api(`/api/clusters/${active.id}/members/${member.id}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Member removed') })
+    if (!active || member.role === 'owner') return
+    openConfirmDialog({ title: 'Remove member?', description: `Remove ${member.id} from “${active.name}”? Their nodes will be disconnected.`, confirmLabel: 'Remove member', onConfirm: () => { void run(async () => { await api(`/api/clusters/${active.id}/members/${member.id}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Member removed') }) } })
   }
   async function revokeInvite(inv: ActiveInvite) {
-    if (!active || !window.confirm('Revoke this invite link? Anyone who has it will no longer be able to join.')) return
-    await run(async () => { await api(`/api/clusters/${active.id}/invites/${inv.token}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Invite revoked') })
+    if (!active) return
+    openConfirmDialog({ title: 'Revoke invite?', description: 'Anyone who has this link will no longer be able to join the cluster.', confirmLabel: 'Revoke invite', onConfirm: () => { void run(async () => { await api(`/api/clusters/${active.id}/invites/${inv.token}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Invite revoked') }) } })
   }
   async function renameCluster() {
     if (!active || active.role !== 'owner') return
-    const name = window.prompt(`Rename “${active.name}”`, active.name)?.trim()
-    if (!name || name === active.name) return
-    await run(async () => { const c = await api<Cluster>(`/api/clusters/${active.id}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await refreshClusters(c.id); setNotice('Cluster renamed') })
+    openInputDialog({ title: 'Rename cluster', description: 'Choose a new name for this cluster.', label: 'Cluster name', value: active.name, submitLabel: 'Save name', onSubmit: name => { if (name === active.name) return; void run(async () => { const c = await api<Cluster>(`/api/clusters/${active.id}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await refreshClusters(c.id); setNotice('Cluster renamed') }) } })
   }
   async function deleteCluster() {
     if (!active || active.role !== 'owner') return
-    if (window.prompt(`Permanently delete “${active.name}” and all its nodes and invites? Type DELETE to confirm.`) !== 'DELETE') return
+    const cluster = active
     const removedNodeIds = nodes.map(node => node.id)
-    await run(async () => {
-      await api(`/api/clusters/${active.id}`, { method: 'DELETE' })
+    openConfirmDialog({ title: `Delete “${cluster.name}”?`, description: 'This permanently removes the cluster, its nodes, and active invites. Type DELETE to confirm.', confirmLabel: 'Delete cluster', requiredValue: 'DELETE', onConfirm: () => { void run(async () => {
+      await api(`/api/clusters/${cluster.id}`, { method: 'DELETE' })
       removedNodeIds.forEach(stopBrowserNode)
       await refreshClusters()
-      setNotice(`Deleted “${active.name}”`)
-    })
+      setNotice(`Deleted “${cluster.name}”`)
+    }) } })
   }
   async function leaveCluster() {
-    if (!active || active.role !== 'member' || !window.confirm(`Leave “${active.name}”?`)) return
-    await run(async () => { await api(`/api/clusters/${active.id}/leave`, { method: 'POST' }); await refreshClusters(); setNotice('You left the cluster') })
+    if (!active || active.role !== 'member') return
+    openConfirmDialog({ title: 'Leave cluster?', description: `Leave “${active.name}”? You will need a new invite to rejoin.`, confirmLabel: 'Leave cluster', onConfirm: () => { void run(async () => { await api(`/api/clusters/${active.id}/leave`, { method: 'POST' }); await refreshClusters(); setNotice('You left the cluster') }) } })
   }
   async function copy(text: string) {
     await navigator.clipboard.writeText(text); setNotice('Copied to clipboard')
@@ -451,7 +481,7 @@ function App() {
     <header className="manage-top"><a className="manage-brand" href="/"><span className="brand-glyph"><Boxes size={18}/></span>mesh<span className="brand-period">.</span></a><div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button></header>
     <main className="manage-main">
       {invite && <div className="invite-banner"><div><b>Invitation to {invite.cluster_name}</b><span>Join this cluster with your current Mesh identity.</span></div><button className="manage-button primary" onClick={() => void join(joinToken)}>Join cluster <ArrowRight size={15}/></button><button className="dismiss-button" onClick={() => { setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname) }} aria-label="Dismiss"><X size={17}/></button></div>}
-      <div className="manage-heading"><div><div className="overline">COMPUTE NETWORK</div><h1>Clusters</h1><p>Manage cluster membership, invitations, and connected nodes.</p></div><div className="heading-buttons"><button className="manage-button" onClick={() => { const value = window.prompt('Paste a cluster invite URL or token'); if (value) { const token = value.includes('invite=') ? new URL(value, location.origin).searchParams.get('invite') ?? '' : value.trim(); setJoinToken(token); void run(async () => { setInvite(await api<InvitePreview>(`/api/invites/${encodeURIComponent(token)}`)) }) } }}><Link2 size={15}/>Join by invite</button><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>New cluster</button></div></div>
+      <div className="manage-heading"><div><div className="overline">COMPUTE NETWORK</div><h1>Clusters</h1><p>Manage cluster membership, invitations, and connected nodes.</p></div><div className="heading-buttons"><button className="manage-button" onClick={openInviteDialog}><Link2 size={15}/>Join by invite</button><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>New cluster</button></div></div>
       {error && <div className="feedback error">{error}</div>}{notice && <div className="feedback success"><Check size={14}/>{notice}</div>}
       {busy ? <div className="empty-state">Connecting to coordinator…</div> : <div className="manage-layout">
         <aside className="cluster-rail"><div className="rail-title">YOUR CLUSTERS <span>{clusters.length}</span></div>{clusters.map(c=><button key={c.id} className={`rail-cluster ${active?.id===c.id?'active':''}`} onClick={()=>void run(()=>refreshClusters(c.id))}><span className="rail-icon">{c.name.slice(0,2).toUpperCase()}</span><span className="rail-label"><b>{c.name}</b><small>{c.role} · {c.members} members</small></span><span className={`rail-state ${c.online_nodes?'online':''}`}/></button>)}{!clusters.length&&<p className="rail-empty">No clusters yet.</p>}<button className="rail-create" onClick={() => void createCluster()}><Plus size={14}/>Create cluster</button><div className="identity-note"><Shield size={14}/><span>Your browser holds your private Mesh identity key. Clearing site data loses access to this anonymous account.</span></div></aside>
@@ -466,6 +496,7 @@ function App() {
       <footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
     </main>
     {nodeCredentials && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setNodeCredentials(null)}}><section className="credentials-dialog"><button className="dialog-close" onClick={()=>setNodeCredentials(null)} aria-label="Close"><X size={17}/></button><div className="dialog-icon"><Cpu size={19}/></div><div className="overline">NODE REGISTERED</div><h2>{nodeCredentials.name}</h2><p>This tab connects the browser node to the coordinator and its cluster peers. Keep it open while the node is online.</p><div className="credential-value">{nodeCredentials.url}</div><button className="manage-button primary full-width" onClick={()=>void copy(nodeCredentials.url)}><Copy size={15}/>Copy worker connection URL</button><div className="credential-hint">The URL is a bearer credential. Direct peer transfers use WebRTC; the coordinator relays signaling only. A general task runner is not connected yet.</div></section></div>}
+    {dialog && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setDialog(null)}}><form className="credentials-dialog app-dialog" role="dialog" aria-modal="true" aria-labelledby="app-dialog-title" onSubmit={submitDialog}><button type="button" className="dialog-close" onClick={()=>setDialog(null)} aria-label="Close dialog"><X size={17}/></button><div className="dialog-icon">{dialog.kind==='input'?<Settings size={19}/>:<Shield size={19}/>}</div><div className="overline">{dialog.kind==='input'?'CLUSTER MANAGEMENT':'CONFIRM ACTION'}</div><h2 id="app-dialog-title">{dialog.title}</h2><p>{dialog.description}</p>{(dialog.kind==='input'||dialog.requiredValue)&&<><label className="field-label" htmlFor="app-dialog-value">{dialog.kind==='input'?dialog.label:'Type DELETE to confirm'}</label><input id="app-dialog-value" className="text-input" autoFocus value={dialogValue} onChange={e=>setDialogValue(e.target.value)} placeholder={dialog.kind==='input'?dialog.placeholder:dialog.requiredValue} data-testid="app-dialog-input" /></>}{dialog.kind==='confirm'&&<div className="credential-hint">Review this action before continuing.</div>}<div className="heading-buttons dialog-actions"><button type="button" className="manage-button" onClick={()=>setDialog(null)}>Cancel</button><button type="submit" className={`manage-button primary ${dialog.kind==='confirm'?'danger':''}`} disabled={dialog.kind==='input'?!dialogValue.trim():dialog.requiredValue!==undefined&&dialogValue!==dialog.requiredValue} data-testid="app-dialog-submit">{dialog.kind==='input'?dialog.submitLabel:dialog.confirmLabel}</button></div></form></div>}
   </div>
 }
 
