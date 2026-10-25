@@ -3,5 +3,6 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  server: { proxy: { '/api': 'http://127.0.0.1:7860', '/health': 'http://127.0.0.1:7860' } },
+  server: { proxy: { '/api': { target: 'http://127.0.0.1:7860', ws: true }, '/health': 'http://127.0.0.1:7860' } },
 })
+

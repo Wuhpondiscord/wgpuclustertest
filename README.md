@@ -34,6 +34,10 @@ npm run dev
 
 In another terminal, run `cargo run --manifest-path server/Cargo.toml`. The Vite development server proxies `/api` to the Rust server on port 7860.
 
+## Browser integration tests
+
+Install the Playwright Chromium runtime with `npx playwright install chromium`, then run `npm run test:e2e`. Playwright starts an isolated Rust coordinator and Vite server, creates three browser contexts with separate Mesh identities, and exchanges a real vector-add checkpoint over WebRTC. The recovery scenario pauses one shard node and verifies that the other two shards reconstruct the artifact and match its full SHA-256 digest. The test uses host ICE candidates between same-machine contexts and does not exercise NAT traversal, TURN, or cross-network behavior. GitHub Actions runs this test before allowing a main-branch deployment.
+
 ## Current control plane
 
 - A browser creates an anonymous Mesh identity key and stores it in local storage. The server stores only its SHA-256 pseudonymous ID. Clearing local site data loses that identity; there is no email/password login or account recovery yet.

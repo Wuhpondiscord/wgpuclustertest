@@ -136,7 +136,11 @@ export class PeerMeshNode {
   }
 
   private createPeer(peerId: string, initiator: boolean) {
-    const peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
+    // Browser E2E runs three peer pages on the same host, so local host
+    // candidates are enough and avoid making CI depend on an external STUN
+    // service. Production keeps the normal STUN-assisted ICE configuration.
+    const localE2e = new URLSearchParams(location.search).get('mesh-e2e') === 'local'
+    const peer = new RTCPeerConnection({ iceServers: localE2e ? [] : [{ urls: 'stun:stun.l.google.com:19302' }] })
     this.peers.set(peerId, peer)
     peer.onicecandidate = event => { if (event.candidate) this.signal(peerId, { candidate: event.candidate.toJSON() }) }
     peer.onconnectionstatechange = () => {
