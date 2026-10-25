@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 #[allow(dead_code)]
 mod checkpoint;
+mod erasure;
 mod recovery;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";
@@ -28,6 +29,7 @@ const JOB_LEASE_DURATION_MS: u64 = 45_000;
 const MAX_JOB_UNITS: u64 = 10_000_000;
 const MAX_JOB_BATCHES: u64 = 256;
 const MAX_PEER_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+const SHARDING_THRESHOLD_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,6 +96,17 @@ struct BatchOutput {
     worker_node_id: Uuid,
     replica_node_id: Uuid,
     committed_at: u64,
+    #[serde(default)]
+    shards: Vec<ShardReceipt>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ShardReceipt {
+    shard_index: u8,
+    node_id: Uuid,
+    artifact_name: String,
+    sha256: String,
+    bytes: u64,
 }
 
 #[derive(Clone)]
@@ -121,7 +134,13 @@ struct NodeConnection {
 #[derive(Deserialize)] struct CreateNode { name: String }
 #[derive(Deserialize)] struct CreateJob { #[serde(default)] workload: ComputeWorkload, total_units: u64, batch_units: u64 }
 #[derive(Deserialize)] struct ClaimJob { node_id: Uuid }
-#[derive(Deserialize)] struct CommitBatch { lease: recovery::TaskLease, replica_node_id: Uuid, sha256: String, bytes: u64 }
+#[derive(Deserialize)] struct CommitBatch {
+    lease: recovery::TaskLease,
+    #[serde(default)] replica_node_id: Option<Uuid>,
+    #[serde(default)] shards: Vec<ShardReceipt>,
+    sha256: String,
+    bytes: u64,
+}
 #[derive(Deserialize)] struct JoinInvite { token: String }
 #[derive(Deserialize)] struct NodeSocketQuery { token: String }
 #[derive(Serialize)]
@@ -131,7 +150,9 @@ struct NodeSummary { id: Uuid, cluster_id: Uuid, name: String, paused: bool, onl
 #[derive(Serialize)]
 struct NodeCreated { node: NodeSummary, token: String }
 #[derive(Serialize)]
-struct JobSummary { id: Uuid, cluster_id: Uuid, created_at: u64, workload: ComputeWorkload, total_units: u64, batch_units: u64, total_batches: u64, completed_batches: usize }
+struct CheckpointSummary { batch_index: u64, sha256: String, bytes: u64, shards: Vec<ShardReceipt> }
+#[derive(Serialize)]
+struct JobSummary { id: Uuid, cluster_id: Uuid, created_at: u64, workload: ComputeWorkload, total_units: u64, batch_units: u64, total_batches: u64, completed_batches: usize, checkpoints: Vec<CheckpointSummary> }
 #[derive(Serialize)]
 struct JobLease { job_id: Uuid, batch_index: u64, start: u64, end: u64, lease: recovery::TaskLease }
 #[derive(Serialize)]
@@ -189,8 +210,12 @@ fn node_summary(node: &Node) -> NodeSummary {
     NodeSummary { id: node.id, cluster_id: node.cluster_id, name: node.name.clone(), paused: node.paused, online: node.online, last_seen: node.last_seen }
 }
 fn job_summary(job: &ComputeJob) -> JobSummary {
+    let mut checkpoints = job.outputs.iter().map(|(batch_index, output)| CheckpointSummary {
+        batch_index: *batch_index, sha256: output.sha256.clone(), bytes: output.bytes, shards: output.shards.clone(),
+    }).collect::<Vec<_>>();
+    checkpoints.sort_by_key(|checkpoint| checkpoint.batch_index);
     JobSummary { id: job.id, cluster_id: job.cluster_id, created_at: job.created_at, workload: job.workload, total_units: job.total_units,
-        batch_units: job.batch_units, total_batches: job.total_units.div_ceil(job.batch_units), completed_batches: job.outputs.len() }
+        batch_units: job.batch_units, total_batches: job.total_units.div_ceil(job.batch_units), completed_batches: job.outputs.len(), checkpoints }
 }
 fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
     let serialized = serde_json::to_vec(store).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not serialize state".into()))?;
@@ -453,14 +478,47 @@ async fn commit_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid
         let worker_id = Uuid::parse_str(&input.lease.worker_id).map_err(|_| ApiError(StatusCode::FORBIDDEN, "Invalid lease worker".into()))?;
         let worker = store.nodes.get(&worker_id).filter(|node| node.cluster_id == job.cluster_id && node.owner_id == user)
             .ok_or(ApiError(StatusCode::FORBIDDEN, "The lease worker is not owned by your Mesh identity".into()))?;
-        let replica = store.nodes.get(&input.replica_node_id).filter(|node| node.cluster_id == job.cluster_id && node.id != worker.id && !node.paused && node.online)
-            .ok_or(ApiError(StatusCode::CONFLICT, "A second active cluster node must hold the checkpoint artifact".into()))?;
         let prefix = format!("{job_id}:");
         let batch_index = input.lease.task_id.strip_prefix(&prefix).and_then(|value| value.parse::<u64>().ok())
             .ok_or(ApiError(StatusCode::BAD_REQUEST, "Lease does not belong to this job".into()))?;
         if batch_index >= job.total_units.div_ceil(job.batch_units) { return Err(ApiError(StatusCode::BAD_REQUEST, "Lease batch is out of range".into())); }
         if let Some(existing) = job.outputs.get(&batch_index) {
             return if existing.sha256 == input.sha256 { Ok(()) } else { Err(ApiError(StatusCode::CONFLICT, "This batch already committed a different artifact".into())) };
+        }
+        // Legacy browser clients may still submit a two-copy receipt. New clients
+        // submit two copies for small artifacts and three XOR-coded shards above
+        // the threshold.
+        let receipts = if input.shards.is_empty() {
+            let replica_id = input.replica_node_id.ok_or(ApiError(StatusCode::BAD_REQUEST, "Checkpoint shard receipts are required".into()))?;
+            vec![
+                ShardReceipt { shard_index: 0, node_id: worker_id, artifact_name: format!("legacy-{job_id}-{batch_index}-0"), sha256: input.sha256.clone(), bytes: input.bytes },
+                ShardReceipt { shard_index: 1, node_id: replica_id, artifact_name: format!("legacy-{job_id}-{batch_index}-1"), sha256: input.sha256.clone(), bytes: input.bytes },
+            ]
+        } else { input.shards.clone() };
+        let erasure_coded = !input.shards.is_empty() && input.bytes >= SHARDING_THRESHOLD_BYTES;
+        let expected_shards = if erasure_coded { 3 } else { 2 };
+        if receipts.len() != expected_shards
+            || receipts.iter().enumerate().any(|(index, shard)| shard.shard_index as usize != index
+                || shard.artifact_name.is_empty() || shard.artifact_name.len() > 128
+                || shard.bytes == 0 || shard.bytes > MAX_PEER_ARTIFACT_BYTES
+                || shard.sha256.len() != 64 || !shard.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            || receipts.iter().map(|shard| shard.node_id).collect::<std::collections::HashSet<_>>().len() != expected_shards
+            || receipts.first().map(|shard| shard.node_id) != Some(worker_id)
+        {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "Shard manifest is incomplete or invalid".into()));
+        }
+        let expected_shard_bytes = if erasure_coded { input.bytes.div_ceil(2) } else { input.bytes };
+        if receipts.iter().any(|shard| shard.bytes != expected_shard_bytes
+            || (!erasure_coded && shard.sha256.to_lowercase() != input.sha256.to_lowercase()))
+        {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "Shard sizes or replicated digests do not match the checkpoint".into()));
+        }
+        if receipts.iter().any(|shard| !store.nodes.get(&shard.node_id).is_some_and(|node|
+            node.cluster_id == job.cluster_id && !node.paused && node.online))
+        {
+            return Err(ApiError(StatusCode::CONFLICT, if erasure_coded {
+                "2+1 sharding requires three distinct active cluster nodes".into()
+            } else { "Two active cluster nodes must acknowledge the replicated checkpoint".into() }));
         }
         store.recovery.commit_result(&input.lease, now().saturating_mul(1_000), input.sha256.clone())
             .map_err(|error| match error {
@@ -470,7 +528,7 @@ async fn commit_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid
             })?;
         store.jobs.get_mut(&job_id).expect("job was checked").outputs.insert(batch_index, BatchOutput {
             sha256: input.sha256.clone(), bytes: input.bytes, worker_node_id: worker_id,
-            replica_node_id: replica.id, committed_at: now(),
+            replica_node_id: receipts[1].node_id, committed_at: now(), shards: receipts,
         });
         Ok(())
     }).await?;
@@ -862,9 +920,13 @@ mod tests {
             "created_at": 1,
             "total_units": 1000,
             "batch_units": 1000,
-            "outputs": {}
+            "outputs": {"0": {
+                "sha256": "a".repeat(64), "bytes": 128,
+                "worker_node_id": Uuid::nil(), "replica_node_id": Uuid::nil(), "committed_at": 1
+            }}
         })).unwrap();
         assert_eq!(old_snapshot.workload, ComputeWorkload::CpuHash);
+        assert!(old_snapshot.outputs[&0].shards.is_empty());
 
         let vector_add: CreateJob = serde_json::from_value(serde_json::json!({
             "workload": "vector-add",
@@ -1144,16 +1206,45 @@ mod tests {
         assert_eq!((claim.start, claim.end), (0, 1_000));
         let digest = "a".repeat(64);
         state.store.lock().unwrap().nodes.get_mut(&replica.node.id).unwrap().online = false;
-        assert!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease.clone(), replica_node_id: replica.node.id, sha256: digest.clone(), bytes: 128 })).await.is_err());
+        assert!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease.clone(), replica_node_id: Some(replica.node.id), shards: Vec::new(), sha256: digest.clone(), bytes: 128 })).await.is_err());
         state.store.lock().unwrap().nodes.get_mut(&replica.node.id).unwrap().online = true;
-        let commit = CommitBatch { lease: claim.lease.clone(), replica_node_id: replica.node.id, sha256: digest.clone(), bytes: 128 };
+        let commit = CommitBatch { lease: claim.lease.clone(), replica_node_id: Some(replica.node.id), shards: Vec::new(), sha256: digest.clone(), bytes: 128 };
         assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(commit)).await.unwrap(), StatusCode::NO_CONTENT);
-        assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease, replica_node_id: replica.node.id, sha256: digest, bytes: 128 })).await.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease, replica_node_id: Some(replica.node.id), shards: Vec::new(), sha256: digest, bytes: 128 })).await.unwrap(), StatusCode::NO_CONTENT);
 
         let Json(jobs) = list_jobs(State(state.clone()), Path(cluster.id), owner_headers).await.unwrap();
         assert_eq!(jobs[0].completed_batches, 1);
         let Json(Some(next)) = claim_job_batch(State(state.clone()), Path(job.id), test_headers(owner_token), Json(ClaimJob { node_id: worker.node.id })).await.unwrap() else { panic!("expected the next independent batch"); };
         assert_eq!((next.start, next.end), (1_000, 2_000));
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn large_checkpoints_require_three_distinct_active_nodes_and_persist_shard_manifest() {
+        let file = std::env::temp_dir().join(format!("mesh-shard-test-{}.json", Uuid::new_v4()));
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let owner = test_headers("shard-owner-identity-token-01234567890123456789");
+        let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "Shards".into() })).await.unwrap();
+        let (_, Json(worker)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
+        let (_, Json(peer_a)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Peer A".into() })).await.unwrap();
+        let (_, Json(peer_b)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Peer B".into() })).await.unwrap();
+        for node_id in [worker.node.id, peer_a.node.id, peer_b.node.id] { state.store.lock().unwrap().nodes.get_mut(&node_id).unwrap().online = true; }
+        let (_, Json(job)) = create_job(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateJob { workload: ComputeWorkload::VectorAdd, total_units: 1_000, batch_units: 1_000 })).await.unwrap();
+        let Json(Some(claim)) = claim_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(ClaimJob { node_id: worker.node.id })).await.unwrap() else { panic!("expected a batch lease"); };
+        let digest = "a".repeat(64);
+        let shards = vec![
+            ShardReceipt { shard_index: 0, node_id: worker.node.id, artifact_name: "cp-1-shard-0".into(), sha256: "1".repeat(64), bytes: 32_768 },
+            ShardReceipt { shard_index: 1, node_id: peer_a.node.id, artifact_name: "cp-1-shard-1".into(), sha256: "2".repeat(64), bytes: 32_768 },
+            ShardReceipt { shard_index: 2, node_id: peer_b.node.id, artifact_name: "cp-1-shard-2".into(), sha256: "3".repeat(64), bytes: 32_768 },
+        ];
+        state.store.lock().unwrap().nodes.get_mut(&peer_b.node.id).unwrap().online = false;
+        let request = || CommitBatch { lease: claim.lease.clone(), replica_node_id: None, shards: shards.clone(), sha256: digest.clone(), bytes: SHARDING_THRESHOLD_BYTES };
+        assert!(commit_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(request())).await.is_err());
+        state.store.lock().unwrap().nodes.get_mut(&peer_b.node.id).unwrap().online = true;
+        assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(request())).await.unwrap(), StatusCode::NO_CONTENT);
+        let Json(jobs) = list_jobs(State(state), Path(cluster.id), owner).await.unwrap();
+        assert_eq!(jobs[0].checkpoints[0].shards.len(), 3);
+        assert_eq!(jobs[0].checkpoints[0].shards[2].node_id, peer_b.node.id);
         let _ = std::fs::remove_file(file);
     }
 

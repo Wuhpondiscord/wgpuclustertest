@@ -9,6 +9,7 @@ type TransferStart = { type: 'artifact_start'; transfer_id: string; name: string
 type TransferChunk = { type: 'artifact_chunk'; transfer_id: string; index: number; data: string }
 type IncomingTransfer = { peerId: string; start: TransferStart; chunks: Map<number, Uint8Array>; bytes: number }
 type PendingTransfer = { peerId: string; resolve: (digest: string) => void; reject: (error: Error) => void; timer: number }
+type PendingArtifactRead = { peerId: string; name: string; resolve: (bytes: Uint8Array) => void; reject: (error: Error) => void; timer: number }
 
 function encode(bytes: Uint8Array) {
   let binary = ''
@@ -47,11 +48,28 @@ async function persistArtifact(key: string, value: { name: string; bytes: Uint8A
   } finally { db.close() }
 }
 
+async function loadArtifact(name: string): Promise<Uint8Array | null> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open('mesh-peer-artifacts', 1)
+    request.onupgradeneeded = () => request.result.createObjectStore('artifacts')
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Could not open local artifact storage'))
+  })
+  try {
+    return await new Promise<Uint8Array | null>((resolve, reject) => {
+      const request = db.transaction('artifacts', 'readonly').objectStore('artifacts').get(`artifact:${name}`)
+      request.onsuccess = () => resolve((request.result as { bytes?: Uint8Array } | undefined)?.bytes ?? null)
+      request.onerror = () => reject(request.error ?? new Error('Could not read local artifact storage'))
+    })
+  } finally { db.close() }
+}
+
 export class PeerMeshNode {
   private peers = new Map<string, RTCPeerConnection>()
   private channels = new Map<string, RTCDataChannel>()
   private incoming = new Map<string, IncomingTransfer>()
   private pending = new Map<string, PendingTransfer>()
+  private pendingArtifactReads = new Map<string, PendingArtifactRead>()
   private closed = false
 
   constructor(
@@ -82,6 +100,11 @@ export class PeerMeshNode {
       window.clearTimeout(pending.timer)
       this.pending.delete(transferId)
       pending.reject(new Error('Peer disconnected during artifact transfer'))
+    }
+    for (const [key, pending] of this.pendingArtifactReads) if (pending.peerId === peerId) {
+      window.clearTimeout(pending.timer)
+      this.pendingArtifactReads.delete(key)
+      pending.reject(new Error('Peer disconnected while a shard was being requested'))
     }
   }
 
@@ -141,6 +164,20 @@ export class PeerMeshNode {
       if (pending?.peerId === peerId) { window.clearTimeout(pending.timer); this.pending.delete(message.transfer_id); pending.resolve(message.sha256) }
       return
     }
+    if (message.type === 'artifact_get' && typeof message.name === 'string' && message.name.length > 0 && message.name.length <= 128) {
+      try {
+        const artifact = await loadArtifact(message.name)
+        if (!artifact) { channel.send(JSON.stringify({ type: 'artifact_missing', name: message.name })); return }
+        void this.sendArtifact(peerId, message.name, artifact, false).catch(() => undefined)
+      } catch { channel.send(JSON.stringify({ type: 'artifact_missing', name: message.name })) }
+      return
+    }
+    if (message.type === 'artifact_missing' && typeof message.name === 'string') {
+      const key = `${peerId}:${message.name}`
+      const pending = this.pendingArtifactReads.get(key)
+      if (pending) { window.clearTimeout(pending.timer); this.pendingArtifactReads.delete(key); pending.reject(new Error(`Peer ${peerId} no longer has shard “${message.name}”`)) }
+      return
+    }
     if (message.type === 'artifact_start') {
       const start = message as unknown as TransferStart
       if (typeof start.transfer_id !== 'string' || start.transfer_id.length > 64 || !start.transfer_id || typeof start.name !== 'string' || !start.name || start.name.length > 128 || !Number.isSafeInteger(start.total_bytes) || start.total_bytes <= 0 || start.total_bytes > MAX_ARTIFACT_BYTES
@@ -175,9 +212,12 @@ export class PeerMeshNode {
         return
       }
       try {
-        await persistArtifact(`${peerId}:${message.transfer_id}`, { name: transfer.start.name, bytes: result, sha256: actualHash, receivedAt: Date.now() })
+        await persistArtifact(`artifact:${transfer.start.name}`, { name: transfer.start.name, bytes: result, sha256: actualHash, receivedAt: Date.now() })
         channel.send(JSON.stringify({ type: 'artifact_ack', transfer_id: message.transfer_id, sha256: actualHash }))
         this.onNotice(`Verified peer artifact “${transfer.start.name}” (${result.length.toLocaleString()} bytes)`)
+        const readKey = `${peerId}:${transfer.start.name}`
+        const pendingRead = this.pendingArtifactReads.get(readKey)
+        if (pendingRead) { window.clearTimeout(pendingRead.timer); this.pendingArtifactReads.delete(readKey); pendingRead.resolve(result) }
       } catch { channel.send(JSON.stringify({ type: 'artifact_nack', transfer_id: message.transfer_id, reason: 'storage_failed' })) }
       this.incoming.delete(message.transfer_id)
     }
@@ -187,7 +227,8 @@ export class PeerMeshNode {
     }
   }
 
-  async sendArtifact(peerId: string, name: string, bytes: Uint8Array) {
+  async sendArtifact(peerId: string, name: string, bytes: Uint8Array, persistLocally = true) {
+    if (!name || name.length > 128) throw new Error('Peer artifact names must contain 1–128 characters')
     if (!bytes.length) throw new Error('Peer artifacts must contain at least one byte')
     if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Peer artifact exceeds the 8 MiB transfer limit')
     const deadline = Date.now() + 20_000
@@ -217,8 +258,44 @@ export class PeerMeshNode {
     }
     const receivedHash = await acknowledged
     if (receivedHash !== sha256) throw new Error('Peer acknowledged a different artifact digest')
-    await persistArtifact(`local:${transferId}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+    if (persistLocally) await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
     return { transferId, sha256, bytes: bytes.length }
+  }
+
+  async storeArtifact(name: string, bytes: Uint8Array) {
+    if (!name || name.length > 128 || !bytes.length || bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Local shard is outside artifact limits')
+    const sha256 = await digest(bytes)
+    await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+    return { sha256, bytes: bytes.length }
+  }
+
+  async getArtifact(peerId: string, name: string) {
+    const local = await loadArtifact(name)
+    if (local) return local
+    if (peerId === this.nodeId) throw new Error(`This node no longer has shard “${name}”`)
+    const deadline = Date.now() + 20_000
+    let channel = this.channels.get(peerId)
+    while ((!channel || channel.readyState !== 'open') && Date.now() < deadline) {
+      await new Promise(resolve => window.setTimeout(resolve, 100))
+      channel = this.channels.get(peerId)
+    }
+    if (!channel || channel.readyState !== 'open') throw new Error(`Peer ${peerId} is not connected`)
+    const key = `${peerId}:${name}`
+    if (this.pendingArtifactReads.has(key)) throw new Error('A request for this shard is already pending')
+    const result = new Promise<Uint8Array>((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this.pendingArtifactReads.delete(key)
+        reject(new Error(`Timed out requesting shard “${name}” from peer ${peerId}`))
+      }, 30_000)
+      this.pendingArtifactReads.set(key, { peerId, name, resolve, reject, timer })
+    })
+    try { await this.sendFrame(channel, { type: 'artifact_get', name }) }
+    catch (error) {
+      const pending = this.pendingArtifactReads.get(key)
+      if (pending) { window.clearTimeout(pending.timer); this.pendingArtifactReads.delete(key) }
+      throw error
+    }
+    return result
   }
 
   private async sendFrame(channel: RTCDataChannel, message: unknown) {
@@ -241,6 +318,11 @@ export class PeerMeshNode {
     this.peers.clear(); this.channels.clear(); this.incoming.clear()
     for (const pending of this.pending.values()) { window.clearTimeout(pending.timer); pending.reject(new Error('Node connection closed')) }
     this.pending.clear()
+    for (const pending of this.pendingArtifactReads.values()) {
+      window.clearTimeout(pending.timer)
+      pending.reject(new Error('Node connection closed while reading a shard'))
+    }
+    this.pendingArtifactReads.clear()
   }
 }
 
