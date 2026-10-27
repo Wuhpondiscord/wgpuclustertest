@@ -55,6 +55,37 @@ test('cluster creation uses an in-app form instead of browser prompts', async ({
   if (created) await api(identity, `/api/clusters/${created.id}`, 'DELETE')
 })
 
+test('explains the live peer requirements for P2P and CPU jobs', async ({ browser }) => {
+  const identity = ownerIdentity()
+  let clusterId = ''
+  let context: BrowserContext | undefined
+  try {
+    const cluster = await api<{ id: string }>(identity, '/api/clusters', 'POST', { name: 'readiness-feedback-e2e' })
+    clusterId = cluster.id
+    const created = await api<{ node: { id: string }; token: string }>(
+      identity, `/api/clusters/${clusterId}/nodes`, 'POST', { name: 'readiness-owner-node' },
+    )
+    const peer = await openPeer(browser, identity, created.node.id, created.token)
+    context = peer.context
+    await waitFor(async () => api<Array<{ id: string; online: boolean }>>(identity, `/api/clusters/${clusterId}/nodes`),
+      nodes => nodes.some(node => node.id === created.node.id && node.online), 'the local worker node to connect')
+
+    await peer.page.getByRole('button', { name: 'Create CPU demo' }).click()
+    const runButton = peer.page.getByRole('button', { name: 'Run on this node' })
+    await expect(runButton).toBeEnabled()
+    await runButton.click()
+    await expect(peer.page.getByText(/CPU demo requires 2 connected nodes total/)).toBeVisible()
+
+    const p2pButton = peer.page.getByRole('button', { name: 'Test P2P' })
+    await expect(p2pButton).toBeEnabled()
+    await p2pButton.click()
+    await expect(peer.page.getByText(/P2P test requires 2 connected nodes/)).toBeVisible()
+  } finally {
+    await context?.close()
+    if (clusterId) await api(identity, `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
+  }
+})
+
 test('reconstructs a 2+1 checkpoint after one peer goes offline', async ({ browser }) => {
   const identities = [ownerIdentity(), ownerIdentity(), ownerIdentity()]
   let clusterId = ''
