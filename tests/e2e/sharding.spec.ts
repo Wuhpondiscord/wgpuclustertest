@@ -149,8 +149,9 @@ test('keeps a large checkpoint recoverable when a peer disconnects mid-transfer'
       const current = jobs.find(item => item.id === job.id)
       return Boolean(current?.checkpoints[0]?.shards.length === 2)
     }, 'the fallback full-copy checkpoint to commit', 90_000)
-    const checkpoint = committed.find(item => item.id === job.id)!.checkpoints[0]
-    expect(checkpoint.completed_batches).toBe(1)
+    const committedJob = committed.find(item => item.id === job.id)!
+    const checkpoint = committedJob.checkpoints[0]
+    expect(committedJob.completed_batches).toBe(1)
     expect(new Set(checkpoint.shards.map(shard => shard.node_id)).size).toBe(2)
     expect(checkpoint.shards.map(shard => shard.bytes)).toEqual([checkpoint.bytes, checkpoint.bytes])
     expect(checkpoint.shards.every(shard => shard.sha256 === checkpoint.sha256)).toBe(true)
