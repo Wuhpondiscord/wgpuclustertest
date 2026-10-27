@@ -1320,7 +1320,7 @@ mod tests {
         let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "Runtime".into() })).await.unwrap();
         let (_, Json(worker)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
         state.store.lock().unwrap().nodes.get_mut(&worker.node.id).unwrap().online = true;
-        let (_, Json(job)) = create_job(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateJob { workload: ComputeWorkload::CpuHash, total_units: 100, batch_units: 100 })).await.unwrap();
+        let (_, Json(job)) = create_job(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateJob { workload: ComputeWorkload::CpuHash, total_units: 1_000, batch_units: 1_000 })).await.unwrap();
         let before = std::fs::read(&file).unwrap();
         let Json(Some(claim)) = claim_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(ClaimJob { node_id: worker.node.id })).await.unwrap() else { panic!("expected lease"); };
         assert_eq!(std::fs::read(&file).unwrap(), before);
