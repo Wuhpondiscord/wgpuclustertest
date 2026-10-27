@@ -47,9 +47,43 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   headers.set('X-Mesh-Identity', getIdentity())
   if (init.body) headers.set('Content-Type', 'application/json')
   const response = await fetch(path, { ...init, headers })
-  if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`)
+  if (!response.ok) throw Object.assign(new Error((await response.text()) || `Request failed (${response.status})`), { status: response.status })
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
+}
+
+function maintainLease(jobId: string, initial: JobLease['lease'], claimedAt: number) {
+  let current = initial
+  // Use monotonic elapsed time so a device with an incorrect wall clock does
+  // not reject a valid server lease. Reserve one second for server rounding.
+  let deadline = claimedAt + 44_000
+  let stopped = false
+  let lost: Error | null = null
+  let timer = 0
+  const schedule = (delay: number) => { if (!stopped) timer = window.setTimeout(() => void renew(), delay) }
+  const renew = async () => {
+    let delay = 10_000
+    const startedAt = performance.now()
+    try {
+      current = await api<JobLease['lease']>(`/api/jobs/${jobId}/renew`, { method: 'POST', body: JSON.stringify({ lease: current }), signal: AbortSignal.timeout(8_000) })
+      deadline = startedAt + 44_000
+    } catch (error) {
+      const status = (error as { status?: number }).status
+      if ((status && [401, 403, 404, 409].includes(status)) || performance.now() >= deadline) {
+        lost = error instanceof Error ? error : new Error('The worker lease was lost')
+      } else { delay = 2_000 }
+    }
+    if (!lost) schedule(delay)
+  }
+  schedule(Math.min(10_000, Math.max(0, deadline - performance.now() - 15_000)))
+  return {
+    current: () => {
+      if (lost) throw lost
+      if (performance.now() >= deadline) throw new Error('The worker lease expired before checkpoint commit; run the job again')
+      return current
+    },
+    stop: () => { stopped = true; window.clearTimeout(timer) },
+  }
 }
 
 function App() {
@@ -365,6 +399,7 @@ function App() {
       try {
        let idlePolls = 0
        while (idlePolls < 60) {
+        const claimedAt = performance.now()
         const claim = await api<JobLease | null>(`/api/jobs/${job.id}/claim`, { method: 'POST', body: JSON.stringify({ node_id: source[0] }) })
         if (!claim) {
           const current = await api<ComputeJob[]>(`/api/clusters/${job.cluster_id}/jobs`)
@@ -376,6 +411,9 @@ function App() {
           continue
         }
         idlePolls = 0
+        let checkpointPolicy = ''
+        const heartbeat = maintainLease(job.id, claim.lease, claimedAt)
+        try {
         const vectorResult = job.workload === 'vector-add'
           ? (gpuWorker ? await gpuWorker.run(claim.start, claim.end) : runVectorAddCpu(claim.start, claim.end))
           : null
@@ -429,12 +467,14 @@ function App() {
           shardReceipts.push(...await tryReplicatedCheckpoint(new Set()))
         }
         await api(`/api/jobs/${job.id}/commit`, { method: 'POST', body: JSON.stringify({
-          lease: claim.lease, sha256: checkpointDigest, bytes: artifact.byteLength, shards: shardReceipts,
+          lease: heartbeat.current(), sha256: checkpointDigest, bytes: artifact.byteLength, shards: shardReceipts,
         }) })
+        checkpointPolicy = shardReceipts.length === 3 ? '2+1 shards' : 'two replicas'
+        } finally { heartbeat.stop() }
         const current = await api<ComputeJob[]>(`/api/clusters/${job.cluster_id}/jobs`)
         setJobs(current)
         const updated = current.find(item => item.id === job.id)
-        setNotice(`Checkpointed ${job.workload === 'vector-add' ? 'vector-add' : 'CPU'} batch ${claim.batch_index + 1} of ${job.total_batches} using ${shardReceipts.length === 3 ? '2+1 shards' : 'two replicas'}`)
+        setNotice(`Checkpointed ${job.workload === 'vector-add' ? 'vector-add' : 'CPU'} batch ${claim.batch_index + 1} of ${job.total_batches} using ${checkpointPolicy}`)
         if (updated && updated.completed_batches >= updated.total_batches) { setNotice('All job batches completed and replicated'); return }
       }
       throw new Error('No batches became available before the worker wait limit. You can run the job again after active leases expire.')

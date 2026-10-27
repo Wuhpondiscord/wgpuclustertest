@@ -26,6 +26,7 @@ const NODE_PING_INTERVAL_SECS: u64 = 15;
 const NODE_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
 const MAX_STORAGE_CONFLICT_RETRIES: usize = 3;
 const JOB_LEASE_DURATION_MS: u64 = 45_000;
+const WORKER_RECONNECT_GRACE_MS: u64 = 10_000;
 const MAX_JOB_UNITS: u64 = 10_000_000;
 const MAX_JOB_BATCHES: u64 = 256;
 const MAX_PEER_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
@@ -134,6 +135,7 @@ struct NodeConnection {
 #[derive(Deserialize)] struct CreateNode { name: String }
 #[derive(Deserialize)] struct CreateJob { #[serde(default)] workload: ComputeWorkload, total_units: u64, batch_units: u64 }
 #[derive(Deserialize)] struct ClaimJob { node_id: Uuid }
+#[derive(Deserialize)] struct RenewJob { lease: recovery::TaskLease }
 #[derive(Deserialize)] struct CommitBatch {
     lease: recovery::TaskLease,
     #[serde(default)] replica_node_id: Option<Uuid>,
@@ -182,6 +184,11 @@ fn identity(headers: &HeaderMap) -> ApiResult<String> {
     Ok(secret_hash(id))
 }
 fn secret_hash(value: &str) -> String { format!("{:x}", Sha256::digest(value.as_bytes())) }
+fn coordinator_epoch(session: Uuid) -> u64 {
+    // Leases cross the JSON/JavaScript boundary. Keep the opaque random token
+    // exactly representable by Number so browsers return the same fencing token.
+    (session.as_u64_pair().0 & ((1_u64 << 53) - 1)).max(1)
+}
 fn cluster_name(name: &str) -> Option<String> {
     let name = name.trim();
     (!name.is_empty() && name.chars().count() <= 80).then(|| name.to_owned())
@@ -294,6 +301,7 @@ where
                         node.last_seen = runtime_node.last_seen;
                     }
                 }
+                latest.recovery.preserve_runtime_from(&current.recovery);
             }
             *state.github_file_sha.lock()
                 .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Storage unavailable".into()))? = latest_sha;
@@ -304,6 +312,7 @@ where
         let mut current = state.store.lock()
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
         // Heartbeats are runtime-only state. Preserve them when committing a durable snapshot.
+        next.recovery.preserve_runtime_from(&current.recovery);
         for (id, node) in next.nodes.iter_mut() {
             if let Some(runtime_node) = current.nodes.get(id) {
                 node.online = runtime_node.online;
@@ -331,6 +340,7 @@ async fn refresh_invite_from_github(state: &AppState, token: &str) -> ApiResult<
     if found {
         let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
         let mut fresh_store = fresh_store;
+        fresh_store.recovery.preserve_runtime_from(&store.recovery);
         for (id, node) in fresh_store.nodes.iter_mut() {
             if let Some(runtime_node) = store.nodes.get(id) { node.online = runtime_node.online; node.last_seen = runtime_node.last_seen; }
         }
@@ -442,7 +452,10 @@ async fn create_job(State(state): State<AppState>, Path(cluster_id): Path<Uuid>,
 async fn claim_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid>, headers: HeaderMap, Json(input): Json<ClaimJob>) -> ApiResult<Json<Option<JobLease>>> {
     let user = identity(&headers)?;
     let node_id = input.node_id;
-    let result = mutate_store(&state, move |store| {
+    // Claims serialize with durable changes, but never write storage themselves.
+    let _mutation = state.mutation_lock.lock().await;
+    let mut current = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
+    let result = (|store: &mut Store| {
         let job = store.jobs.get(&job_id).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Job not found".into()))?;
         require_member(store, job.cluster_id, &user)?;
         let node = store.nodes.get(&node_id).filter(|node| node.cluster_id == job.cluster_id && node.owner_id == user)
@@ -464,8 +477,28 @@ async fn claim_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid>
             }
         }
         Ok(None)
-    }).await?;
+    })(&mut current)?;
     Ok(Json(result))
+}
+async fn renew_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid>, headers: HeaderMap, Json(input): Json<RenewJob>) -> ApiResult<Json<recovery::TaskLease>> {
+    let user = identity(&headers)?;
+    // Renewal must remain available while a slow durable write is in progress.
+    let mut store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
+    let job = store.jobs.get(&job_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Job not found".into()))?;
+    require_member(&store, job.cluster_id, &user)?;
+    let prefix = format!("{job_id}:");
+    let batch = input.lease.task_id.strip_prefix(&prefix).and_then(|value| value.parse::<u64>().ok());
+    if !batch.is_some_and(|index| index < job.total_units.div_ceil(job.batch_units)) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "Lease does not belong to this job".into()));
+    }
+    let worker_id = Uuid::parse_str(&input.lease.worker_id).map_err(|_| ApiError(StatusCode::FORBIDDEN, "Invalid lease worker".into()))?;
+    let node = store.nodes.get(&worker_id).filter(|node| node.cluster_id == job.cluster_id && node.owner_id == user)
+        .ok_or(ApiError(StatusCode::FORBIDDEN, "The lease worker is not owned by your Mesh identity".into()))?;
+    if node.paused { return Err(ApiError(StatusCode::CONFLICT, "The worker node is paused".into())); }
+    if !node.online { return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "The worker is reconnecting; retry renewal within its grace period".into())); }
+    let renewed = store.recovery.renew(&input.lease, now().saturating_mul(1_000), JOB_LEASE_DURATION_MS)
+        .map_err(|_| ApiError(StatusCode::CONFLICT, "The worker lease expired or was reassigned; claim the batch again".into()))?;
+    Ok(Json(renewed))
 }
 async fn commit_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid>, headers: HeaderMap, Json(input): Json<CommitBatch>) -> ApiResult<StatusCode> {
     let user = identity(&headers)?;
@@ -667,7 +700,9 @@ async fn set_node_paused(State(state): State<AppState>, Path(id): Path<Uuid>, he
         if cluster_owner != user && node_owner != user { return Err(ApiError(StatusCode::FORBIDDEN, "You cannot manage this node".into())); }
         let node = store.nodes.get_mut(&id).expect("checked above");
         node.paused = paused;
-        Ok(node_summary(node))
+        let summary = node_summary(node);
+        if paused { store.recovery.shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), 0); }
+        Ok(summary)
     }).await?;
     let (node_session, peers) = if let Ok(connections) = state.node_connections.lock() {
         let node_session = connections.get(&id).map(|connection| {
@@ -698,6 +733,7 @@ async fn delete_node(State(state): State<AppState>, Path(id): Path<Uuid>, header
         let cluster = store.clusters.get(&node.cluster_id).ok_or(ApiError(StatusCode::NOT_FOUND, "Cluster not found".into()))?;
         if cluster.owner_id != user && node.owner_id != user { return Err(ApiError(StatusCode::FORBIDDEN, "You cannot remove this node".into())); }
         store.nodes.remove(&id);
+        store.recovery.shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), 0);
         Ok(())
     }).await?;
     if let Ok(mut connections) = state.node_connections.lock() { connections.remove(&id); }
@@ -725,7 +761,11 @@ fn register_node_connection(state: &AppState, id: Uuid, session_id: Uuid, sender
     } else { false };
     if !inserted { return false; }
     if let Ok(mut store) = state.store.lock() {
-        if let Some(node) = store.nodes.get_mut(&id) { node.online = true; node.last_seen = Some(now()); true }
+        if let Some(node) = store.nodes.get_mut(&id) {
+            node.online = true; node.last_seen = Some(now());
+            store.recovery.resume_worker_leases(&id.to_string(), now().saturating_mul(1_000), JOB_LEASE_DURATION_MS);
+            true
+        }
         else {
             if let Ok(mut connections) = state.node_connections.lock() {
                 if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id); }
@@ -768,7 +808,10 @@ fn disconnect_node(state: &AppState, id: Uuid, session_id: Uuid) {
         if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id).map(|connection| connection.cluster_id) } else { None }
     } else { None };
     if let Some(cluster_id) = removed_cluster {
-        if let Ok(mut store) = state.store.lock() { if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); } }
+        if let Ok(mut store) = state.store.lock() {
+            if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); }
+            store.recovery.shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), WORKER_RECONNECT_GRACE_MS);
+        }
         // Tell remaining same-cluster workers to close stale peer channels.
         let event = serde_json::json!({"type":"peer_left","peer_node_id":id}).to_string();
         if let Ok(connections) = state.node_connections.lock() {
@@ -867,7 +910,7 @@ async fn main() {
         let store = std::fs::read(&data_file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         (store, None)
     };
-    let _ = store.recovery.restart_coordinator();
+    store.recovery.start_session(coordinator_epoch(Uuid::new_v4()));
     for node in store.nodes.values_mut() { node.online = false; }
     let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
     let app = Router::new()
@@ -876,6 +919,7 @@ async fn main() {
         .route("/api/clusters/:id", axum::routing::patch(rename_cluster).delete(delete_cluster))
         .route("/api/clusters/:id/jobs", get(list_jobs).post(create_job))
         .route("/api/jobs/:id/claim", post(claim_job_batch))
+        .route("/api/jobs/:id/renew", post(renew_job_batch))
         .route("/api/jobs/:id/commit", post(commit_job_batch))
         .route("/api/clusters/:id/invites", get(list_invites).post(create_invite))
         .route("/api/clusters/:id/invites/:token", axum::routing::delete(revoke_invite))
@@ -1117,11 +1161,22 @@ mod tests {
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
         assert!(register_node_connection(&state, node_id, old_session, old_tx));
         assert!(register_node_connection(&state, node_id, new_session, new_tx));
+        let now_ms = now().saturating_mul(1_000);
+        let lease = {
+            let mut store = state.store.lock().unwrap();
+            store.recovery.add_task("connection-test").unwrap();
+            store.recovery.claim("connection-test", node_id.to_string(), now_ms, JOB_LEASE_DURATION_MS).unwrap()
+        };
         disconnect_node(&state, node_id, old_session);
         assert!(is_current_node_connection(&state, node_id, new_session));
         assert!(state.store.lock().unwrap().nodes.get(&node_id).unwrap().online);
+        let mut still_active = state.store.lock().unwrap().recovery.clone();
+        assert_eq!(still_active.claim("connection-test", "other-worker", now_ms + WORKER_RECONNECT_GRACE_MS + 1, JOB_LEASE_DURATION_MS), Err(recovery::LeaseError::LeaseBusy));
         disconnect_node(&state, node_id, new_session);
         assert!(!state.store.lock().unwrap().nodes.get(&node_id).unwrap().online);
+        let mut disconnected = state.store.lock().unwrap().recovery.clone();
+        let replacement = disconnected.claim("connection-test", "other-worker", now().saturating_mul(1_000) + WORKER_RECONNECT_GRACE_MS, JOB_LEASE_DURATION_MS).unwrap();
+        assert!(replacement.generation > lease.generation);
     }
 
     #[tokio::test]
@@ -1260,6 +1315,42 @@ mod tests {
         let store: Store = serde_json::from_str(r#"{"clusters":{},"invites":{},"nodes":{}}"#).unwrap();
         assert!(store.jobs.is_empty());
         assert!(!store.recovery.is_complete("missing"));
+    }
+
+    #[test]
+    fn process_epochs_round_trip_through_javascript_numbers() {
+        let epoch = coordinator_epoch(Uuid::from_u128(u128::MAX));
+        assert!(epoch > 0 && epoch <= (1_u64 << 53) - 1);
+        assert_eq!((epoch as f64) as u64, epoch);
+        assert_ne!(coordinator_epoch(Uuid::from_u128(1_u128 << 64)), coordinator_epoch(Uuid::from_u128(2_u128 << 64)));
+    }
+
+    #[tokio::test]
+    async fn claims_and_renewals_do_not_write_storage_and_renewal_bypasses_durable_lock() {
+        let file = std::env::temp_dir().join(format!("mesh-runtime-lease-{}.json", Uuid::new_v4()));
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let owner = test_headers("runtime-owner-identity-01234567890123456789012345");
+        let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "Runtime".into() })).await.unwrap();
+        let (_, Json(worker)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
+        state.store.lock().unwrap().nodes.get_mut(&worker.node.id).unwrap().online = true;
+        let (_, Json(job)) = create_job(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateJob { workload: ComputeWorkload::CpuHash, total_units: 1_000, batch_units: 1_000 })).await.unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let Json(Some(claim)) = claim_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(ClaimJob { node_id: worker.node.id })).await.unwrap() else { panic!("expected lease"); };
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        let durable_lock = state.mutation_lock.lock().await;
+        let Json(renewed) = tokio::time::timeout(Duration::from_millis(100), renew_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(RenewJob { lease: claim.lease.clone() }))).await.unwrap().unwrap();
+        assert_eq!(renewed.generation, claim.lease.generation);
+        assert!(renewed.expires_at_ms >= claim.lease.expires_at_ms);
+        drop(durable_lock);
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert!(renew_job_batch(State(state.clone()), Path(Uuid::new_v4()), owner.clone(), Json(RenewJob { lease: renewed.clone() })).await.is_err());
+        assert!(renew_job_batch(State(state.clone()), Path(job.id), test_headers("stranger-identity-012345678901234567890123456789"), Json(RenewJob { lease: renewed.clone() })).await.is_err());
+        let mut stale = renewed.clone();
+        stale.generation += 1;
+        assert!(renew_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(RenewJob { lease: stale })).await.is_err());
+        state.store.lock().unwrap().nodes.get_mut(&worker.node.id).unwrap().paused = true;
+        assert!(renew_job_batch(State(state.clone()), Path(job.id), owner, Json(RenewJob { lease: renewed })).await.is_err());
+        let _ = std::fs::remove_file(file);
     }
 }
 
