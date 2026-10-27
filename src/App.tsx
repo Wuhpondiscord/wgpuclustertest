@@ -16,7 +16,7 @@ type ShardReceipt = { shard_index: number; node_id: string; artifact_name: strin
 type ComputeCheckpoint = { batch_index: number; sha256: string; bytes: number; shards: ShardReceipt[]; available_shards: number; verified_holders: number; durability: string; manifest_revision: number }
 type ComputeJob = { id: string; cluster_id: string; created_at: number; workload: 'cpu-hash' | 'vector-add'; total_units: number; batch_units: number; total_batches: number; completed_batches: number; checkpoints: ComputeCheckpoint[] }
 type JobLease = { job_id: string; batch_index: number; start: number; end: number; lease: { task_id: string; worker_id: string; coordinator_epoch: number; generation: number; attempt_id: number; expires_at_ms: number } }
-type BrowserNodeConnection = { url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean; peerMesh: PeerMeshNode | null; custody: HolderCustody | null; repairRunning: boolean }
+type BrowserNodeConnection = { url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean; peerMesh: PeerMeshNode | null; custody: HolderCustody | null; repairRunning: string | null }
 type UiDialog =
   | { kind: 'input'; title: string; description: string; label: string; value: string; placeholder?: string; submitLabel: string; onSubmit: (value: string) => void }
   | { kind: 'confirm'; title: string; description: string; confirmLabel: string; requiredValue?: string; onConfirm: () => void }
@@ -274,7 +274,7 @@ function App() {
   }
   function connectBrowserNode(id: string, url: string) {
     stopBrowserNode(id)
-    const connection: BrowserNodeConnection = { url, socket: null, retryTimer: null, heartbeatTimer: null, stableTimer: null, attempts: 0, stopped: false, peerMesh: null, custody: null, repairRunning: false }
+    const connection: BrowserNodeConnection = { url, socket: null, retryTimer: null, heartbeatTimer: null, stableTimer: null, attempts: 0, stopped: false, peerMesh: null, custody: null, repairRunning: null }
     sockets.current.set(id, connection)
     openBrowserNode(id, connection)
   }
@@ -316,14 +316,14 @@ function App() {
         else if (message.type === 'repair_checkpoint' && message.task && message.task.worker_node_id === id && connection.peerMesh && connection.custody) {
           const task = message.task
           if (connection.repairRunning) { socket.send(JSON.stringify({ type: 'repair_failed', repair_id: task.id })); return }
-          connection.repairRunning = true
+          connection.repairRunning = task.id
           const mesh = connection.peerMesh
           const custody = connection.custody
           setNotice(`Repairing checkpoint ${task.batch_index + 1} on a spare node…`)
           void executeRepair(task, mesh).then(() => custody.request('repair_complete', { repair_id: task.id }, 90_000)).catch(error => {
             if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'repair_failed', repair_id: task.id }))
             setNotice(`Checkpoint repair will retry: ${error instanceof Error ? error.message : 'peer transfer failed'}`)
-          }).finally(() => { connection.repairRunning = false })
+          }).finally(() => { if (connection.repairRunning === task.id) connection.repairRunning = null })
         }
         else if (message.type === 'holder_ready') { void refreshClusters(activeSelection.current).catch(() => undefined) }
         else if (message.type === 'checkpoint_repaired') {
@@ -339,7 +339,7 @@ function App() {
       connection.stableTimer = null
       connection.peerMesh?.close(); connection.peerMesh = null
       connection.custody?.close(); connection.custody = null
-      connection.repairRunning = false
+      connection.repairRunning = null
       if (connection.socket === socket) connection.socket = null
       if (connection.stopped || sockets.current.get(id) !== connection) return
       setNotice(`${nameForNode(id)} disconnected; retrying automatically`)
