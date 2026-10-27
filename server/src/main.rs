@@ -783,9 +783,10 @@ fn register_node_connection(state: &AppState, id: Uuid, session_id: Uuid, sender
     let cluster_id = if let Ok(store) = state.store.lock() {
         if let Some(node) = store.nodes.get(&id) { node.cluster_id } else { return false; }
     } else { return false; };
-    if let Ok(mut runtime) = state.durability.lock() { runtime.custody.remove_node(id); }
+    let receipt_nonce = Uuid::new_v4().to_string();
     let inserted = if let Ok(mut connections) = state.node_connections.lock() {
-        connections.insert(id, NodeConnection { session_id, cluster_id, sender, receipt_nonce: Uuid::new_v4().to_string(), receipt_key: None });
+        if let Ok(mut runtime) = state.durability.lock() { runtime.custody.begin_session(id, receipt_nonce.clone()); } else { return false; }
+        connections.insert(id, NodeConnection { session_id, cluster_id, sender, receipt_nonce, receipt_key: None });
         true
     } else { false };
     if !inserted { return false; }
@@ -834,10 +835,10 @@ fn announce_peer_presence(state: &AppState, id: Uuid, joined: bool) {
 
 fn disconnect_node(state: &AppState, id: Uuid, session_id: Uuid) {
     let removed_cluster = if let Ok(mut connections) = state.node_connections.lock() {
-        if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id).map(|connection| connection.cluster_id) } else { None }
+        if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id).map(|connection| (connection.cluster_id, connection.receipt_nonce)) } else { None }
     } else { None };
-    if let Some(cluster_id) = removed_cluster {
-        if let Ok(mut runtime) = state.durability.lock() { runtime.custody.remove_node(id); }
+    if let Some((cluster_id, receipt_nonce)) = removed_cluster {
+        if let Ok(mut runtime) = state.durability.lock() { runtime.custody.end_session(id, &receipt_nonce); }
         if let Ok(mut store) = state.store.lock() {
             if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); }
             store.recovery.shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), WORKER_RECONNECT_GRACE_MS);
@@ -903,6 +904,7 @@ fn route_durability_message(state: &AppState, node: Uuid, session: Uuid, text: &
                 let connection = connections.get_mut(&node).filter(|connection| connection.session_id == session && connection.receipt_nonce == nonce)
                     .ok_or("Holder session changed")?;
                 if connection.receipt_key.as_ref().is_some_and(|existing| existing != key) { return Err("A signing key is already bound to this session".into()); }
+                state.durability.lock().map_err(|_| "Holder registry unavailable")?.custody.register_key(node, nonce, key)?;
                 connection.receipt_key = Some(key.to_owned());
                 Ok(())
             })();
