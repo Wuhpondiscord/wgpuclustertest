@@ -314,14 +314,19 @@ function App() {
     if (!active) return
     const source = [...sockets.current.entries()].find(([id, connection]) => nodes.some(node => node.id === id && node.cluster_id === active.id && !node.paused) && connection.socket?.readyState === WebSocket.OPEN && connection.peerMesh)
     const target = nodes.find(node => node.cluster_id === active.id && node.online && !node.paused && node.id !== source?.[0])
-    if (!source || !source[1].peerMesh) { setError('No active worker node is connected from this browser. Click Add node here and keep this dashboard tab open. Inviting a member alone does not connect a worker.'); return }
-    if (!target) { const onlineCount = nodes.filter(node => node.cluster_id === active.id && node.online && !node.paused).length; setError(`P2P test requires 2 connected nodes: one node in this browser and one peer. ${onlineCount}/2 currently online. An invite only grants membership; the other member must add a node and leave their dashboard open.`); return }
+    if (!source || !target || !source[1].peerMesh) { setError('Keep this tab connected to a node and connect a second node in the same cluster first.'); return }
     setError(''); setNotice('Establishing a direct peer channel…')
-    try {
-      const bytes = new TextEncoder().encode(JSON.stringify({ kind: 'checkpoint-transfer-probe', cluster_id: active.id, generated_at: Date.now(), payload: 'mesh-peer-transfer'.repeat(2048) }))
-      const result = await source[1].peerMesh.sendArtifact(target.id, 'mesh-p2p-checkpoint-probe', bytes)
-      setNotice(`Peer transfer verified: ${result.bytes.toLocaleString()} bytes, SHA-256 ${result.sha256.slice(0, 16)}…`)
-    } catch (e) { setError(e instanceof Error ? e.message : 'Peer transfer failed') }
+    const bytes = new TextEncoder().encode(JSON.stringify({ kind: 'checkpoint-transfer-probe', cluster_id: active.id, generated_at: Date.now(), payload: 'mesh-peer-transfer'.repeat(2048) }))
+    let lastError: unknown
+    const candidates = nodes.filter(node => node.cluster_id === active.id && node.online && !node.paused && node.id !== source[0])
+    for (const peer of candidates) {
+      try {
+        const result = await source[1].peerMesh.sendArtifact(peer.id, 'mesh-p2p-checkpoint-probe', bytes)
+        setNotice(`Peer transfer verified: ${result.bytes.toLocaleString()} bytes, SHA-256 ${result.sha256.slice(0, 16)}…`)
+        return
+      } catch (e) { lastError = e }
+    }
+    setError(lastError instanceof Error ? lastError.message : 'Peer transfer failed; no active peer acknowledged the test artifact')
   }
   async function createComputeJob(workload: ComputeJob['workload']) {
     if (!active) return
@@ -339,11 +344,16 @@ function App() {
       && connection.socket?.readyState === WebSocket.OPEN && connection.peerMesh)
     const source = workers[0]
     const replicas = nodes.filter(node => node.cluster_id === active.id && node.online && !node.paused && node.id !== source?.[0])
-    if (!source?.[1].peerMesh) { setError('No active worker node is connected from this browser. Click Add node here and keep this dashboard tab open. Inviting a member alone does not connect a worker.'); return }
-    const peersNeeded = job.workload === 'vector-add' ? 2 : 1
-    if (replicas.length < peersNeeded) { const required = peersNeeded + 1; const onlineCount = replicas.length + 1; const workloadName = job.workload === 'vector-add' ? 'WebGPU job' : 'CPU demo'; setError(`${workloadName} requires ${required} connected nodes total, including this worker. ${onlineCount}/${required} currently online. Have a cluster member add their own node and keep both dashboards open.`); return }
+    if (!source?.[1].peerMesh || !replicas.length) { setError('Connect one node owned by this browser and a second online node in the cluster.'); return }
+    if (job.workload === 'vector-add' && replicas.length < 2) { setError('This vector-add job produces a large checkpoint and needs three online nodes: this worker plus two peers.'); return }
     const peerMesh = source[1].peerMesh
     if (!peerMesh) { setError('The worker peer transport is not ready.'); return }
+    const availableCheckpointPeers = async (excluded: Set<string> = new Set()) => {
+      const currentNodes = await api<Node[]>(`/api/clusters/${job.cluster_id}/nodes`)
+      setNodes(currentNodes)
+      return currentNodes.filter(node => node.cluster_id === job.cluster_id && node.online && !node.paused && node.id !== source[0]
+        && !excluded.has(node.id) && peerMesh.canTransferTo(node.id))
+    }
     let gpuWorker: Awaited<ReturnType<typeof createVectorAddWorker>> = null
     let executionMode: 'webgpu' | 'cpu-fallback' | 'cpu' = 'cpu'
     if (job.workload === 'vector-add') {
@@ -376,26 +386,47 @@ function App() {
           result_digest: result, output: vectorResult ? Array.from(vectorResult) : undefined,
           worker_node_id: source[0], generation: claim.lease.generation,
         }))
-        const orderedPeers = replicas.map((_, offset) => replicas[(claim.batch_index + offset) % replicas.length])
         const shardReceipts: ShardReceipt[] = []
         const checkpointName = `job-${job.id}-batch-${claim.batch_index}-g${claim.lease.generation}`
         const checkpointDigest = await sha256Hex(artifact)
-        if (artifact.byteLength >= 64 * 1024) {
-          if (orderedPeers.length < 2) throw new Error('This checkpoint is large enough for 2+1 sharding and needs three online nodes (the worker plus two peers).')
-          const encoded = encode2Plus1(artifact)
-          const local = await peerMesh.storeArtifact(`${checkpointName}-s0`, encoded[0].bytes)
-          shardReceipts.push({ shard_index: 0, node_id: source[0], artifact_name: `${checkpointName}-s0`, sha256: local.sha256, bytes: local.bytes })
-          for (const shard of encoded.slice(1)) {
-            const target = orderedPeers[shard.index - 1]
-            const transfer = await peerMesh.sendArtifact(target.id, `${checkpointName}-s${shard.index}`, shard.bytes, false)
-            shardReceipts.push({ shard_index: shard.index, node_id: target.id, artifact_name: `${checkpointName}-s${shard.index}`, sha256: transfer.sha256, bytes: transfer.bytes })
+        const tryReplicatedCheckpoint = async (excluded: Set<string>) => {
+          const candidates = await availableCheckpointPeers(excluded)
+          let lastTransferError: unknown
+          for (const target of candidates) {
+            try {
+              const local = await peerMesh.storeArtifact(`${checkpointName}-s0`, artifact)
+              const transfer = await peerMesh.sendArtifact(target.id, `${checkpointName}-s1`, artifact, false)
+              return [
+                { shard_index: 0, node_id: source[0], artifact_name: `${checkpointName}-s0`, sha256: local.sha256, bytes: local.bytes },
+                { shard_index: 1, node_id: target.id, artifact_name: `${checkpointName}-s1`, sha256: transfer.sha256, bytes: transfer.bytes },
+              ] satisfies ShardReceipt[]
+            } catch (error) { lastTransferError = error }
           }
+          throw lastTransferError instanceof Error ? lastTransferError : new Error('No active peer acknowledged the replicated checkpoint')
+        }
+        if (artifact.byteLength >= 64 * 1024) {
+          const peers = await availableCheckpointPeers()
+          let shardAttemptFailed = false
+          if (peers.length >= 2) {
+            const orderedPeers = peers.map((_, offset) => peers[(claim.batch_index + offset) % peers.length])
+            try {
+              const encoded = encode2Plus1(artifact)
+              const local = await peerMesh.storeArtifact(`${checkpointName}-s0`, encoded[0].bytes)
+              shardReceipts.push({ shard_index: 0, node_id: source[0], artifact_name: `${checkpointName}-s0`, sha256: local.sha256, bytes: local.bytes })
+              for (const shard of encoded.slice(1)) {
+                const target = orderedPeers[shard.index - 1]
+                const transfer = await peerMesh.sendArtifact(target.id, `${checkpointName}-s${shard.index}`, shard.bytes, false)
+                shardReceipts.push({ shard_index: shard.index, node_id: target.id, artifact_name: `${checkpointName}-s${shard.index}`, sha256: transfer.sha256, bytes: transfer.bytes })
+              }
+            } catch (error) {
+              shardAttemptFailed = true
+              shardReceipts.length = 0
+              setNotice(`A shard peer left during batch ${claim.batch_index + 1}; retrying this checkpoint with full replicas`)
+            }
+          }
+          if (peers.length < 2 || shardAttemptFailed) shardReceipts.push(...await tryReplicatedCheckpoint(new Set()))
         } else {
-          const local = await peerMesh.storeArtifact(`${checkpointName}-s0`, artifact)
-          const target = orderedPeers[0]
-          const transfer = await peerMesh.sendArtifact(target.id, `${checkpointName}-s1`, artifact, false)
-          shardReceipts.push({ shard_index: 0, node_id: source[0], artifact_name: `${checkpointName}-s0`, sha256: local.sha256, bytes: local.bytes })
-          shardReceipts.push({ shard_index: 1, node_id: target.id, artifact_name: `${checkpointName}-s1`, sha256: transfer.sha256, bytes: transfer.bytes })
+          shardReceipts.push(...await tryReplicatedCheckpoint(new Set()))
         }
         await api(`/api/jobs/${job.id}/commit`, { method: 'POST', body: JSON.stringify({
           lease: claim.lease, sha256: checkpointDigest, bytes: artifact.byteLength, shards: shardReceipts,
@@ -489,9 +520,9 @@ function App() {
         <aside className="cluster-rail"><div className="rail-title">YOUR CLUSTERS <span>{clusters.length}</span></div>{clusters.map(c=><button key={c.id} className={`rail-cluster ${active?.id===c.id?'active':''}`} onClick={()=>void run(()=>refreshClusters(c.id))}><span className="rail-icon">{c.name.slice(0,2).toUpperCase()}</span><span className="rail-label"><b>{c.name}</b><small>{c.role} · {c.members} members</small></span><span className={`rail-state ${c.online_nodes?'online':''}`}/></button>)}{!clusters.length&&<p className="rail-empty">No clusters yet.</p>}<button className="rail-create" onClick={() => void createCluster()}><Plus size={14}/>Create cluster</button><div className="identity-note"><Shield size={14}/><span>Your browser holds your private Mesh identity key. Clearing site data loses access to this anonymous account.</span></div></aside>
         <section className="cluster-content">{!active ? <div className="empty-state"><div className="empty-symbol"><Boxes size={22}/></div><h2>Start your first cluster</h2><p>Create a pool, then invite members and register their nodes.</p><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>Create cluster</button></div> : <>
           <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions">{active.role==='owner'?<><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button" onClick={() => void renameCluster()}><Settings size={15}/>Rename</button><button className="manage-button danger" onClick={() => void deleteCluster()}><Trash2 size={15}/>Delete cluster</button></>:<button className="manage-button" onClick={() => void leaveCluster()}><LogOut size={15}/>Leave cluster</button>}</div></div>
-          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" title="Requires a connected worker in this browser and one other online cluster node." onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div><p className="availability-note">Invites grant membership only. Each member must add a node and keep their dashboard open. P2P needs two connected nodes.</p>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.paused?'Paused':n.online?'Connected':'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
+          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.paused?'Paused':n.online?'Connected':'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
             <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.token.slice(0,10)}…</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
-          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Compute jobs</h3><p>CPU jobs need 2 connected nodes. WebGPU jobs need 3 for 2+1 recovery.</p><p className="availability-note">Each member must add a node on their own device; an invite alone does not connect one.</p></div><div className="heading-buttons"><button className="manage-button small" onClick={() => void createComputeJob('cpu-hash')}>Create CPU demo</button><button className="manage-button small primary" onClick={() => void createComputeJob('vector-add')}>Create WebGPU job</button></div></div>{jobs.length===0?<div className="table-empty">Create a bounded CPU or WebGPU vector-add workload to exercise leases and recoverable checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);return <div className="job-row" key={job.id}><div className="job-title"><b>{job.workload==='vector-add'?'Vector addition (WebGPU with CPU fallback)':'Deterministic CPU hash'}</b><small>{job.total_units.toLocaleString()} elements · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}{job.checkpoints.length?` · ${job.checkpoints.length} recoverable checkpoint(s)`:''}</small><div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><div className="heading-buttons">{job.checkpoints.some(checkpoint=>checkpoint.shards.length>0)&&<button className="manage-button small" onClick={()=>void restoreLatestCheckpoint(job)}>Test restore</button>}<button className="manage-button small" disabled={done} title={job.workload==='vector-add'?'Requires this browser worker and two connected peers.':'Requires this browser worker and one connected peer.'} onClick={() => void runComputeJob(job)}>{done?'Complete':'Run on this node'}</button></div></div>})}</div>}</article>
+          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Compute jobs</h3><p>Small checkpoints use two copies; larger results use 2+1 shards across three nodes.</p></div><div className="heading-buttons"><button className="manage-button small" onClick={() => void createComputeJob('cpu-hash')}>Create CPU demo</button><button className="manage-button small primary" onClick={() => void createComputeJob('vector-add')}>Create WebGPU job</button></div></div>{jobs.length===0?<div className="table-empty">Create a bounded CPU or WebGPU vector-add workload to exercise leases and recoverable checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);const online=nodes.filter(node=>node.online&&!node.paused).length;return <div className="job-row" key={job.id}><div className="job-title"><b>{job.workload==='vector-add'?'Vector addition (WebGPU with CPU fallback)':'Deterministic CPU hash'}</b><small>{job.total_units.toLocaleString()} elements · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}{job.checkpoints.length?` · ${job.checkpoints.length} recoverable checkpoint(s)`:''}</small><div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><div className="heading-buttons">{job.checkpoints.some(checkpoint=>checkpoint.shards.length>0)&&<button className="manage-button small" onClick={()=>void restoreLatestCheckpoint(job)}>Test restore</button>}<button className="manage-button small" disabled={done||online<(job.workload==='vector-add'?3:2)} onClick={() => void runComputeJob(job)}>{done?'Complete':'Run on this node'}</button></div></div>})}</div>}</article>
           <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages leases and manifests; artifact bytes move peer to peer.</b><span>Large batches are split into two data shards plus XOR parity and written to three distinct nodes. Any two verified shards can reconstruct a checkpoint; use “Test restore” to request shards, reconstruct the latest checkpoint, and verify its full-artifact digest. This prototype does not yet attest to trusted computation or issue rewards.</span></div></div>
         </>}</section>
       </div>}

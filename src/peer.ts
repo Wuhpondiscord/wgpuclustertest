@@ -82,6 +82,11 @@ export class PeerMeshNode {
     for (const peerId of peerNodeIds) this.considerPeer(peerId)
   }
 
+  canTransferTo(peerId: string) {
+    const peer = this.peers.get(peerId)
+    return Boolean(peer && peer.signalingState !== 'closed' && peer.connectionState !== 'failed' && peer.connectionState !== 'closed')
+  }
+
   peerJoined(peerId: string) {
     if (this.peers.has(peerId)) {
       this.peers.get(peerId)?.close()
@@ -235,6 +240,10 @@ export class PeerMeshNode {
     if (!name || name.length > 128) throw new Error('Peer artifact names must contain 1–128 characters')
     if (!bytes.length) throw new Error('Peer artifacts must contain at least one byte')
     if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Peer artifact exceeds the 8 MiB transfer limit')
+    this.onNotice(`Sending checkpoint artifact “${name}” to peer ${peerId}…`)
+    // Give the local end-to-end harness a window to inject a peer failure while
+    // a transfer is in flight. Production transfers are not delayed.
+    if (new URLSearchParams(location.search).get('mesh-e2e') === 'local') await new Promise(resolve => window.setTimeout(resolve, 750))
     const deadline = Date.now() + 20_000
     let channel = this.channels.get(peerId)
     while ((!channel || channel.readyState !== 'open') && Date.now() < deadline) {

@@ -55,37 +55,6 @@ test('cluster creation uses an in-app form instead of browser prompts', async ({
   if (created) await api(identity, `/api/clusters/${created.id}`, 'DELETE')
 })
 
-test('explains the live peer requirements for P2P and CPU jobs', async ({ browser }) => {
-  const identity = ownerIdentity()
-  let clusterId = ''
-  let context: BrowserContext | undefined
-  try {
-    const cluster = await api<{ id: string }>(identity, '/api/clusters', 'POST', { name: 'readiness-feedback-e2e' })
-    clusterId = cluster.id
-    const created = await api<{ node: { id: string }; token: string }>(
-      identity, `/api/clusters/${clusterId}/nodes`, 'POST', { name: 'readiness-owner-node' },
-    )
-    const peer = await openPeer(browser, identity, created.node.id, created.token)
-    context = peer.context
-    await waitFor(async () => api<Array<{ id: string; online: boolean }>>(identity, `/api/clusters/${clusterId}/nodes`),
-      nodes => nodes.some(node => node.id === created.node.id && node.online), 'the local worker node to connect')
-
-    await peer.page.getByRole('button', { name: 'Create CPU demo' }).click()
-    const runButton = peer.page.getByRole('button', { name: 'Run on this node' })
-    await expect(runButton).toBeEnabled()
-    await runButton.click()
-    await expect(peer.page.getByText(/CPU demo requires 2 connected nodes total/)).toBeVisible()
-
-    const p2pButton = peer.page.getByRole('button', { name: 'Test P2P' })
-    await expect(p2pButton).toBeEnabled()
-    await p2pButton.click()
-    await expect(peer.page.getByText(/P2P test requires 2 connected nodes/)).toBeVisible()
-  } finally {
-    await context?.close()
-    if (clusterId) await api(identity, `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
-  }
-})
-
 test('reconstructs a 2+1 checkpoint after one peer goes offline', async ({ browser }) => {
   const identities = [ownerIdentity(), ownerIdentity(), ownerIdentity()]
   let clusterId = ''
@@ -134,6 +103,59 @@ test('reconstructs a 2+1 checkpoint after one peer goes offline', async ({ brows
     await expect(peers[0].page.locator('.node-row').filter({ hasText: 'Paused' })).toBeVisible()
     await peers[0].page.getByRole('button', { name: 'Test restore' }).click()
     await expect(peers[0].page.getByText(/Recovered batch 1 from 2 verified shard\(s\); full artifact SHA-256 matches\./)).toBeVisible({ timeout: 45_000 })
+  } finally {
+    await Promise.all(contexts.map(context => context.close()))
+    if (clusterId) await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
+  }
+})
+
+test('keeps a large checkpoint recoverable when a peer disconnects mid-transfer', async ({ browser }) => {
+  const identities = [ownerIdentity(), ownerIdentity(), ownerIdentity()]
+  let clusterId = ''
+  const contexts: BrowserContext[] = []
+  try {
+    const cluster = await api<{ id: string }>(identities[0], '/api/clusters', 'POST', { name: 'webrtc-interrupted-transfer-e2e' })
+    clusterId = cluster.id
+    const invite = await api<{ token: string }>(identities[0], `/api/clusters/${clusterId}/invites`, 'POST')
+    await Promise.all(identities.slice(1).map(identity => api(identity, '/api/invites/join', 'POST', { token: invite.token })))
+
+    const createdNodes = await Promise.all(identities.map((identity, index) => api<{ node: { id: string }; token: string }>(
+      identity, `/api/clusters/${clusterId}/nodes`, 'POST', { name: `e2e-fault-peer-${index + 1}` },
+    )))
+    const peers = await Promise.all(createdNodes.map((node, index) => openPeer(browser, identities[index], node.node.id, node.token)))
+    contexts.push(...peers.map(peer => peer.context))
+    const nodesPath = `/api/clusters/${clusterId}/nodes`
+    await waitFor(async () => api<Array<{ id: string; online: boolean; paused: boolean }>>(identities[0], nodesPath),
+      nodes => nodes.length === 3 && nodes.every(node => node.online && !node.paused), 'three live WebSocket nodes')
+
+    const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', {
+      workload: 'vector-add', total_units: 100_000, batch_units: 100_000,
+    })
+    await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
+    const transferNotice = peers[0].page.locator('.feedback.success').filter({ hasText: 'Sending checkpoint artifact' })
+    await expect(transferNotice).toBeVisible({ timeout: 45_000 })
+    const noticeText = await transferNotice.textContent()
+    const failedPeerId = noticeText?.match(/to peer ([0-9a-f-]{36})/)?.[1]
+    expect(failedPeerId).toBeTruthy()
+    await api(identities[0], `/api/nodes/${failedPeerId}/pause`, 'POST')
+    await waitFor(async () => api<Array<{ id: string; paused: boolean }>>(identities[0], nodesPath),
+      nodes => nodes.some(node => node.id === failedPeerId && node.paused), 'the transferring peer to disconnect')
+
+    const committed = await waitFor(async () => api<Array<{
+      id: string
+      completed_batches: number
+      checkpoints: Array<{ batch_index: number; sha256: string; bytes: number; shards: Array<{ shard_index: number; node_id: string; sha256: string; bytes: number }> }>
+    }>>(identities[0], `/api/clusters/${clusterId}/jobs`), jobs => {
+      const current = jobs.find(item => item.id === job.id)
+      return Boolean(current?.checkpoints[0]?.shards.length === 2)
+    }, 'the fallback full-copy checkpoint to commit', 90_000)
+    const committedJob = committed.find(item => item.id === job.id)!
+    const checkpoint = committedJob.checkpoints[0]
+    expect(committedJob.completed_batches).toBe(1)
+    expect(new Set(checkpoint.shards.map(shard => shard.node_id)).size).toBe(2)
+    expect(checkpoint.shards.map(shard => shard.bytes)).toEqual([checkpoint.bytes, checkpoint.bytes])
+    expect(checkpoint.shards.every(shard => shard.sha256 === checkpoint.sha256)).toBe(true)
+    await expect(peers[0].page.locator('.feedback.success')).toContainText('All job batches completed and replicated')
   } finally {
     await Promise.all(contexts.map(context => context.close()))
     if (clusterId) await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
