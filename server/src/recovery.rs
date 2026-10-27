@@ -20,6 +20,7 @@ pub struct TaskLease {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct TaskRecord {
     generation: u64,
+    #[serde(skip)]
     lease: Option<TaskLease>,
     result_digest: Option<String>,
 }
@@ -57,6 +58,46 @@ impl Default for RecoveryLedger {
 }
 
 impl RecoveryLedger {
+    /// Epochs are opaque fencing tokens. A fresh process supplies a fresh token
+    /// because runtime claims are deliberately absent from durable snapshots.
+    pub fn start_session(&mut self, epoch: u64) {
+        self.coordinator_epoch = epoch;
+        self.next_attempt_id = 0;
+        for record in self.tasks.values_mut() { record.lease = None; }
+    }
+
+    /// Keep renewals and disconnect deadlines that arrived while a durable
+    /// snapshot was being written. Newly committed tasks keep their result.
+    pub fn preserve_runtime_from(&mut self, current: &Self) {
+        self.coordinator_epoch = current.coordinator_epoch;
+        self.next_attempt_id = current.next_attempt_id;
+        for (id, record) in &mut self.tasks {
+            if record.result_digest.is_none() {
+                if let Some(runtime) = current.tasks.get(id) {
+                    record.generation = runtime.generation;
+                    record.lease = runtime.lease.clone();
+                }
+            }
+        }
+    }
+
+    pub fn shorten_worker_leases(&mut self, worker_id: &str, now_ms: u64, grace_ms: u64) {
+        let deadline = now_ms.saturating_add(grace_ms);
+        for record in self.tasks.values_mut() {
+            if let Some(lease) = record.lease.as_mut().filter(|lease| lease.worker_id == worker_id) {
+                lease.expires_at_ms = lease.expires_at_ms.min(deadline);
+            }
+        }
+    }
+
+    pub fn resume_worker_leases(&mut self, worker_id: &str, now_ms: u64, duration_ms: u64) {
+        for record in self.tasks.values_mut() {
+            if let Some(lease) = record.lease.as_mut().filter(|lease| lease.worker_id == worker_id && lease.expires_at_ms > now_ms) {
+                lease.expires_at_ms = now_ms.saturating_add(duration_ms);
+            }
+        }
+    }
+
     pub fn add_task(&mut self, task_id: impl Into<String>) -> Result<(), LeaseError> {
         let task_id = task_id.into();
         if self.tasks.contains_key(&task_id) { return Err(LeaseError::DuplicateTask); }
@@ -170,6 +211,51 @@ fn same_attempt(current: &TaskLease, submitted: &TaskLease) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_survives_the_original_deadline_and_a_durable_snapshot_swap() {
+        let mut current = RecoveryLedger::default();
+        current.add_task("batch").unwrap();
+        let lease = current.claim("batch", "worker", 0, 30).unwrap();
+        let mut snapshot = current.clone();
+        current.renew(&lease, 20, 100).unwrap();
+        snapshot.preserve_runtime_from(&current);
+        assert_eq!(snapshot.commit_result(&lease, 80, "result"), Ok(ResultCommit::Accepted));
+    }
+
+    #[test]
+    fn disconnect_grace_allows_reconnect_then_fences_reassigned_work() {
+        let mut ledger = RecoveryLedger::default();
+        ledger.add_task("a").unwrap();
+        ledger.add_task("b").unwrap();
+        let old = ledger.claim("a", "worker-a", 0, 100).unwrap();
+        let other = ledger.claim("b", "worker-b", 0, 100).unwrap();
+        ledger.shorten_worker_leases("worker-a", 10, 10);
+        assert_eq!(ledger.claim("a", "worker-c", 19, 100), Err(LeaseError::LeaseBusy));
+        ledger.resume_worker_leases("worker-a", 15, 100);
+        assert_eq!(ledger.claim("a", "worker-c", 25, 100), Err(LeaseError::LeaseBusy));
+        ledger.shorten_worker_leases("worker-a", 30, 10);
+        let reassigned = ledger.claim("a", "worker-c", 40, 100).unwrap();
+        assert_eq!(ledger.renew(&old, 41, 100), Err(LeaseError::StaleLease));
+        assert_eq!(ledger.commit_result(&old, 41, "stale"), Err(LeaseError::StaleLease));
+        assert_eq!(ledger.commit_result(&reassigned, 41, "fresh"), Ok(ResultCommit::Accepted));
+        assert_eq!(ledger.commit_result(&other, 41, "independent"), Ok(ResultCommit::Accepted));
+    }
+
+    #[test]
+    fn snapshots_exclude_leases_and_fresh_sessions_fence_old_attempts() {
+        let mut ledger = RecoveryLedger::default();
+        ledger.add_task("batch").unwrap();
+        ledger.start_session(101);
+        let old = ledger.claim("batch", "worker", 0, 100).unwrap();
+        let json = serde_json::to_string(&ledger).unwrap();
+        assert!(!json.contains("expires_at_ms"));
+        let mut restored: RecoveryLedger = serde_json::from_str(&json).unwrap();
+        restored.start_session(102);
+        let fresh = restored.claim("batch", "worker", 1, 100).unwrap();
+        assert_eq!(restored.commit_result(&old, 2, "stale"), Err(LeaseError::StaleLease));
+        assert_eq!(restored.commit_result(&fresh, 2, "fresh"), Ok(ResultCommit::Accepted));
+    }
 
     #[test]
     fn expired_attempt_is_fenced_after_reassignment() {
