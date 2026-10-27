@@ -192,3 +192,5 @@ button { -webkit-tap-highlight-color: transparent; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
+.availability-note { margin-top: 9px; padding: 9px 11px; border: 1px solid #ddd6fe; border-radius: 8px; background: var(--mesh-wash); color: var(--mesh-purple-deep); font-size: 11px; line-height: 1.5; }
+.card-heading .availability-note { color: var(--mesh-muted); font-size: 11px; }
