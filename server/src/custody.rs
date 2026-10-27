@@ -34,16 +34,37 @@ pub fn public_key(encoded: &str) -> Result<VerifyingKey, String> {
 #[derive(Default)]
 pub struct Registry {
     receipts: HashMap<(Uuid, String), HolderProof>,
+    sessions: HashMap<Uuid, (String, Option<String>)>,
 }
 
 impl Registry {
     pub fn remove_node(&mut self, node_id: Uuid) {
         self.receipts.retain(|(id, _), _| *id != node_id);
+        self.sessions.remove(&node_id);
+    }
+
+    pub fn begin_session(&mut self, node_id: Uuid, nonce: String) {
+        self.remove_node(node_id);
+        self.sessions.insert(node_id, (nonce, None));
+    }
+
+    pub fn end_session(&mut self, node_id: Uuid, nonce: &str) {
+        if self.sessions.get(&node_id).is_some_and(|(current, _)| current == nonce) { self.remove_node(node_id); }
+    }
+
+    pub fn register_key(&mut self, node_id: Uuid, nonce: &str, key: &str) -> Result<(), String> {
+        let (current_nonce, current_key) = self.sessions.get_mut(&node_id).ok_or("The holder session ended")?;
+        if current_nonce != nonce || current_key.as_ref().is_some_and(|current| current != key) { return Err("The holder signing session changed".into()); }
+        *current_key = Some(key.to_owned());
+        Ok(())
     }
 
     pub fn accept(&mut self, proof: HolderProof, authenticated_node: Uuid, session_nonce: &str, session_key: &str, now: u64) -> Result<(), String> {
         if proof.node_id != authenticated_node || proof.nonce != session_nonce || proof.public_key != session_key {
             return Err("Receipt is not bound to the authenticated holder session".into());
+        }
+        if !self.sessions.get(&authenticated_node).is_some_and(|(nonce, key)| nonce == session_nonce && key.as_deref() == Some(session_key)) {
+            return Err("The holder signing session is no longer current".into());
         }
         if proof.artifact_name.is_empty() || proof.artifact_name.len() > 128 || proof.bytes == 0 || proof.bytes > 8 * 1024 * 1024
             || proof.sha256.len() != 64 || !proof.sha256.bytes().all(|b| b.is_ascii_hexdigit()) || proof.signature.len() > 100 {
@@ -98,6 +119,8 @@ pub(crate) mod tests {
         let key = SigningKey::from_slice(&[7; 32]).unwrap();
         let public_key = BASE64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
         let nonce = "unit-test-session".to_string();
+        if !registry.sessions.get(&shard.node_id).is_some_and(|(current, _)| current == &nonce) { registry.begin_session(shard.node_id, nonce.clone()); }
+        registry.register_key(shard.node_id, &nonce, &public_key).unwrap();
         let signature: Signature = key.sign(&signing_input(&nonce, shard.node_id, &shard.artifact_name, &shard.sha256, shard.bytes));
         let proof = HolderProof { node_id: shard.node_id, artifact_name: shard.artifact_name.clone(), sha256: shard.sha256.clone(), bytes: shard.bytes, nonce: nonce.clone(), public_key: public_key.clone(), signature: BASE64.encode(signature.to_bytes()), observed_at: now };
         registry.accept(proof, shard.node_id, &nonce, &public_key, now).unwrap();
@@ -115,7 +138,10 @@ pub(crate) mod tests {
         let mut corrupt = proof.clone(); corrupt.bytes += 1;
         assert!(registry.accept(corrupt, node_id, &proof.nonce, &proof.public_key, 11).is_err());
         assert!(registry.proof(&shard, 611).is_err());
-        registry.remove_node(node_id);
+        registry.begin_session(node_id, "replacement-session".into());
+        registry.end_session(node_id, &proof.nonce);
+        assert!(registry.sessions.contains_key(&node_id));
+        assert!(registry.accept(proof.clone(), node_id, &proof.nonce, &proof.public_key, 11).is_err());
         assert!(registry.proof(&shard, 11).is_err());
     }
 
