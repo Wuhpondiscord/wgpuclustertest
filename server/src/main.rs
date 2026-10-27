@@ -184,6 +184,11 @@ fn identity(headers: &HeaderMap) -> ApiResult<String> {
     Ok(secret_hash(id))
 }
 fn secret_hash(value: &str) -> String { format!("{:x}", Sha256::digest(value.as_bytes())) }
+fn coordinator_epoch(session: Uuid) -> u64 {
+    // Leases cross the JSON/JavaScript boundary. Keep the opaque random token
+    // exactly representable by Number so browsers return the same fencing token.
+    (session.as_u64_pair().0 & ((1_u64 << 53) - 1)).max(1)
+}
 fn cluster_name(name: &str) -> Option<String> {
     let name = name.trim();
     (!name.is_empty() && name.chars().count() <= 80).then(|| name.to_owned())
@@ -905,7 +910,7 @@ async fn main() {
         let store = std::fs::read(&data_file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         (store, None)
     };
-    store.recovery.start_session(Uuid::new_v4().as_u64_pair().0);
+    store.recovery.start_session(coordinator_epoch(Uuid::new_v4()));
     for node in store.nodes.values_mut() { node.online = false; }
     let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
     let app = Router::new()
@@ -1310,6 +1315,14 @@ mod tests {
         let store: Store = serde_json::from_str(r#"{"clusters":{},"invites":{},"nodes":{}}"#).unwrap();
         assert!(store.jobs.is_empty());
         assert!(!store.recovery.is_complete("missing"));
+    }
+
+    #[test]
+    fn process_epochs_round_trip_through_javascript_numbers() {
+        let epoch = coordinator_epoch(Uuid::from_u128(u128::MAX));
+        assert!(epoch > 0 && epoch <= (1_u64 << 53) - 1);
+        assert_eq!((epoch as f64) as u64, epoch);
+        assert_ne!(coordinator_epoch(Uuid::from_u128(1_u128 << 64)), coordinator_epoch(Uuid::from_u128(2_u128 << 64)));
     }
 
     #[tokio::test]
