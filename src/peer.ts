@@ -40,10 +40,17 @@ async function persistArtifact(key: string, value: { name: string; bytes: Uint8A
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction('artifacts', 'readwrite')
-      transaction.objectStore('artifacts').put(value, key)
+      const artifacts = transaction.objectStore('artifacts')
+      const existing = artifacts.get(key)
+      let conflict = false
+      existing.onsuccess = () => {
+        const previous = existing.result as { sha256?: string } | undefined
+        if (previous && previous.sha256 !== value.sha256) { conflict = true; transaction.abort(); return }
+        artifacts.put(value, key)
+      }
       transaction.oncomplete = () => resolve()
       transaction.onerror = () => reject(transaction.error ?? new Error('Could not persist received artifact'))
-      transaction.onabort = () => reject(transaction.error ?? new Error('Artifact persistence was aborted'))
+      transaction.onabort = () => reject(new Error(conflict ? 'Artifact names are immutable; use a new name for changed bytes' : 'Artifact persistence was aborted'))
     })
   } finally { db.close() }
 }
@@ -78,6 +85,7 @@ export class PeerMeshNode {
     private readonly nodeId: string,
     private readonly signal: (peerNodeId: string, payload: SignalPayload) => void,
     private readonly onNotice: (message: string) => void,
+    private readonly onStored?: (name: string, sha256: string, bytes: number) => Promise<void>,
   ) {}
 
   addPeers(peerNodeIds: string[]) {
@@ -213,7 +221,10 @@ export class PeerMeshNode {
       if (typeof start.transfer_id !== 'string' || start.transfer_id.length > 64 || !start.transfer_id || typeof start.name !== 'string' || !start.name || start.name.length > 128 || !Number.isSafeInteger(start.total_bytes) || start.total_bytes <= 0 || start.total_bytes > MAX_ARTIFACT_BYTES
         || !Number.isSafeInteger(start.chunks) || start.chunks < 0 || start.chunks > Math.ceil(MAX_ARTIFACT_BYTES / CHUNK_BYTES)
         || !/^[a-f0-9]{64}$/i.test(start.sha256) || start.chunks !== Math.ceil(start.total_bytes / CHUNK_BYTES)) return
-      if (this.incoming.size >= MAX_CONCURRENT_TRANSFERS && !this.incoming.has(start.transfer_id)) return
+      if (this.incoming.size >= MAX_CONCURRENT_TRANSFERS && !this.incoming.has(start.transfer_id)) {
+        channel.send(JSON.stringify({ type: 'artifact_nack', transfer_id: start.transfer_id, reason: 'receiver_busy' }))
+        return
+      }
       this.incoming.set(start.transfer_id, { peerId, start, chunks: new Map(), bytes: 0 })
       return
     }
@@ -243,6 +254,7 @@ export class PeerMeshNode {
       }
       try {
         await persistArtifact(`artifact:${transfer.start.name}`, { name: transfer.start.name, bytes: result, sha256: actualHash, receivedAt: Date.now() })
+        await this.onStored?.(transfer.start.name, actualHash, result.length)
         channel.send(JSON.stringify({ type: 'artifact_ack', transfer_id: message.transfer_id, sha256: actualHash }))
         this.onNotice(`Verified peer artifact “${transfer.start.name}” (${result.length.toLocaleString()} bytes)`)
         const readKey = `${peerId}:${transfer.start.name}`
@@ -295,7 +307,10 @@ export class PeerMeshNode {
     }
     const receivedHash = await acknowledged
     if (receivedHash !== sha256) throw new Error('Peer acknowledged a different artifact digest')
-    if (persistLocally) await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+    if (persistLocally) {
+      await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+      await this.onStored?.(name, sha256, bytes.length)
+    }
     return { transferId, sha256, bytes: bytes.length }
   }
 
@@ -303,6 +318,7 @@ export class PeerMeshNode {
     if (!name || name.length > 128 || !bytes.length || bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Local shard is outside artifact limits')
     const sha256 = await digest(bytes)
     await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+    await this.onStored?.(name, sha256, bytes.length)
     return { sha256, bytes: bytes.length }
   }
 
