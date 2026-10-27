@@ -540,21 +540,11 @@ button { -webkit-tap-highlight-color: transparent; }
   .dialog-actions {
     justify-content: flex-end;
   }
-@media(max-width:850px) {
-  .manage-main {
-    padding: 28px 17px;
-  }
-  .manage-layout {
-    grid-template-columns: 205px minmax(0,1fr);
-  }
-  .resource-grid {
-    grid-template-columns: 1fr;
-  }
+@media (max-width: 900px) {
   .cluster-content {
     padding: 13px;
   }
   .cluster-summary {
-    align-items: flex-start;
     gap: 10px;
     flex-direction: column;
   }
@@ -580,27 +570,11 @@ button { -webkit-tap-highlight-color: transparent; }
     flex: 1;
   }
 }
-@media(max-width:620px) {
-  .manage-top {
-    height: 55px;
-    padding: 0 15px;
-  }
-  .manage-main {
-    padding: 22px 12px;
-  }
-  .manage-layout {
-    grid-template-columns: 1fr;
-  }
+@media (max-width: 680px) {
   .cluster-rail {
     min-height: 0;
-    padding: 10px;
-  }
-  .identity-note {
-    margin-top: 10px;
   }
   .cluster-rail .rail-cluster {
-    display: inline-flex;
-    width: calc(50% - 3px);
     vertical-align: top;
   }
   .rail-create {
@@ -609,32 +583,14 @@ button { -webkit-tap-highlight-color: transparent; }
   .cluster-content {
     min-height: 300px;
   }
-  .resource-grid {
-    gap: 9px;
-  }
-  .summary-actions {
-    align-self: stretch;
-  }
   .summary-actions .manage-button:first-child {
     flex: 1;
-  }
-  .invite-banner {
-    align-items: flex-start;
-    flex-wrap: wrap;
   }
   .invite-banner>div {
     flex-basis: calc(100% - 28px);
   }
   .invite-banner .manage-button {
     margin-left: 0;
-  }
-  .invite-banner .dismiss-button {
-    position: absolute;
-    right: 17px;
-  }
-  .control-badge i {
-    width: 7px;
-    height: 7px;
   }
   .heading-buttons .manage-button {
     padding: 0 7px;
