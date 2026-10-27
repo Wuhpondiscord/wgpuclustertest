@@ -7,7 +7,7 @@ const MAX_CONCURRENT_TRANSFERS = 2
 type SignalPayload = { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
 type TransferStart = { type: 'artifact_start'; transfer_id: string; name: string; total_bytes: number; chunks: number; sha256: string }
 type TransferChunk = { type: 'artifact_chunk'; transfer_id: string; index: number; data: string }
-type IncomingTransfer = { peerId: string; start: TransferStart; chunks: Map<number, Uint8Array>; bytes: number }
+type IncomingTransfer = { peerId: string; start: TransferStart; chunks: Map<number, Uint8Array>; bytes: number; lastActivity: number }
 type PendingTransfer = { peerId: string; resolve: (digest: string) => void; reject: (error: Error) => void; timer: number }
 type PendingArtifactRead = { peerId: string; name: string; resolve: (bytes: Uint8Array) => void; reject: (error: Error) => void; timer: number }
 
@@ -195,6 +195,10 @@ export class PeerMeshNode {
 
   private async handleDataMessage(peerId: string, channel: RTCDataChannel, data: unknown) {
     if (typeof data !== 'string' || data.length > MAX_FRAME_CHARS) return
+    // Failed senders can leave an incomplete frame sequence on a live channel.
+    // Reclaim idle slots before accepting fresh traffic, keeping retries usable.
+    const at = performance.now()
+    for (const [id, transfer] of this.incoming) if (at - transfer.lastActivity > 45_000) this.incoming.delete(id)
     let message: Record<string, unknown>
     try { message = JSON.parse(data) as Record<string, unknown> } catch { return }
     if (message.type === 'artifact_ack' && typeof message.transfer_id === 'string' && typeof message.sha256 === 'string') {
@@ -225,7 +229,7 @@ export class PeerMeshNode {
         channel.send(JSON.stringify({ type: 'artifact_nack', transfer_id: start.transfer_id, reason: 'receiver_busy' }))
         return
       }
-      this.incoming.set(start.transfer_id, { peerId, start, chunks: new Map(), bytes: 0 })
+      this.incoming.set(start.transfer_id, { peerId, start, chunks: new Map(), bytes: 0, lastActivity: at })
       return
     }
     if (message.type === 'artifact_chunk' && typeof message.transfer_id === 'string' && typeof message.data === 'string') {
@@ -238,6 +242,7 @@ export class PeerMeshNode {
       if (bytes.length > CHUNK_BYTES || transfer.bytes + bytes.length > transfer.start.total_bytes) { this.incoming.delete(message.transfer_id); return }
       transfer.chunks.set(index, bytes)
       transfer.bytes += bytes.length
+      transfer.lastActivity = at
       if (transfer.chunks.size !== transfer.start.chunks) return
       const result = new Uint8Array(transfer.bytes)
       let offset = 0
@@ -265,11 +270,12 @@ export class PeerMeshNode {
     }
     if (message.type === 'artifact_nack' && typeof message.transfer_id === 'string') {
       const pending = this.pending.get(message.transfer_id)
-      if (pending?.peerId === peerId) { window.clearTimeout(pending.timer); this.pending.delete(message.transfer_id); pending.reject(new Error('Peer rejected the artifact: integrity check or storage failed')) }
+      if (pending?.peerId === peerId) { window.clearTimeout(pending.timer); this.pending.delete(message.transfer_id); pending.reject(new Error(message.reason === 'receiver_busy' ? 'Peer storage is busy; retry the artifact transfer' : 'Peer rejected the artifact: integrity check or storage failed')) }
     }
   }
 
   async sendArtifact(peerId: string, name: string, bytes: Uint8Array, persistLocally = true) {
+    if (this.closed) throw new Error('Node connection closed')
     if (!name || name.length > 128) throw new Error('Peer artifact names must contain 1–128 characters')
     if (!bytes.length) throw new Error('Peer artifacts must contain at least one byte')
     if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Peer artifact exceeds the 8 MiB transfer limit')
@@ -280,6 +286,7 @@ export class PeerMeshNode {
     const deadline = Date.now() + 20_000
     let channel = this.channels.get(peerId)
     while ((!channel || channel.readyState !== 'open') && Date.now() < deadline) {
+      if (this.closed) throw new Error('Node connection closed')
       await new Promise(resolve => window.setTimeout(resolve, 100))
       channel = this.channels.get(peerId)
     }
