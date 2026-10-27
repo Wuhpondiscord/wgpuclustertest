@@ -108,11 +108,13 @@ function App() {
   const [dialog, setDialog] = useState<UiDialog | null>(null)
   const [dialogValue, setDialogValue] = useState('')
   const sockets = useRef(new Map<string, BrowserNodeConnection>())
+  const activeSelection = useRef('')
   const [busy, setBusy] = useState(true)
   const [coordinatorStatus, setCoordinatorStatus] = useState<'checking' | 'online' | 'offline'>('checking')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const active = clusters.find(c => c.id === activeId) ?? clusters[0]
+  useEffect(() => { activeSelection.current = activeId }, [activeId])
 
   async function refreshClusters(preferId?: string) {
     const data = await api<Cluster[]>('/api/clusters')
@@ -323,10 +325,10 @@ function App() {
             setNotice(`Checkpoint repair will retry: ${error instanceof Error ? error.message : 'peer transfer failed'}`)
           }).finally(() => { connection.repairRunning = false })
         }
-        else if (message.type === 'holder_ready') { void refreshClusters(activeId).catch(() => undefined) }
+        else if (message.type === 'holder_ready') { void refreshClusters(activeSelection.current).catch(() => undefined) }
         else if (message.type === 'checkpoint_repaired') {
           setNotice('Checkpoint redundancy restored on a replacement holder')
-          void refreshClusters(activeId).catch(() => undefined)
+          void refreshClusters(activeSelection.current).catch(() => undefined)
         }
       } catch { /* Ignore unknown worker messages. */ }
     })
