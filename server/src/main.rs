@@ -1,6 +1,6 @@
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     extract::DefaultBodyLimit,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -378,6 +378,23 @@ fn load_github_store(config: &GitHubStorage) -> Result<(Store, Option<String>), 
     let store = serde_json::from_slice(&bytes).map_err(|_| "GitHub state file is not valid Mesh data".to_string())?;
     let sha = result.get("sha").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| "GitHub state file has no revision".to_string())?;
     Ok((store, Some(sha)))
+}
+
+fn prevent_html_caching(headers: &mut HeaderMap) {
+    let is_html = headers.get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if is_html {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate"));
+        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    }
+}
+
+async fn no_cache_html(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    prevent_html_caching(response.headers_mut());
+    response
 }
 
 async fn health() -> &'static str { "mesh coordinator ready" }
@@ -888,7 +905,11 @@ async fn main() {
         .route("/api/nodes/connect", get(node_socket))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state.clone())
-        .fallback_service(ServeDir::new("dist").append_index_html_on_directories(true));
+        .fallback_service(
+            Router::new()
+                .fallback_service(ServeDir::new("dist").append_index_html_on_directories(true))
+                .layer(axum::middleware::from_fn(no_cache_html)),
+        );
     let port = std::env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(7860);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind coordinator");
@@ -899,6 +920,25 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_documents_are_never_cached() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+        prevent_html_caching(&mut headers);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store, no-cache, must-revalidate");
+        assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+        assert_eq!(headers.get(header::EXPIRES).unwrap(), "0");
+    }
+
+    #[test]
+    fn non_html_assets_keep_their_existing_cache_policy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
+        prevent_html_caching(&mut headers);
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "public, max-age=31536000, immutable");
+    }
 
     fn test_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
