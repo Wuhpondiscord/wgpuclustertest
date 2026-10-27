@@ -4,6 +4,51 @@ import { expect, test, type Browser, type BrowserContext } from '@playwright/tes
 const baseURL = 'http://127.0.0.1:5173'
 const ownerIdentity = () => randomBytes(32).toString('hex')
 
+test('serializes peer descriptions and buffers ICE candidates that arrive early', async ({ page }) => {
+  await page.goto('/?mesh-e2e=local')
+  const result = await page.evaluate(async () => {
+    const path = '/src/peer.ts'
+    const { PeerMeshNode } = await import(path)
+    const native = window.RTCPeerConnection
+    const events: string[] = []
+    const notices: string[] = []
+    class FakePeer {
+      remoteDescription: RTCSessionDescriptionInit | null = null
+      localDescription: RTCSessionDescriptionInit | null = null
+      connectionState = 'new'
+      signalingState = 'stable'
+      async setRemoteDescription(description: RTCSessionDescriptionInit) {
+        events.push('remote-start')
+        await new Promise(resolve => setTimeout(resolve, 30))
+        this.remoteDescription = description
+        events.push('remote-ready')
+      }
+      async addIceCandidate(candidate: RTCIceCandidateInit) {
+        if (!this.remoteDescription) throw new Error('Remote description is missing')
+        events.push(`candidate:${candidate.candidate}`)
+      }
+      async createAnswer() { return { type: 'answer', sdp: 'answer' } }
+      async setLocalDescription(description: RTCSessionDescriptionInit) { this.localDescription = description }
+      close() { this.connectionState = 'closed' }
+    }
+    Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: FakePeer })
+    const node = new PeerMeshNode('worker', () => undefined, (notice: string) => notices.push(notice))
+    try {
+      await Promise.all([
+        node.handleSignal('peer', { candidate: { candidate: 'early' } }),
+        node.handleSignal('peer', { description: { type: 'offer', sdp: 'offer' } }),
+        node.handleSignal('peer', { candidate: { candidate: 'concurrent' } }),
+      ])
+      return { events, notices }
+    } finally {
+      node.close()
+      Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: native })
+    }
+  })
+  expect(result.notices).toEqual([])
+  expect(result.events).toEqual(['remote-start', 'remote-ready', 'candidate:early', 'candidate:concurrent'])
+})
+
 async function api<T>(identity: string, path: string, method = 'GET', body?: unknown): Promise<T> {
   const response = await fetch(new URL(path, baseURL), {
     method,
@@ -159,6 +204,51 @@ test('keeps a large checkpoint recoverable when a peer disconnects mid-transfer'
   } finally {
     await Promise.all(contexts.map(context => context.close()))
     if (clusterId) await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
+  }
+})
+
+test('renews a lease through a slow commit and a temporary renewal failure', async ({ browser }) => {
+  const identity = ownerIdentity()
+  let clusterId = ''
+  const contexts: BrowserContext[] = []
+  try {
+    const cluster = await api<{ id: string }>(identity, '/api/clusters', 'POST', { name: 'slow-checkpoint-lease-e2e' })
+    clusterId = cluster.id
+    const created = await Promise.all([0, 1].map(index => api<{ node: { id: string }; token: string }>(
+      identity, `/api/clusters/${clusterId}/nodes`, 'POST', { name: `lease-peer-${index}` },
+    )))
+    const peers = await Promise.all(created.map(node => openPeer(browser, identity, node.node.id, node.token)))
+    contexts.push(...peers.map(peer => peer.context))
+    await waitFor(() => api<Array<{ online: boolean }>>(identity, `/api/clusters/${clusterId}/nodes`),
+      nodes => nodes.length === 2 && nodes.every(node => node.online), 'two live worker nodes')
+    const job = await api<{ id: string }>(identity, `/api/clusters/${clusterId}/jobs`, 'POST', {
+      workload: 'cpu-hash', total_units: 1000, batch_units: 1000,
+    })
+    let renewAttempts = 0
+    let renewed = 0
+    peers[0].page.on('response', response => {
+      if (response.url().endsWith(`/api/jobs/${job.id}/renew`) && response.ok()) renewed++
+    })
+    await peers[0].page.route(`**/api/jobs/${job.id}/renew`, async route => {
+      if (++renewAttempts === 1) await route.fulfill({ status: 503, body: 'Temporary renewal outage' })
+      else await route.continue()
+    })
+    await peers[0].page.route(`**/api/jobs/${job.id}/commit`, async route => {
+      // The original lease lasts 45 seconds. Deliver the commit after that
+      // deadline to prove successful renewals keep the same attempt valid.
+      await new Promise(resolve => setTimeout(resolve, 52_000))
+      await route.continue()
+    })
+    await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
+    const jobs = await waitFor(() => api<Array<{ id: string; completed_batches: number }>>(identity, `/api/clusters/${clusterId}/jobs`),
+      jobs => jobs.some(item => item.id === job.id && item.completed_batches === 1), 'a checkpoint committed beyond its original lease deadline', 90_000)
+    expect(jobs.find(item => item.id === job.id)!.completed_batches).toBe(1)
+    expect(renewAttempts).toBeGreaterThanOrEqual(4)
+    expect(renewed).toBeGreaterThanOrEqual(3)
+    await expect(peers[0].page.locator('.feedback.error')).toHaveCount(0)
+  } finally {
+    await Promise.all(contexts.map(context => context.close()))
+    if (clusterId) await api(identity, `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
   }
 })
 
