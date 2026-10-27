@@ -79,6 +79,12 @@ async function openPeer(browser: Browser, identity: string, nodeId: string, toke
   }, { meshIdentity: identity, nodeId, token })
   const page = await context.newPage()
   page.on('pageerror', error => console.error(`Peer page error: ${error.message}`))
+  page.on('websocket', socket => socket.on('framereceived', event => {
+    try {
+      const message = JSON.parse(typeof event.payload === 'string' ? event.payload : event.payload.toString())
+      if (message.type === 'node_reply' && message.ok === false) console.error(`Node operation rejected: ${String(message.error).slice(0, 300)}`)
+    } catch { /* Ignore non-JSON frames in diagnostic logging. */ }
+  }))
   page.on('response', response => {
     if (response.status() >= 400 && response.url().includes('/api/jobs/')) {
       void response.text().then(text => console.error(`Job request ${response.status()}: ${text.slice(0, 300)}`)).catch(() => undefined)
