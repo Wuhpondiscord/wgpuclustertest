@@ -25,7 +25,7 @@ export default defineConfig({
       url: 'http://127.0.0.1:7860/health',
       timeout: 180_000,
       reuseExistingServer: !process.env.CI,
-      env: { PORT: '7860', MESH_DATA_FILE: join(tmpdir(), `mesh-e2e-${process.pid}.json`) },
+      env: { PORT: '7860', MESH_DATA_FILE: join(tmpdir(), `mesh-e2e-${process.pid}.json`), MESH_REPAIR_GRACE_SECS: '1' },
     },
     {
       command: 'npm run dev -- --host 127.0.0.1 --port 5173 --strictPort',
