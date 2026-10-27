@@ -309,8 +309,10 @@ test('an online worker cannot fabricate another holders storage confirmation', a
   }
 })
 
-test('repairs a lost shard onto a spare holder and survives a second holder loss', async ({ browser }) => {
-  const identities = [ownerIdentity(), ownerIdentity(), ownerIdentity(), ownerIdentity()]
+for (const workload of ['vector-add', 'cpu-hash'] as const) {
+test(`repairs ${workload} checkpoints onto a spare and survives a second original holder loss`, async ({ browser }) => {
+  const desiredHolders = workload === 'vector-add' ? 3 : 2
+  const identities = Array.from({ length: desiredHolders + 1 }, ownerIdentity)
   let clusterId = ''
   const contexts: BrowserContext[] = []
   type Checkpoint = { sha256: string; manifest_revision: number; available_shards: number; verified_holders: number; durability: string;
@@ -324,12 +326,13 @@ test('repairs a lost shard onto a spare holder and survives a second holder loss
     const peers = await Promise.all(created.map((node, index) => openPeer(browser, identities[index], node.node.id, node.token)))
     contexts.push(...peers.map(peer => peer.context))
     await waitFor(() => api<Array<{ online: boolean }>>(identities[0], `/api/clusters/${clusterId}/nodes`),
-      nodes => nodes.length === 4 && nodes.every(node => node.online), 'four live worker nodes')
-    const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', { workload: 'vector-add', total_units: 100_000, batch_units: 100_000 })
+      nodes => nodes.length === identities.length && nodes.every(node => node.online), 'the live worker and spare nodes')
+    const units = workload === 'vector-add' ? 100_000 : 1000
+    const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', { workload, total_units: units, batch_units: units })
     await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
     const read = () => api<Array<{ id: string; checkpoints: Checkpoint[] }>>(identities[0], `/api/clusters/${clusterId}/jobs`)
-    const initial = (await waitFor(read, jobs => jobs.some(item => item.id === job.id && item.checkpoints[0]?.verified_holders === 3),
-      'a checkpoint independently acknowledged by three holders', 90_000)).find(item => item.id === job.id)!.checkpoints[0]
+    const initial = (await waitFor(read, jobs => jobs.some(item => item.id === job.id && item.checkpoints[0]?.verified_holders === desiredHolders),
+      'a checkpoint independently acknowledged by every assigned holder', 90_000)).find(item => item.id === job.id)!.checkpoints[0]
     const failed = initial.shards.find(shard => shard.node_id !== created[0].node.id)!
     const spare = created.find(node => !initial.shards.some(shard => shard.node_id === node.node.id))!
     await api(identities[0], `/api/nodes/${failed.node_id}/pause`, 'POST')
@@ -337,18 +340,22 @@ test('repairs a lost shard onto a spare holder and survives a second holder loss
       'the missing shard to be repaired onto the spare holder', 90_000)).find(item => item.id === job.id)!.checkpoints[0]
     expect(repaired.sha256).toBe(initial.sha256)
     expect(repaired.durability).toBe('healthy')
-    expect(repaired.available_shards).toBe(3)
-    expect(repaired.verified_holders).toBe(3)
+    expect(repaired.available_shards).toBe(desiredHolders)
+    expect(repaired.verified_holders).toBe(desiredHolders)
     expect(repaired.shards.some(shard => shard.node_id === failed.node_id)).toBe(false)
     expect(repaired.shards.find(shard => shard.shard_index === failed.shard_index)!.node_id).toBe(spare.node.id)
-    const second = initial.shards.find(shard => shard.node_id !== failed.node_id && shard.node_id !== created[0].node.id)!
+    const second = initial.shards.find(shard => desiredHolders === 3
+      ? shard.node_id !== failed.node_id && shard.node_id !== created[0].node.id
+      : shard.node_id === created[0].node.id)!
     await api(identities[0], `/api/nodes/${second.node_id}/pause`, 'POST')
-    await peers[0].page.getByRole('button', { name: 'Refresh', exact: true }).click()
-    await peers[0].page.getByRole('button', { name: 'Test restore' }).click()
-    await expect(peers[0].page.getByText(/Recovered batch 1 from 2 verified shard\(s\); full artifact SHA-256 matches\./)).toBeVisible({ timeout: 45_000 })
+    const restorePage = desiredHolders === 3 ? peers[0].page : peers[created.findIndex(node => node.node.id === spare.node.id)].page
+    await restorePage.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await restorePage.getByRole('button', { name: 'Test restore' }).click()
+    await expect(restorePage.getByText(`Recovered batch 1 from ${desiredHolders - 1} verified shard(s); full artifact SHA-256 matches.`, { exact: true })).toBeVisible({ timeout: 45_000 })
   } finally {
     await Promise.all(contexts.map(context => context.close()))
     if (clusterId) await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
   }
 })
+}
 
