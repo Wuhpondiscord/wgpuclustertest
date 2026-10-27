@@ -70,6 +70,8 @@ export class PeerMeshNode {
   private incoming = new Map<string, IncomingTransfer>()
   private pending = new Map<string, PendingTransfer>()
   private pendingArtifactReads = new Map<string, PendingArtifactRead>()
+  private signalQueues = new Map<string, Promise<void>>()
+  private earlyCandidates = new WeakMap<RTCPeerConnection, RTCIceCandidateInit[]>()
   private closed = false
 
   constructor(
@@ -88,18 +90,16 @@ export class PeerMeshNode {
   }
 
   peerJoined(peerId: string) {
-    if (this.peers.has(peerId)) {
-      this.peers.get(peerId)?.close()
-      this.peers.delete(peerId)
-      this.channels.delete(peerId)
-    }
+    if (this.peers.has(peerId)) this.peerLeft(peerId)
     this.considerPeer(peerId)
   }
 
   peerLeft(peerId: string) {
-    this.peers.get(peerId)?.close()
+    const oldPeer = this.peers.get(peerId)
     this.peers.delete(peerId)
     this.channels.delete(peerId)
+    this.signalQueues.delete(peerId)
+    oldPeer?.close()
     for (const [transferId, transfer] of this.incoming) if (transfer.peerId === peerId) this.incoming.delete(transferId)
     for (const [transferId, pending] of this.pending) if (pending.peerId === peerId) {
       window.clearTimeout(pending.timer)
@@ -126,18 +126,39 @@ export class PeerMeshNode {
   async handleSignal(peerId: string, payload: SignalPayload) {
     if (this.closed || peerId === this.nodeId) return
     const peer = this.peers.get(peerId) ?? this.createPeer(peerId, false)
-    try {
+    const previous = this.signalQueues.get(peerId) ?? Promise.resolve()
+    const next = previous.then(async () => {
+      if (this.closed || this.peers.get(peerId) !== peer) return
       if (payload.description?.type === 'offer') {
         await peer.setRemoteDescription(payload.description)
+        await this.flushCandidates(peer)
         const answer = await peer.createAnswer()
         await peer.setLocalDescription(answer)
         this.signal(peerId, { description: peer.localDescription ?? answer })
       } else if (payload.description?.type === 'answer') {
         await peer.setRemoteDescription(payload.description)
+        await this.flushCandidates(peer)
       } else if (payload.candidate) {
-        await peer.addIceCandidate(payload.candidate)
+        if (peer.remoteDescription) await peer.addIceCandidate(payload.candidate)
+        else {
+          const candidates = this.earlyCandidates.get(peer) ?? []
+          if (candidates.length >= 128) throw new Error('Too many early ICE candidates')
+          candidates.push(payload.candidate)
+          this.earlyCandidates.set(peer, candidates)
+        }
       }
-    } catch { this.onNotice('Peer negotiation failed; the node will retry when it reconnects') }
+    }).catch(() => {
+      if (!this.closed && this.peers.get(peerId) === peer) this.onNotice('Peer negotiation failed; the node will retry when it reconnects')
+    })
+    this.signalQueues.set(peerId, next)
+    await next
+    if (this.signalQueues.get(peerId) === next) this.signalQueues.delete(peerId)
+  }
+
+  private async flushCandidates(peer: RTCPeerConnection) {
+    const candidates = this.earlyCandidates.get(peer) ?? []
+    this.earlyCandidates.delete(peer)
+    for (const candidate of candidates) await peer.addIceCandidate(candidate)
   }
 
   private createPeer(peerId: string, initiator: boolean) {
@@ -258,6 +279,9 @@ export class PeerMeshNode {
       const timer = window.setTimeout(() => { this.pending.delete(transferId); reject(new Error('Peer did not confirm the artifact before timeout')) }, 30_000)
       this.pending.set(transferId, { peerId, resolve, reject, timer })
     })
+    // Disconnect can reject the acknowledgement while chunk sends are awaiting
+    // backpressure. Observe it immediately, then propagate it at the await below.
+    void acknowledged.catch(() => undefined)
     try {
       await this.sendFrame(channel, { type: 'artifact_start', transfer_id: transferId, name, total_bytes: bytes.length, chunks, sha256 } satisfies TransferStart)
       for (let index = 0; index < chunks; index++) {
@@ -329,6 +353,7 @@ export class PeerMeshNode {
     this.closed = true
     for (const peer of this.peers.values()) peer.close()
     this.peers.clear(); this.channels.clear(); this.incoming.clear()
+    this.signalQueues.clear()
     for (const pending of this.pending.values()) { window.clearTimeout(pending.timer); pending.reject(new Error('Node connection closed')) }
     this.pending.clear()
     for (const pending of this.pendingArtifactReads.values()) {
