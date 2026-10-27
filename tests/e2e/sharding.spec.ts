@@ -154,7 +154,7 @@ test('keeps a large checkpoint recoverable when a peer disconnects mid-transfer'
     expect(new Set(checkpoint.shards.map(shard => shard.node_id)).size).toBe(2)
     expect(checkpoint.shards.map(shard => shard.bytes)).toEqual([checkpoint.bytes, checkpoint.bytes])
     expect(checkpoint.shards.every(shard => shard.sha256 === checkpoint.sha256)).toBe(true)
-    await expect(peers[0].page.locator('.feedback.success')).toContainText('using two replicas')
+    await expect(peers[0].page.locator('.feedback.success')).toContainText('All job batches completed and replicated')
   } finally {
     await Promise.all(contexts.map(context => context.close()))
     if (clusterId) await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
