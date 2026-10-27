@@ -7,7 +7,7 @@ const MAX_CONCURRENT_TRANSFERS = 2
 type SignalPayload = { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
 type TransferStart = { type: 'artifact_start'; transfer_id: string; name: string; total_bytes: number; chunks: number; sha256: string }
 type TransferChunk = { type: 'artifact_chunk'; transfer_id: string; index: number; data: string }
-type IncomingTransfer = { peerId: string; start: TransferStart; chunks: Map<number, Uint8Array>; bytes: number }
+type IncomingTransfer = { peerId: string; start: TransferStart; chunks: Map<number, Uint8Array>; bytes: number; lastActivity: number }
 type PendingTransfer = { peerId: string; resolve: (digest: string) => void; reject: (error: Error) => void; timer: number }
 type PendingArtifactRead = { peerId: string; name: string; resolve: (bytes: Uint8Array) => void; reject: (error: Error) => void; timer: number }
 
@@ -40,10 +40,17 @@ async function persistArtifact(key: string, value: { name: string; bytes: Uint8A
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction('artifacts', 'readwrite')
-      transaction.objectStore('artifacts').put(value, key)
+      const artifacts = transaction.objectStore('artifacts')
+      const existing = artifacts.get(key)
+      let conflict = false
+      existing.onsuccess = () => {
+        const previous = existing.result as { sha256?: string } | undefined
+        if (previous && previous.sha256 !== value.sha256) { conflict = true; transaction.abort(); return }
+        artifacts.put(value, key)
+      }
       transaction.oncomplete = () => resolve()
       transaction.onerror = () => reject(transaction.error ?? new Error('Could not persist received artifact'))
-      transaction.onabort = () => reject(transaction.error ?? new Error('Artifact persistence was aborted'))
+      transaction.onabort = () => reject(new Error(conflict ? 'Artifact names are immutable; use a new name for changed bytes' : 'Artifact persistence was aborted'))
     })
   } finally { db.close() }
 }
@@ -78,6 +85,7 @@ export class PeerMeshNode {
     private readonly nodeId: string,
     private readonly signal: (peerNodeId: string, payload: SignalPayload) => void,
     private readonly onNotice: (message: string) => void,
+    private readonly onStored?: (name: string, sha256: string, bytes: number) => Promise<void>,
   ) {}
 
   addPeers(peerNodeIds: string[]) {
@@ -187,6 +195,10 @@ export class PeerMeshNode {
 
   private async handleDataMessage(peerId: string, channel: RTCDataChannel, data: unknown) {
     if (typeof data !== 'string' || data.length > MAX_FRAME_CHARS) return
+    // Failed senders can leave an incomplete frame sequence on a live channel.
+    // Reclaim idle slots before accepting fresh traffic, keeping retries usable.
+    const at = performance.now()
+    for (const [id, transfer] of this.incoming) if (at - transfer.lastActivity > 45_000) this.incoming.delete(id)
     let message: Record<string, unknown>
     try { message = JSON.parse(data) as Record<string, unknown> } catch { return }
     if (message.type === 'artifact_ack' && typeof message.transfer_id === 'string' && typeof message.sha256 === 'string') {
@@ -213,8 +225,11 @@ export class PeerMeshNode {
       if (typeof start.transfer_id !== 'string' || start.transfer_id.length > 64 || !start.transfer_id || typeof start.name !== 'string' || !start.name || start.name.length > 128 || !Number.isSafeInteger(start.total_bytes) || start.total_bytes <= 0 || start.total_bytes > MAX_ARTIFACT_BYTES
         || !Number.isSafeInteger(start.chunks) || start.chunks < 0 || start.chunks > Math.ceil(MAX_ARTIFACT_BYTES / CHUNK_BYTES)
         || !/^[a-f0-9]{64}$/i.test(start.sha256) || start.chunks !== Math.ceil(start.total_bytes / CHUNK_BYTES)) return
-      if (this.incoming.size >= MAX_CONCURRENT_TRANSFERS && !this.incoming.has(start.transfer_id)) return
-      this.incoming.set(start.transfer_id, { peerId, start, chunks: new Map(), bytes: 0 })
+      if (this.incoming.size >= MAX_CONCURRENT_TRANSFERS && !this.incoming.has(start.transfer_id)) {
+        channel.send(JSON.stringify({ type: 'artifact_nack', transfer_id: start.transfer_id, reason: 'receiver_busy' }))
+        return
+      }
+      this.incoming.set(start.transfer_id, { peerId, start, chunks: new Map(), bytes: 0, lastActivity: at })
       return
     }
     if (message.type === 'artifact_chunk' && typeof message.transfer_id === 'string' && typeof message.data === 'string') {
@@ -227,6 +242,7 @@ export class PeerMeshNode {
       if (bytes.length > CHUNK_BYTES || transfer.bytes + bytes.length > transfer.start.total_bytes) { this.incoming.delete(message.transfer_id); return }
       transfer.chunks.set(index, bytes)
       transfer.bytes += bytes.length
+      transfer.lastActivity = at
       if (transfer.chunks.size !== transfer.start.chunks) return
       const result = new Uint8Array(transfer.bytes)
       let offset = 0
@@ -243,6 +259,7 @@ export class PeerMeshNode {
       }
       try {
         await persistArtifact(`artifact:${transfer.start.name}`, { name: transfer.start.name, bytes: result, sha256: actualHash, receivedAt: Date.now() })
+        await this.onStored?.(transfer.start.name, actualHash, result.length)
         channel.send(JSON.stringify({ type: 'artifact_ack', transfer_id: message.transfer_id, sha256: actualHash }))
         this.onNotice(`Verified peer artifact “${transfer.start.name}” (${result.length.toLocaleString()} bytes)`)
         const readKey = `${peerId}:${transfer.start.name}`
@@ -253,11 +270,12 @@ export class PeerMeshNode {
     }
     if (message.type === 'artifact_nack' && typeof message.transfer_id === 'string') {
       const pending = this.pending.get(message.transfer_id)
-      if (pending?.peerId === peerId) { window.clearTimeout(pending.timer); this.pending.delete(message.transfer_id); pending.reject(new Error('Peer rejected the artifact: integrity check or storage failed')) }
+      if (pending?.peerId === peerId) { window.clearTimeout(pending.timer); this.pending.delete(message.transfer_id); pending.reject(new Error(message.reason === 'receiver_busy' ? 'Peer storage is busy; retry the artifact transfer' : 'Peer rejected the artifact: integrity check or storage failed')) }
     }
   }
 
   async sendArtifact(peerId: string, name: string, bytes: Uint8Array, persistLocally = true) {
+    if (this.closed) throw new Error('Node connection closed')
     if (!name || name.length > 128) throw new Error('Peer artifact names must contain 1–128 characters')
     if (!bytes.length) throw new Error('Peer artifacts must contain at least one byte')
     if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Peer artifact exceeds the 8 MiB transfer limit')
@@ -268,6 +286,7 @@ export class PeerMeshNode {
     const deadline = Date.now() + 20_000
     let channel = this.channels.get(peerId)
     while ((!channel || channel.readyState !== 'open') && Date.now() < deadline) {
+      if (this.closed) throw new Error('Node connection closed')
       await new Promise(resolve => window.setTimeout(resolve, 100))
       channel = this.channels.get(peerId)
     }
@@ -295,7 +314,10 @@ export class PeerMeshNode {
     }
     const receivedHash = await acknowledged
     if (receivedHash !== sha256) throw new Error('Peer acknowledged a different artifact digest')
-    if (persistLocally) await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+    if (persistLocally) {
+      await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+      await this.onStored?.(name, sha256, bytes.length)
+    }
     return { transferId, sha256, bytes: bytes.length }
   }
 
@@ -303,6 +325,7 @@ export class PeerMeshNode {
     if (!name || name.length > 128 || !bytes.length || bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Local shard is outside artifact limits')
     const sha256 = await digest(bytes)
     await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
+    await this.onStored?.(name, sha256, bytes.length)
     return { sha256, bytes: bytes.length }
   }
 

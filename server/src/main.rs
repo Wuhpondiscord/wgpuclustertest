@@ -19,6 +19,8 @@ use uuid::Uuid;
 mod checkpoint;
 mod erasure;
 mod recovery;
+mod custody;
+mod repair;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -99,9 +101,13 @@ struct BatchOutput {
     committed_at: u64,
     #[serde(default)]
     shards: Vec<ShardReceipt>,
+    #[serde(default)]
+    holder_proofs: Vec<custody::HolderProof>,
+    #[serde(default)]
+    manifest_revision: u64,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct ShardReceipt {
     shard_index: u8,
     node_id: Uuid,
@@ -121,13 +127,19 @@ struct AppState {
     github: Option<Arc<GitHubStorage>>,
     github_file_sha: Arc<Mutex<Option<String>>>,
     node_connections: Arc<Mutex<HashMap<Uuid, NodeConnection>>>,
+    durability: Arc<Mutex<DurabilityRuntime>>,
 }
+
+#[derive(Default)]
+struct DurabilityRuntime { custody: custody::Registry, repairs: repair::RepairQueue }
 
 #[derive(Clone)]
 struct NodeConnection {
     session_id: Uuid,
     cluster_id: Uuid,
     sender: tokio::sync::mpsc::Sender<Message>,
+    receipt_nonce: String,
+    receipt_key: Option<String>,
 }
 
 #[derive(Deserialize)] struct CreateCluster { name: String }
@@ -148,11 +160,14 @@ struct NodeConnection {
 #[derive(Serialize)]
 struct ClusterSummary { id: Uuid, name: String, role: Role, members: usize, nodes: usize, online_nodes: usize }
 #[derive(Serialize)]
-struct NodeSummary { id: Uuid, cluster_id: Uuid, name: String, paused: bool, online: bool, last_seen: Option<u64> }
+struct NodeSummary { id: Uuid, cluster_id: Uuid, name: String, paused: bool, online: bool, last_seen: Option<u64>, holder_ready: bool }
 #[derive(Serialize)]
 struct NodeCreated { node: NodeSummary, token: String }
 #[derive(Serialize)]
-struct CheckpointSummary { batch_index: u64, sha256: String, bytes: u64, shards: Vec<ShardReceipt> }
+struct CheckpointSummary {
+    batch_index: u64, sha256: String, bytes: u64, shards: Vec<ShardReceipt>,
+    available_shards: usize, verified_holders: usize, durability: String, manifest_revision: u64,
+}
 #[derive(Serialize)]
 struct JobSummary { id: Uuid, cluster_id: Uuid, created_at: u64, workload: ComputeWorkload, total_units: u64, batch_units: u64, total_batches: u64, completed_batches: usize, checkpoints: Vec<CheckpointSummary> }
 #[derive(Serialize)]
@@ -214,11 +229,17 @@ fn require_owner<'a>(store: &'a Store, cluster_id: Uuid, user: &str) -> ApiResul
     Ok(cluster)
 }
 fn node_summary(node: &Node) -> NodeSummary {
-    NodeSummary { id: node.id, cluster_id: node.cluster_id, name: node.name.clone(), paused: node.paused, online: node.online, last_seen: node.last_seen }
+    NodeSummary { id: node.id, cluster_id: node.cluster_id, name: node.name.clone(), paused: node.paused, online: node.online, last_seen: node.last_seen, holder_ready: false }
 }
-fn job_summary(job: &ComputeJob) -> JobSummary {
-    let mut checkpoints = job.outputs.iter().map(|(batch_index, output)| CheckpointSummary {
-        batch_index: *batch_index, sha256: output.sha256.clone(), bytes: output.bytes, shards: output.shards.clone(),
+fn job_summary(job: &ComputeJob, store: &Store) -> JobSummary {
+    let mut checkpoints = job.outputs.iter().map(|(batch_index, output)| {
+        let available_shards = output.shards.iter().filter(|shard| store.nodes.get(&shard.node_id).is_some_and(|node| node.online && !node.paused)).count();
+        let threshold = if output.shards.len() == 3 { 2 } else { 1 };
+        CheckpointSummary {
+            batch_index: *batch_index, sha256: output.sha256.clone(), bytes: output.bytes, shards: output.shards.clone(),
+            available_shards, verified_holders: output.holder_proofs.len(), manifest_revision: output.manifest_revision,
+            durability: if available_shards == output.shards.len() { "healthy" } else if available_shards >= threshold { "degraded" } else { "unavailable" }.into(),
+        }
     }).collect::<Vec<_>>();
     checkpoints.sort_by_key(|checkpoint| checkpoint.batch_index);
     JobSummary { id: job.id, cluster_id: job.cluster_id, created_at: job.created_at, workload: job.workload, total_units: job.total_units,
@@ -423,7 +444,7 @@ async fn list_jobs(State(state): State<AppState>, Path(cluster_id): Path<Uuid>, 
     let user = identity(&headers)?;
     let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
     require_member(&store, cluster_id, &user)?;
-    Ok(Json(store.jobs.values().filter(|job| job.cluster_id == cluster_id).map(job_summary).collect()))
+    Ok(Json(store.jobs.values().filter(|job| job.cluster_id == cluster_id).map(|job| job_summary(job, &store)).collect()))
 }
 async fn create_job(State(state): State<AppState>, Path(cluster_id): Path<Uuid>, headers: HeaderMap, Json(input): Json<CreateJob>) -> ApiResult<(StatusCode, Json<JobSummary>)> {
     let user = identity(&headers)?;
@@ -443,7 +464,7 @@ async fn create_job(State(state): State<AppState>, Path(cluster_id): Path<Uuid>,
                 .map_err(|_| ApiError(StatusCode::CONFLICT, "Could not register a job batch".into()))?;
         }
         let job = ComputeJob { id: job_id, cluster_id, created_at: now(), workload, total_units, batch_units, outputs: HashMap::new() };
-        let summary = job_summary(&job);
+        let summary = job_summary(&job, store);
         store.jobs.insert(job_id, job);
         Ok(summary)
     }).await?;
@@ -505,6 +526,7 @@ async fn commit_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid
     if input.bytes == 0 || input.bytes > MAX_PEER_ARTIFACT_BYTES || input.sha256.len() != 64 || !input.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "Checkpoint artifact metadata is invalid".into()));
     }
+    let durability = state.durability.clone();
     let result = mutate_store(&state, move |store| {
         let job = store.jobs.get(&job_id).cloned().ok_or(ApiError(StatusCode::NOT_FOUND, "Job not found".into()))?;
         require_member(store, job.cluster_id, &user)?;
@@ -556,6 +578,9 @@ async fn commit_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid
                 "2+1 sharding requires three distinct active cluster nodes".into()
             } else { "Two active cluster nodes must acknowledge the replicated checkpoint".into() }));
         }
+        let proofs = durability.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Holder registry unavailable".into()))?
+            .custody.verify_manifest(&input.lease.task_id, input.bytes, &receipts, now())
+            .map_err(|message| ApiError(StatusCode::CONFLICT, message))?;
         store.recovery.commit_result(&input.lease, now().saturating_mul(1_000), input.sha256.clone())
             .map_err(|error| match error {
                 recovery::LeaseError::LeaseExpired => ApiError(StatusCode::CONFLICT, "The worker lease expired; claim the batch again".into()),
@@ -565,6 +590,7 @@ async fn commit_job_batch(State(state): State<AppState>, Path(job_id): Path<Uuid
         store.jobs.get_mut(&job_id).expect("job was checked").outputs.insert(batch_index, BatchOutput {
             sha256: input.sha256.clone(), bytes: input.bytes, worker_node_id: worker_id,
             replica_node_id: receipts[1].node_id, committed_at: now(), shards: receipts,
+            holder_proofs: proofs, manifest_revision: 0,
         });
         Ok(())
     }).await?;
@@ -672,9 +698,11 @@ async fn remove_member(State(state): State<AppState>, Path((id, member_id)): Pat
 }
 async fn list_nodes(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap) -> ApiResult<Json<Vec<NodeSummary>>> {
     let user = identity(&headers)?;
+    let ready: std::collections::HashSet<_> = state.node_connections.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Connection registry unavailable".into()))?
+        .iter().filter(|(_, connection)| connection.receipt_key.is_some()).map(|(id, _)| *id).collect();
     let store = state.store.lock().map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Store unavailable".into()))?;
     require_member(&store, id, &user)?;
-    Ok(Json(store.nodes.values().filter(|n| n.cluster_id == id).map(node_summary).collect()))
+    Ok(Json(store.nodes.values().filter(|n| n.cluster_id == id).map(|node| { let mut summary = node_summary(node); summary.holder_ready = ready.contains(&node.id); summary }).collect()))
 }
 async fn create_node(State(state): State<AppState>, Path(id): Path<Uuid>, headers: HeaderMap, Json(input): Json<CreateNode>) -> ApiResult<(StatusCode, Json<NodeCreated>)> {
     let user = identity(&headers)?;
@@ -755,8 +783,10 @@ fn register_node_connection(state: &AppState, id: Uuid, session_id: Uuid, sender
     let cluster_id = if let Ok(store) = state.store.lock() {
         if let Some(node) = store.nodes.get(&id) { node.cluster_id } else { return false; }
     } else { return false; };
+    let receipt_nonce = Uuid::new_v4().to_string();
     let inserted = if let Ok(mut connections) = state.node_connections.lock() {
-        connections.insert(id, NodeConnection { session_id, cluster_id, sender });
+        if let Ok(mut runtime) = state.durability.lock() { runtime.custody.begin_session(id, receipt_nonce.clone()); } else { return false; }
+        connections.insert(id, NodeConnection { session_id, cluster_id, sender, receipt_nonce, receipt_key: None });
         true
     } else { false };
     if !inserted { return false; }
@@ -805,9 +835,10 @@ fn announce_peer_presence(state: &AppState, id: Uuid, joined: bool) {
 
 fn disconnect_node(state: &AppState, id: Uuid, session_id: Uuid) {
     let removed_cluster = if let Ok(mut connections) = state.node_connections.lock() {
-        if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id).map(|connection| connection.cluster_id) } else { None }
+        if connections.get(&id).is_some_and(|connection| connection.session_id == session_id) { connections.remove(&id).map(|connection| (connection.cluster_id, connection.receipt_nonce)) } else { None }
     } else { None };
-    if let Some(cluster_id) = removed_cluster {
+    if let Some((cluster_id, receipt_nonce)) = removed_cluster {
+        if let Ok(mut runtime) = state.durability.lock() { runtime.custody.end_session(id, &receipt_nonce); }
         if let Ok(mut store) = state.store.lock() {
             if let Some(node) = store.nodes.get_mut(&id) { node.online = false; node.last_seen = Some(now()); }
             store.recovery.shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), WORKER_RECONNECT_GRACE_MS);
@@ -843,9 +874,91 @@ async fn route_peer_signal(state: &AppState, from_id: Uuid, session_id: Uuid, te
     let _ = sender.try_send(Message::Text(forwarded));
 }
 
+fn node_reply(state: &AppState, node: Uuid, session: Uuid, request_id: &str, result: Result<(), String>) {
+    if let Ok(connections) = state.node_connections.lock() {
+        if let Some(connection) = connections.get(&node).filter(|connection| connection.session_id == session) {
+            let message = match result {
+                Ok(()) => serde_json::json!({"type":"node_reply","request_id":request_id,"ok":true}),
+                Err(error) => serde_json::json!({"type":"node_reply","request_id":request_id,"ok":false,"error":error}),
+            };
+            let _ = connection.sender.try_send(Message::Text(message.to_string()));
+        }
+    }
+}
+
+fn route_durability_message(state: &AppState, node: Uuid, session: Uuid, text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return false; };
+    let kind = value.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+    if !matches!(kind, "custody_key" | "custody_receipt" | "repair_complete" | "repair_failed") { return false; }
+    if !is_current_node_connection(state, node, session) { return true; }
+    let request_id = value.get("request_id").and_then(serde_json::Value::as_str).filter(|id| id.len() <= 64).unwrap_or("");
+    let active = state.store.lock().ok().is_some_and(|store| store.nodes.get(&node).is_some_and(|node| node.online && (kind == "custody_key" || !node.paused)));
+    if !active { node_reply(state, node, session, request_id, Err("The holder node must be active".into())); return true; }
+    match kind {
+        "custody_key" => {
+            let key = value.get("public_key").and_then(serde_json::Value::as_str).unwrap_or("");
+            let nonce = value.get("nonce").and_then(serde_json::Value::as_str).unwrap_or("");
+            let result = (|| {
+                custody::public_key(key)?;
+                let mut connections = state.node_connections.lock().map_err(|_| "Connection registry unavailable")?;
+                let connection = connections.get_mut(&node).filter(|connection| connection.session_id == session && connection.receipt_nonce == nonce)
+                    .ok_or("Holder session changed")?;
+                if connection.receipt_key.as_ref().is_some_and(|existing| existing != key) { return Err("A signing key is already bound to this session".into()); }
+                state.durability.lock().map_err(|_| "Holder registry unavailable")?.custody.register_key(node, nonce, key)?;
+                connection.receipt_key = Some(key.to_owned());
+                Ok(())
+            })();
+            let registered = result.is_ok();
+            node_reply(state, node, session, request_id, result);
+            if registered {
+                if let Ok(connections) = state.node_connections.lock() {
+                    if let Some(holder) = connections.get(&node) {
+                        let message = serde_json::json!({"type":"holder_ready","node_id":node}).to_string();
+                        for connection in connections.values().filter(|connection| connection.cluster_id == holder.cluster_id) { let _ = connection.sender.try_send(Message::Text(message.clone())); }
+                    }
+                }
+            }
+        }
+        "custody_receipt" => {
+            let result = (|| {
+                let proof: custody::HolderProof = serde_json::from_value(value.get("receipt").cloned().ok_or("Holder receipt is missing")?).map_err(|_| "Invalid holder receipt")?;
+                let connection = state.node_connections.lock().map_err(|_| "Connection registry unavailable")?.get(&node)
+                    .filter(|connection| connection.session_id == session).cloned().ok_or("Holder session changed")?;
+                let key = connection.receipt_key.as_deref().ok_or("Register a holder signing key first")?;
+                state.durability.lock().map_err(|_| "Holder registry unavailable")?.custody.accept(proof, node, &connection.receipt_nonce, key, now())
+            })();
+            node_reply(state, node, session, request_id, result);
+        }
+        "repair_complete" => {
+            if let Some(id) = value.get("repair_id").and_then(serde_json::Value::as_str).and_then(|id| Uuid::parse_str(id).ok()) {
+                let state = state.clone(); let request_id = request_id.to_owned();
+                // Durable manifest writes must not stall the node's signaling,
+                // receipt acknowledgements, and heartbeat receive loop.
+                tokio::spawn(async move {
+                    let result = repair::complete(&state, id, node, session).await.map_err(|error| error.1);
+                    if result.is_err() { if let Ok(mut runtime) = state.durability.lock() { runtime.repairs.fail(id, node, session, now()); } }
+                    node_reply(&state, node, session, &request_id, result);
+                });
+            } else { node_reply(state, node, session, request_id, Err("Invalid repair ID".into())); }
+        }
+        "repair_failed" => {
+            if let Some(id) = value.get("repair_id").and_then(serde_json::Value::as_str).and_then(|id| Uuid::parse_str(id).ok()) {
+                if let Ok(mut runtime) = state.durability.lock() { runtime.repairs.fail(id, node, session, now()); }
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
 async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_id: Uuid) {
     let (outbound, mut queued) = tokio::sync::mpsc::channel::<Message>(128);
     if !register_node_connection(&state, id, session_id, outbound.clone()) { return; }
+    if let Ok(connections) = state.node_connections.lock() {
+        if let Some(connection) = connections.get(&id) {
+            let _ = outbound.try_send(Message::Text(serde_json::json!({"type":"custody_welcome","nonce":connection.receipt_nonce}).to_string()));
+        }
+    }
     announce_peer_presence(&state, id, true);
     let (mut sink, mut stream) = socket.split();
     let mut tick = interval(Duration::from_secs(NODE_PING_INTERVAL_SECS));
@@ -861,7 +974,7 @@ async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_i
                 }
                 Some(Ok(Message::Text(text))) => {
                     if !update_node_heartbeat(&state, id, session_id) { break; }
-                    route_peer_signal(&state, id, session_id, &text).await;
+                    if !route_durability_message(&state, id, session_id, &text) { route_peer_signal(&state, id, session_id, &text).await; }
                 }
                 Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {
                     if !update_node_heartbeat(&state, id, session_id) { break; }
@@ -912,7 +1025,7 @@ async fn main() {
     };
     store.recovery.start_session(coordinator_epoch(Uuid::new_v4()));
     for node in store.nodes.values_mut() { node.online = false; }
-    let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+    let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(data_file), github, github_file_sha: Arc::new(Mutex::new(github_sha)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/clusters", get(list_clusters).post(create_cluster))
@@ -937,6 +1050,11 @@ async fn main() {
         .with_state(state.clone())
         .fallback_service(ServeDir::new("dist").append_index_html_on_directories(true));
     let port = std::env::var("PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(7860);
+    let repair_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticks = interval(Duration::from_secs(5));
+        loop { ticks.tick().await; repair::dispatch(&repair_state); }
+    });
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind coordinator");
     println!("Mesh coordinator listening on http://{addr}");
@@ -1028,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn owner_invites_member_and_can_revoke_invite() {
         let file = std::env::temp_dir().join(format!("mesh-test-{}.json", Uuid::new_v4()));
-        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let owner = test_headers("owner-identity-token-01234567890123456789");
         let guest = test_headers("guest-identity-token-01234567890123456789");
 
@@ -1052,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_cluster_removes_its_nodes_and_invites() {
         let file = std::env::temp_dir().join(format!("mesh-delete-test-{}.json", Uuid::new_v4()));
-        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let owner = test_headers("delete-owner-identity-token-012345678901234567");
         let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "Removable".into() })).await.unwrap();
         let (_, Json(invite)) = create_invite(State(state.clone()), Path(cluster.id), owner.clone()).await.unwrap();
@@ -1077,7 +1195,7 @@ mod tests {
         members.insert(secret_hash(owner), Role::Owner);
         let mut store = Store::default();
         store.clusters.insert(cluster_id, Cluster { id: cluster_id, name: "Keep me".into(), owner_id: secret_hash(owner), members });
-        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(blocker.join("state.json")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(blocker.join("state.json")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
 
         assert!(delete_cluster(State(state.clone()), Path(cluster_id), test_headers(owner)).await.is_err());
         assert!(state.store.lock().unwrap().clusters.contains_key(&cluster_id));
@@ -1094,7 +1212,7 @@ mod tests {
             data_file: Arc::new(blocker.join("state.json")),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
-            node_connections: Arc::new(Mutex::new(HashMap::new())),
+            node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
         };
 
         let result = mutate_store(&state, |store| {
@@ -1122,7 +1240,7 @@ mod tests {
             data_file: Arc::new(file.clone()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
-            node_connections: Arc::new(Mutex::new(HashMap::new())),
+            node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
         };
         let first_id = Uuid::new_v4();
         let second_id = Uuid::new_v4();
@@ -1153,7 +1271,7 @@ mod tests {
         let mut store = Store::default();
         store.clusters.insert(cluster_id, Cluster { id: cluster_id, name: "test".into(), owner_id: "owner".into(), members });
         store.nodes.insert(node_id, Node { id: node_id, cluster_id, name: "node".into(), owner_id: "owner".into(), token_hash: "hash".into(), paused: false, online: false, last_seen: None });
-        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let old_session = Uuid::new_v4();
         let new_session = Uuid::new_v4();
 
@@ -1190,7 +1308,7 @@ mod tests {
         for (id, cluster_id) in [(sender_id, cluster_a), (same_cluster_id, cluster_a), (other_cluster_id, cluster_b)] {
             store.nodes.insert(id, Node { id, cluster_id, name: "node".into(), owner_id: "owner".into(), token_hash: "hash".into(), paused: false, online: false, last_seen: None });
         }
-        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let sender_session = Uuid::new_v4();
         let same_session = Uuid::new_v4();
         let other_session = Uuid::new_v4();
@@ -1227,7 +1345,7 @@ mod tests {
         for (id, paused) in [(current_id, false), (active_id, false), (paused_id, true)] {
             store.nodes.insert(id, Node { id, cluster_id, name: "node".into(), owner_id: "owner".into(), token_hash: "hash".into(), paused, online: false, last_seen: None });
         }
-        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(store)), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(PathBuf::from("unused")), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let (current_tx, mut current_rx) = tokio::sync::mpsc::channel(8);
         let (active_tx, mut active_rx) = tokio::sync::mpsc::channel(8);
         let (paused_tx, mut paused_rx) = tokio::sync::mpsc::channel(8);
@@ -1247,7 +1365,7 @@ mod tests {
     #[tokio::test]
     async fn job_batches_require_a_live_owned_worker_and_replicated_checkpoint_before_commit() {
         let file = std::env::temp_dir().join(format!("mesh-job-test-{}.json", Uuid::new_v4()));
-        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let owner_token = "job-owner-identity-token-012345678901234567890";
         let owner_headers = test_headers(owner_token);
         let stranger_headers = test_headers("job-stranger-identity-token-01234567890123456789");
@@ -1266,6 +1384,12 @@ mod tests {
         state.store.lock().unwrap().nodes.get_mut(&replica.node.id).unwrap().online = false;
         assert!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease.clone(), replica_node_id: Some(replica.node.id), shards: Vec::new(), sha256: digest.clone(), bytes: 128 })).await.is_err());
         state.store.lock().unwrap().nodes.get_mut(&replica.node.id).unwrap().online = true;
+        // A worker cannot fabricate custody by naming an online peer.
+        assert!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease.clone(), replica_node_id: Some(replica.node.id), shards: Vec::new(), sha256: digest.clone(), bytes: 128 })).await.is_err());
+        for (index, node_id) in [worker.node.id, replica.node.id].into_iter().enumerate() {
+            let shard = ShardReceipt { shard_index: index as u8, node_id, artifact_name: format!("legacy-{}-0-{index}", job.id), sha256: digest.clone(), bytes: 128 };
+            custody::tests::confirm(&mut state.durability.lock().unwrap().custody, &shard, now());
+        }
         let commit = CommitBatch { lease: claim.lease.clone(), replica_node_id: Some(replica.node.id), shards: Vec::new(), sha256: digest.clone(), bytes: 128 };
         assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(commit)).await.unwrap(), StatusCode::NO_CONTENT);
         assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner_headers.clone(), Json(CommitBatch { lease: claim.lease, replica_node_id: Some(replica.node.id), shards: Vec::new(), sha256: digest, bytes: 128 })).await.unwrap(), StatusCode::NO_CONTENT);
@@ -1280,7 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn large_checkpoints_require_three_nodes_for_shards_but_can_degrade_to_two_full_replicas() {
         let file = std::env::temp_dir().join(format!("mesh-shard-test-{}.json", Uuid::new_v4()));
-        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let owner = test_headers("shard-owner-identity-token-01234567890123456789");
         let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "Shards".into() })).await.unwrap();
         let (_, Json(worker)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
@@ -1302,6 +1426,7 @@ mod tests {
             ShardReceipt { shard_index: 0, node_id: worker.node.id, artifact_name: "cp-1-full-0".into(), sha256: digest.clone(), bytes: SHARDING_THRESHOLD_BYTES },
             ShardReceipt { shard_index: 1, node_id: peer_a.node.id, artifact_name: "cp-1-full-1".into(), sha256: digest.clone(), bytes: SHARDING_THRESHOLD_BYTES },
         ];
+        for shard in &replicas { custody::tests::confirm(&mut state.durability.lock().unwrap().custody, shard, now()); }
         let fallback = CommitBatch { lease: claim.lease.clone(), replica_node_id: None, shards: replicas, sha256: digest.clone(), bytes: SHARDING_THRESHOLD_BYTES };
         assert_eq!(commit_job_batch(State(state.clone()), Path(job.id), owner.clone(), Json(fallback)).await.unwrap(), StatusCode::NO_CONTENT);
         let Json(jobs) = list_jobs(State(state), Path(cluster.id), owner).await.unwrap();
@@ -1328,7 +1453,7 @@ mod tests {
     #[tokio::test]
     async fn claims_and_renewals_do_not_write_storage_and_renewal_bypasses_durable_lock() {
         let file = std::env::temp_dir().join(format!("mesh-runtime-lease-{}.json", Uuid::new_v4()));
-        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState { store: Arc::new(Mutex::new(Store::default())), mutation_lock: Arc::new(tokio::sync::Mutex::new(())), data_file: Arc::new(file.clone()), github: None, github_file_sha: Arc::new(Mutex::new(None)), node_connections: Arc::new(Mutex::new(HashMap::new())), durability: Arc::new(Mutex::new(DurabilityRuntime::default())) };
         let owner = test_headers("runtime-owner-identity-01234567890123456789012345");
         let (_, Json(cluster)) = create_cluster(State(state.clone()), owner.clone(), Json(CreateCluster { name: "Runtime".into() })).await.unwrap();
         let (_, Json(worker)) = create_node(State(state.clone()), Path(cluster.id), owner.clone(), Json(CreateNode { name: "Worker".into() })).await.unwrap();
