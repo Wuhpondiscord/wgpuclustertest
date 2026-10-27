@@ -212,3 +212,387 @@ button { -webkit-tap-highlight-color: transparent; }
 }
 .availability-note { margin-top: 9px; padding: 9px 11px; border: 1px solid #ddd6fe; border-radius: 8px; background: var(--mesh-wash); color: var(--mesh-purple-deep); font-size: 11px; line-height: 1.5; }
 .card-heading .availability-note { color: var(--mesh-muted); font-size: 11px; }
+
+/* Shared layout rules now live in the single Mesh theme stylesheet. */
+  .manage-top {
+    display: flex;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 3;
+  }
+  .manage-brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .brand-glyph {
+    display: grid;
+  }
+  .brand-period {
+    margin-left: -9px;
+  }
+  .control-badge {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+  }
+  .refresh-button,.dismiss-button,.dialog-close {
+    display: grid;
+    padding: 6px;
+  }
+  .manage-main {
+    margin: 0 auto;
+  }
+  .manage-heading {
+    display: flex;
+    justify-content: space-between;
+  }
+  .heading-buttons,.summary-actions {
+    display: flex;
+  }
+  .manage-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    white-space: nowrap;
+  }
+  .manage-button.full-width {
+    width: 100%;
+  }
+  .manage-layout {
+    display: grid;
+  }
+  .cluster-rail {
+    display: flex;
+    flex-direction: column;
+  }
+  .rail-title {
+    display: flex;
+    justify-content: space-between;
+  }
+  .rail-cluster {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+  }
+  .rail-icon,.summary-icon {
+    width: 29px;
+    height: 29px;
+    display: grid;
+    flex: none;
+  }
+  .rail-label {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .rail-label b {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rail-state,.node-dot {
+    height: 6px;
+    width: 6px;
+    flex: none;
+  }
+  .rail-create {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .identity-note {
+    margin-top: auto;
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+  }
+  .identity-note svg {
+    flex: none;
+    margin-top: 1px;
+  }
+  .cluster-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .summary-ident {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    min-width: 0;
+  }
+  .cluster-summary h2 {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .summary-sub {
+    display: block;
+    margin-top: 4px;
+  }
+  .resource-grid {
+    display: grid;
+  }
+  .resource-card {
+    min-width: 0;
+  }
+  .card-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .card-heading h3 {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .table-empty {
+    text-align: center;
+  }
+  .node-list,.member-list {
+    margin-top: 12px;
+  }
+  .node-row,.member-row {
+    display: flex;
+    align-items: center;
+  }
+  .node-name {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .node-name b {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .node-name small {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .node-action {
+    display: grid;
+    flex: none;
+  }
+  .member-avatar {
+    display: grid;
+    flex: none;
+  }
+  .member-footnote {
+    padding-top: 10px;
+    margin-top: 5px;
+  }
+  .coordinator-note {
+    display: flex;
+    gap: 9px;
+  }
+  .coordinator-note svg {
+    flex: none;
+    margin-top: 1px;
+  }
+  .coordinator-note div {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+  .empty-symbol {
+    height: 43px;
+    width: 43px;
+    display: grid;
+    margin-bottom: 12px;
+  }
+  .feedback.success {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .invite-banner {
+    display: flex;
+    align-items: center;
+  }
+  .invite-banner>div {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .dismiss-button {
+    margin-left: 0;
+  }
+  .manage-footer {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+  }
+  .dialog-shade {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: grid;
+    padding: 20px;
+  }
+  .credentials-dialog {
+    width: min(430px,100%);
+    position: relative;
+  }
+  .dialog-close {
+    position: absolute;
+    right: 13px;
+    top: 13px;
+  }
+  .dialog-icon {
+    height: 36px;
+    width: 36px;
+    display: grid;
+    margin-bottom: 14px;
+  }
+  .credentials-dialog h2 {
+    margin-top: 5px;
+  }
+  .credentials-dialog>p {
+    margin-top: 8px;
+  }
+  .credential-value {
+    overflow-wrap: anywhere;
+    padding: 9px;
+    margin-top: 12px;
+  }
+  .credential-hint {
+    margin-top: 11px;
+  }
+  .job-list {
+    margin-top: 10px;
+  }
+  .job-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    justify-content: space-between;
+  }
+  .job-title {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .job-progress {
+    overflow: hidden;
+    margin-top: 2px;
+  }
+  .job-progress span {
+    height: 100%;
+    display: block;
+    transition: width .2s ease;
+  }
+  .invite-management {
+    margin-top: 7px;
+    padding-top: 9px;
+  }
+  .invite-management-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 0 2px 5px;
+  }
+  .invite-management-title span {
+    padding: 2px 5px;
+  }
+  .invite-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .invite-key {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .invite-expiry {
+    margin-left: auto;
+    white-space: nowrap;
+  }
+  .no-invites {
+    padding: 5px 2px;
+  }
+  .app-dialog .field-label {
+    margin-top: 20px;
+  }
+  .dialog-actions {
+    justify-content: flex-end;
+  }
+@media (max-width: 900px) {
+  .cluster-content {
+    padding: 13px;
+  }
+  .cluster-summary {
+    gap: 10px;
+    flex-direction: column;
+  }
+  .summary-actions {
+    align-self: flex-end;
+    margin-top: -2px;
+  }
+  .manage-heading {
+    align-items: flex-start;
+    gap: 14px;
+    flex-direction: column;
+  }
+  .heading-buttons {
+    width: 100%;
+  }
+  .heading-buttons .manage-button {
+    flex: 1;
+  }
+  .summary-actions {
+    flex-wrap: wrap;
+  }
+  .summary-actions .manage-button {
+    flex: 1;
+  }
+}
+@media (max-width: 680px) {
+  .cluster-rail {
+    min-height: 0;
+  }
+  .cluster-rail .rail-cluster {
+    vertical-align: top;
+  }
+  .rail-create {
+    width: 100%;
+  }
+  .cluster-content {
+    min-height: 300px;
+  }
+  .summary-actions .manage-button:first-child {
+    flex: 1;
+  }
+  .invite-banner>div {
+    flex-basis: calc(100% - 28px);
+  }
+  .invite-banner .manage-button {
+    margin-left: 0;
+  }
+  .heading-buttons .manage-button {
+    padding: 0 7px;
+  }
+}
