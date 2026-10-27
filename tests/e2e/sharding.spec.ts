@@ -78,6 +78,12 @@ async function openPeer(browser: Browser, identity: string, nodeId: string, toke
     sessionStorage.setItem('mesh.node-tokens', JSON.stringify({ [nodeId]: token }))
   }, { meshIdentity: identity, nodeId, token })
   const page = await context.newPage()
+  page.on('pageerror', error => console.error(`Peer page error: ${error.message}`))
+  page.on('response', response => {
+    if (response.status() >= 400 && response.url().includes('/api/jobs/')) {
+      void response.text().then(text => console.error(`Job request ${response.status()}: ${text.slice(0, 300)}`)).catch(() => undefined)
+    }
+  })
   await page.goto(`${baseURL}/?mesh-e2e=local`)
   await expect(page.getByText('Coordinator online')).toBeVisible()
   return { context, page }
@@ -249,6 +255,94 @@ test('renews a lease through a slow commit and a temporary renewal failure', asy
   } finally {
     await Promise.all(contexts.map(context => context.close()))
     if (clusterId) await api(identity, `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
+  }
+})
+
+test('stored artifacts cannot be overwritten with different bytes', async ({ page }) => {
+  await page.goto('/?mesh-e2e=local')
+  const result = await page.evaluate(async () => {
+    const path = '/src/peer.ts'
+    const { PeerMeshNode } = await import(path)
+    const node = new PeerMeshNode('immutable-test', () => undefined, () => undefined)
+    try {
+      await node.storeArtifact('immutable-test-artifact', new Uint8Array([1, 2, 3]))
+      let rejected = false
+      try { await node.storeArtifact('immutable-test-artifact', new Uint8Array([4, 5, 6])) } catch { rejected = true }
+      return { rejected, stored: Array.from(await node.getArtifact('immutable-test', 'immutable-test-artifact')) }
+    } finally { node.close() }
+  })
+  expect(result).toEqual({ rejected: true, stored: [1, 2, 3] })
+})
+
+test('an online worker cannot fabricate another holders storage confirmation', async ({ browser }) => {
+  const identity = ownerIdentity()
+  let clusterId = ''
+  const contexts: BrowserContext[] = []
+  try {
+    clusterId = (await api<{ id: string }>(identity, '/api/clusters', 'POST', { name: 'forged-custody-e2e' })).id
+    const created = await Promise.all([0, 1].map(index => api<{ node: { id: string }; token: string }>(identity,
+      `/api/clusters/${clusterId}/nodes`, 'POST', { name: `custody-peer-${index}` })))
+    const peers = await Promise.all(created.map(node => openPeer(browser, identity, node.node.id, node.token)))
+    contexts.push(...peers.map(peer => peer.context))
+    await waitFor(() => api<Array<{ online: boolean }>>(identity, `/api/clusters/${clusterId}/nodes`), nodes => nodes.length === 2 && nodes.every(node => node.online), 'two live holders')
+    const job = await api<{ id: string }>(identity, `/api/clusters/${clusterId}/jobs`, 'POST', { workload: 'cpu-hash', total_units: 1000, batch_units: 1000 })
+    const claim = await api<{ lease: unknown }>(identity, `/api/jobs/${job.id}/claim`, 'POST', { node_id: created[0].node.id })
+    const response = await fetch(`${baseURL}/api/jobs/${job.id}/commit`, {
+      method: 'POST', headers: { 'X-Mesh-Identity': identity, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lease: claim.lease, sha256: 'a'.repeat(64), bytes: 128, shards: created.map((node, index) => ({
+        shard_index: index, node_id: node.node.id, artifact_name: `fabricated-${index}`, sha256: 'a'.repeat(64), bytes: 128,
+      })) }),
+    })
+    expect(response.status).toBe(409)
+    expect(await response.text()).toContain('independently confirmed storage')
+    const jobs = await api<Array<{ id: string; completed_batches: number }>>(identity, `/api/clusters/${clusterId}/jobs`)
+    expect(jobs.find(item => item.id === job.id)!.completed_batches).toBe(0)
+  } finally {
+    await Promise.all(contexts.map(context => context.close()))
+    if (clusterId) await api(identity, `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
+  }
+})
+
+test('repairs a lost shard onto a spare holder and survives a second holder loss', async ({ browser }) => {
+  const identities = [ownerIdentity(), ownerIdentity(), ownerIdentity(), ownerIdentity()]
+  let clusterId = ''
+  const contexts: BrowserContext[] = []
+  type Checkpoint = { sha256: string; manifest_revision: number; available_shards: number; verified_holders: number; durability: string;
+    shards: Array<{ shard_index: number; node_id: string; artifact_name: string; sha256: string }> }
+  try {
+    clusterId = (await api<{ id: string }>(identities[0], '/api/clusters', 'POST', { name: 'automatic-shard-repair-e2e' })).id
+    const invite = await api<{ token: string }>(identities[0], `/api/clusters/${clusterId}/invites`, 'POST')
+    await Promise.all(identities.slice(1).map(identity => api(identity, '/api/invites/join', 'POST', { token: invite.token })))
+    const created = await Promise.all(identities.map((identity, index) => api<{ node: { id: string }; token: string }>(identity,
+      `/api/clusters/${clusterId}/nodes`, 'POST', { name: `repair-peer-${index}` })))
+    const peers = await Promise.all(created.map((node, index) => openPeer(browser, identities[index], node.node.id, node.token)))
+    contexts.push(...peers.map(peer => peer.context))
+    await waitFor(() => api<Array<{ online: boolean }>>(identities[0], `/api/clusters/${clusterId}/nodes`),
+      nodes => nodes.length === 4 && nodes.every(node => node.online), 'four live worker nodes')
+    const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', { workload: 'vector-add', total_units: 100_000, batch_units: 100_000 })
+    await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
+    const read = () => api<Array<{ id: string; checkpoints: Checkpoint[] }>>(identities[0], `/api/clusters/${clusterId}/jobs`)
+    const initial = (await waitFor(read, jobs => jobs.some(item => item.id === job.id && item.checkpoints[0]?.verified_holders === 3),
+      'a checkpoint independently acknowledged by three holders', 90_000)).find(item => item.id === job.id)!.checkpoints[0]
+    const failed = initial.shards.find(shard => shard.node_id !== created[0].node.id)!
+    const spare = created.find(node => !initial.shards.some(shard => shard.node_id === node.node.id))!
+    await api(identities[0], `/api/nodes/${failed.node_id}/pause`, 'POST')
+    const repaired = (await waitFor(read, jobs => jobs.some(item => item.id === job.id && item.checkpoints[0]?.manifest_revision === 1),
+      'the missing shard to be repaired onto the spare holder', 90_000)).find(item => item.id === job.id)!.checkpoints[0]
+    expect(repaired.sha256).toBe(initial.sha256)
+    expect(repaired.durability).toBe('healthy')
+    expect(repaired.available_shards).toBe(3)
+    expect(repaired.verified_holders).toBe(3)
+    expect(repaired.shards.some(shard => shard.node_id === failed.node_id)).toBe(false)
+    expect(repaired.shards.find(shard => shard.shard_index === failed.shard_index)!.node_id).toBe(spare.node.id)
+    const second = initial.shards.find(shard => shard.node_id !== failed.node_id && shard.node_id !== created[0].node.id)!
+    await api(identities[0], `/api/nodes/${second.node_id}/pause`, 'POST')
+    await peers[0].page.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await peers[0].page.getByRole('button', { name: 'Test restore' }).click()
+    await expect(peers[0].page.getByText(/Recovered batch 1 from 2 verified shard\(s\); full artifact SHA-256 matches\./)).toBeVisible({ timeout: 45_000 })
+  } finally {
+    await Promise.all(contexts.map(context => context.close()))
+    if (clusterId) await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
   }
 })
 
