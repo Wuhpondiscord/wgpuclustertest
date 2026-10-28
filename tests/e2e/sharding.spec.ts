@@ -71,12 +71,13 @@ async function waitFor<T>(read: () => Promise<T>, ready: (value: T) => boolean, 
   throw new Error(`Timed out waiting for ${label}; last value: ${JSON.stringify(last)}`)
 }
 
-async function openPeer(browser: Browser, identity: string, nodeId: string, token: string): Promise<{ context: BrowserContext; page: Awaited<ReturnType<BrowserContext['newPage']>> }> {
+async function openPeer(browser: Browser, identity: string, nodeId: string, token: string, beforeLoad?: (context: BrowserContext) => Promise<void>): Promise<{ context: BrowserContext; page: Awaited<ReturnType<BrowserContext['newPage']>> }> {
   const context = await browser.newContext()
   await context.addInitScript(({ meshIdentity, nodeId, token }) => {
     localStorage.setItem('mesh.identity', meshIdentity)
     sessionStorage.setItem('mesh.node-tokens', JSON.stringify({ [nodeId]: token }))
   }, { meshIdentity: identity, nodeId, token })
+  await beforeLoad?.(context)
   const page = await context.newPage()
   page.on('pageerror', error => console.error(`Peer page error: ${error.message}`))
   page.on('websocket', socket => socket.on('framereceived', event => {
@@ -95,6 +96,166 @@ async function openPeer(browser: Browser, identity: string, nodeId: string, toke
   return { context, page }
 }
 
+async function threePeerFixture(browser: Browser) {
+  const identities = [ownerIdentity(), ownerIdentity(), ownerIdentity()]
+  const clusterId = (await api<{ id: string }>(identities[0], '/api/clusters', 'POST', { name: 'three-device-preflight' })).id
+  const peers: Awaited<ReturnType<typeof openPeer>>[] = []
+  try {
+    const invite = await api<{ token: string }>(identities[0], `/api/clusters/${clusterId}/invites`, 'POST')
+    await Promise.all(identities.slice(1).map(identity => api(identity, '/api/invites/join', 'POST', { token: invite.token })))
+    const nodes = await Promise.all(identities.map((identity, index) => api<{ node: { id: string }; token: string }>(identity,
+      `/api/clusters/${clusterId}/nodes`, 'POST', { name: `preflight-peer-${index}` })))
+    for (let index = 0; index < nodes.length; index++) peers.push(await openPeer(browser, identities[index], nodes[index].node.id, nodes[index].token))
+    await waitFor(() => api<Array<{ online: boolean; holder_ready: boolean }>>(identities[0], `/api/clusters/${clusterId}/nodes`),
+      nodes => nodes.length === 3 && nodes.every(node => node.online && node.holder_ready), 'three verified holders')
+    return { identities, clusterId, nodes, peers, close: async () => {
+      await Promise.all(peers.map(peer => peer.context.close()))
+      await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE')
+    } }
+  } catch (error) {
+    await Promise.all(peers.map(peer => peer.context.close()))
+    await api(identities[0], `/api/clusters/${clusterId}`, 'DELETE').catch(() => undefined)
+    throw error
+  }
+}
+
+test('maximum vector batches replan after holder ACK then finish with two devices', async ({ browser }) => {
+  const fixture = await threePeerFixture(browser)
+  const { identities, clusterId, nodes, peers } = fixture
+  try {
+    const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', {
+      workload: 'vector-add', total_units: 1_500_000, batch_units: 500_000,
+    })
+    let interrupted = false
+    await peers[0].page.route(`**/api/jobs/${job.id}/commit`, async route => {
+      if (!interrupted) {
+        interrupted = true
+        const receipt = route.request().postDataJSON().shards[1] as { node_id: string }
+        const target = nodes.findIndex(node => node.node.id === receipt.node_id)
+        await peers[target].context.close()
+        await waitFor(() => api<Array<{ id: string; online: boolean }>>(identities[0], `/api/clusters/${clusterId}/nodes`),
+          nodes => nodes.some(node => node.id === receipt.node_id && !node.online), 'a real holder socket disconnect')
+      }
+      await route.continue()
+    })
+    await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
+    const current = await waitFor(() => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{ bytes: number; shards: Array<{ bytes: number }> }> }>>(
+      identities[0], `/api/clusters/${clusterId}/jobs`), jobs => jobs.some(item => item.id === job.id && item.completed_batches === 3), 'all maximum-sized vector batches after holder loss', 120_000)
+    const completed = current.find(item => item.id === job.id)!
+    expect(interrupted).toBe(true)
+    for (const checkpoint of completed.checkpoints) {
+      expect(checkpoint.bytes).toBeLessThan(3 * 1024 * 1024)
+      expect(checkpoint.shards.map(shard => shard.bytes)).toEqual([checkpoint.bytes, checkpoint.bytes])
+    }
+    await expect(peers[0].page.locator('.feedback.error')).toHaveCount(0)
+    await peers[0].page.getByRole('button', { name: 'Test restore' }).click()
+    await expect(peers[0].page.getByText('Recovered batch 3 from 2 verified shard(s); full artifact SHA-256 matches.', { exact: true })).toBeVisible({ timeout: 45_000 })
+  } finally { await fixture.close() }
+})
+
+test('a surviving device resumes unfinished GPU job batches after the compute browser closes', async ({ browser }) => {
+  const fixture = await threePeerFixture(browser)
+  const { identities, clusterId, nodes, peers } = fixture
+  try {
+    const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', {
+      workload: 'vector-add', total_units: 300_000, batch_units: 100_000,
+    })
+    let signalInFlight!: () => void
+    const inFlight = new Promise<void>(resolve => { signalInFlight = resolve })
+    await peers[0].page.route(`**/api/jobs/${job.id}/commit`, async route => {
+      if (route.request().postDataJSON().lease.task_id.endsWith(':1')) { signalInFlight(); return }
+      await route.continue()
+    })
+    await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
+    await inFlight
+    const read = () => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{ batch_index: number; sha256: string }> }>>(identities[0], `/api/clusters/${clusterId}/jobs`)
+    const original = (await read()).find(item => item.id === job.id)!.checkpoints[0]
+    await peers[0].context.close()
+    await waitFor(() => api<Array<{ id: string; online: boolean }>>(identities[1], `/api/clusters/${clusterId}/nodes`),
+      nodesNow => nodesNow.some(node => node.id === nodes[0].node.id && !node.online), 'the compute worker to disconnect')
+    await peers[1].page.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await expect(peers[1].page.getByRole('button', { name: 'Run on this node' })).toBeEnabled()
+    await peers[1].page.getByRole('button', { name: 'Run on this node' }).click()
+    const completed = (await waitFor(read, jobs => jobs.some(item => item.id === job.id && item.completed_batches === 3), 'a surviving worker to reclaim and finish every batch', 90_000)).find(item => item.id === job.id)!
+    expect(completed.checkpoints.find(checkpoint => checkpoint.batch_index === 0)!.sha256).toBe(original.sha256)
+    await expect(peers[1].page.locator('.feedback.error')).toHaveCount(0)
+  } finally { await fixture.close() }
+})
+
+test('every device checks every peer and the UI CPU demo completes and restores', async ({ browser }) => {
+  const fixture = await threePeerFixture(browser)
+  try {
+    for (const { page } of fixture.peers) {
+      await page.getByRole('button', { name: 'Test P2P', exact: true }).click()
+      await expect(page.getByText('Peer transfers verified to all 2 other connected node(s). Run this test on every device to check all network pairs.', { exact: true })).toBeVisible({ timeout: 45_000 })
+      await expect(page.locator('.feedback.error')).toHaveCount(0)
+    }
+    const page = fixture.peers[0].page
+    await page.getByRole('button', { name: 'Create CPU demo', exact: true }).click()
+    await page.getByRole('button', { name: 'Run on this node', exact: true }).click()
+    await expect(page.getByText('All job batches completed and replicated (cpu)', { exact: true })).toBeVisible({ timeout: 90_000 })
+    await page.getByRole('button', { name: 'Test restore', exact: true }).click()
+    await expect(page.getByText('Recovered batch 12 from 2 verified shard(s); full artifact SHA-256 matches.', { exact: true })).toBeVisible({ timeout: 45_000 })
+  } finally { await fixture.close() }
+})
+
+test('transfer ACK deadline starts after the final chunk, including slow sends', async ({ page }) => {
+  await page.goto('/')
+  const outcome = await page.evaluate(async () => {
+    const path = '/src/peer.ts'
+    const { PeerMeshNode } = await import(path)
+    const mesh = new PeerMeshNode('sender', () => undefined, () => undefined)
+    const nativeTimeout = window.setTimeout
+    let chunks = 0
+    let chunksWhenArmed = -1
+    let start: { transfer_id: string; sha256: string }
+    const channel = { readyState: 'open' }
+    mesh.channels.set('receiver', channel)
+    window.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 30000) chunksWhenArmed = chunks
+      return nativeTimeout(handler, timeout, ...args)
+    }) as typeof window.setTimeout
+    mesh.sendFrame = async (_channel: unknown, message: { type: string; transfer_id: string; sha256: string; index: number }) => {
+      if (message.type === 'artifact_start') start = message
+      else if (message.type === 'artifact_chunk') {
+        chunks++
+        // A slow network can spend over 30 seconds in these awaits; no ACK
+        // deadline may run before the last chunk has been queued.
+        if (chunksWhenArmed !== -1) throw new Error('ACK timer armed during the transfer')
+        if (chunks === 3) nativeTimeout(() => void mesh.handleDataMessage('receiver', channel, JSON.stringify({ type: 'artifact_ack', transfer_id: start.transfer_id, sha256: start.sha256 })), 0)
+      }
+    }
+    try {
+      await mesh.sendArtifact('receiver', 'slow-link-fixture', new Uint8Array(40000), false)
+      return { chunks, chunksWhenArmed }
+    } finally { window.setTimeout = nativeTimeout; mesh.close() }
+  })
+  expect(outcome).toEqual({ chunks: 3, chunksWhenArmed: 3 })
+})
+
+test('a different peer cannot replace transfer metadata or inject chunks', async ({ page }) => {
+  await page.goto('/')
+  const outcome = await page.evaluate(async () => {
+    const path = '/src/peer.ts'
+    const { PeerMeshNode } = await import(path)
+    const mesh = new PeerMeshNode('receiver', () => undefined, () => undefined)
+    const messages: Array<{ type: string }> = []
+    const channel = { readyState: 'open', send: (value: string) => messages.push(JSON.parse(value)) }
+    const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array([1, 2, 3]))), b => b.toString(16).padStart(2, '0')).join('')
+    const start = { type: 'artifact_start', transfer_id: 'ownership-fixture', name: 'ownership-fixture', total_bytes: 3, chunks: 1, sha256 }
+    try {
+      await mesh.handleDataMessage('good', channel, JSON.stringify(start))
+      await mesh.handleDataMessage('bad', channel, JSON.stringify({ ...start, name: 'attacker-overwrite' }))
+      await mesh.handleDataMessage('bad', channel, JSON.stringify({ type: 'artifact_chunk', transfer_id: start.transfer_id, index: 0, data: '!!!' }))
+      await mesh.handleDataMessage('good', channel, JSON.stringify({ type: 'artifact_chunk', transfer_id: start.transfer_id, index: 0, data: 'AQID' }))
+      return { messages, bytes: Array.from(await mesh.getArtifact('receiver', start.name)) }
+    } finally { mesh.close() }
+  })
+  expect(outcome.messages).toHaveLength(1)
+  expect(outcome.messages[0].type).toBe('artifact_ack')
+  expect(outcome.bytes).toEqual([1, 2, 3])
+})
+
 test('cluster creation uses an in-app form instead of browser prompts', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByText('Coordinator online')).toBeVisible()
@@ -110,6 +271,39 @@ test('cluster creation uses an in-app form instead of browser prompts', async ({
   const clusters = await api<Array<{ id: string; name: string }>>(identity, '/api/clusters')
   const created = clusters.find(cluster => cluster.name === 'modal-smoke-test')
   if (created) await api(identity, `/api/clusters/${created.id}`, 'DELETE')
+})
+
+test('reconnecting an older cluster node preserves the selected cluster', async ({ browser }) => {
+  const identity = ownerIdentity()
+  const first = (await api<{ id: string }>(identity, '/api/clusters', 'POST', { name: 'older-node-cluster' })).id
+  const second = (await api<{ id: string }>(identity, '/api/clusters', 'POST', { name: 'selected-cluster' })).id
+  let context: BrowserContext | undefined
+  try {
+    const node = await api<{ node: { id: string }; token: string }>(identity, `/api/clusters/${first}/nodes`, 'POST', { name: 'reconnecting-node' })
+    const peer = await openPeer(browser, identity, node.node.id, node.token, async context => {
+      await context.addInitScript(() => {
+        const NativeSocket = window.WebSocket
+        const sockets: WebSocket[] = []
+        window.WebSocket = class extends NativeSocket {
+          constructor(url: string | URL, protocols?: string | string[]) { super(url, protocols); sockets.push(this) }
+        }
+        Object.assign(window, { dropTestSockets: () => sockets.forEach(socket => socket.close()) })
+      })
+    })
+    context = peer.context
+    await peer.page.getByRole('button', { name: /older-node-cluster owner/ }).click()
+    await expect(peer.page.getByText('Connected · storage verified')).toBeVisible()
+    await peer.page.getByRole('button', { name: /selected-cluster owner/ }).click()
+    await expect(peer.page.getByRole('heading', { name: 'selected-cluster', exact: true })).toBeVisible()
+    await peer.page.evaluate(() => (window as unknown as { dropTestSockets: () => void }).dropTestSockets())
+    await waitFor(() => api<Array<{ online: boolean; holder_ready: boolean }>>(identity, `/api/clusters/${first}/nodes`),
+      nodes => nodes.every(node => node.online && node.holder_ready), 'the original node to reconnect')
+    await expect(peer.page.getByRole('heading', { name: 'selected-cluster', exact: true })).toBeVisible()
+  } finally {
+    await context?.close()
+    await api(identity, `/api/clusters/${first}`, 'DELETE').catch(() => undefined)
+    await api(identity, `/api/clusters/${second}`, 'DELETE').catch(() => undefined)
+  }
 })
 
 test('reconstructs a 2+1 checkpoint after one peer goes offline', async ({ browser }) => {
@@ -358,4 +552,3 @@ test(`repairs ${workload} checkpoints onto a spare and survives a second origina
   }
 })
 }
-

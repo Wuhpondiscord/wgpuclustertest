@@ -3,7 +3,7 @@ import { Activity, ArrowRight, Boxes, Check, Copy, Cpu, Link2, LogOut, Pause, Pl
 import { PeerMeshNode } from './peer'
 import { HolderCustody } from './custody'
 import { executeRepair, type RepairTask } from './repair'
-import { createVectorAddWorker, digestVectorAddResult, runVectorAddCpu } from './webgpu'
+import { createVectorAddWorker, digestVectorAddResult, encodeVectorAddOutput, runVectorAddCpu } from './webgpu'
 import { encode2Plus1, reconstruct2Plus1, sha256Hex, type EncodedShard } from './sharding'
 
 type Cluster = { id: string; name: string; role: 'owner' | 'member'; members: number; nodes: number; online_nodes: number }
@@ -108,7 +108,10 @@ function App() {
   const [dialog, setDialog] = useState<UiDialog | null>(null)
   const [dialogValue, setDialogValue] = useState('')
   const sockets = useRef(new Map<string, BrowserNodeConnection>())
+  const runningJobs = useRef(new Set<string>())
+  const [runningJobIds, setRunningJobIds] = useState<string[]>([])
   const activeSelection = useRef('')
+  const refreshGeneration = useRef(0)
   const [busy, setBusy] = useState(true)
   const [coordinatorStatus, setCoordinatorStatus] = useState<'checking' | 'online' | 'offline'>('checking')
   const [error, setError] = useState('')
@@ -117,18 +120,26 @@ function App() {
   useEffect(() => { activeSelection.current = activeId }, [activeId])
 
   async function refreshClusters(preferId?: string) {
+    if (preferId) activeSelection.current = preferId
+    const generation = ++refreshGeneration.current
     const data = await api<Cluster[]>('/api/clusters')
+    if (generation !== refreshGeneration.current) return
     setClusters(data)
-    const nextId = preferId && data.some(c => c.id === preferId) ? preferId : data.some(c => c.id === activeId) ? activeId : data[0]?.id ?? ''
+    const selection = activeSelection.current
+    const nextId = preferId && data.some(c => c.id === preferId) ? preferId : data.some(c => c.id === selection) ? selection : data[0]?.id ?? ''
     setActiveId(nextId)
+    activeSelection.current = nextId
     if (nextId) {
-      const [nextNodes, nextMembers] = await Promise.all([
+      const selected = data.find(c => c.id === nextId)
+      const [nextNodes, nextMembers, nextJobs, nextInvites] = await Promise.all([
         api<Node[]>(`/api/clusters/${nextId}/nodes`),
         api<Member[]>(`/api/clusters/${nextId}/members`),
+        api<ComputeJob[]>(`/api/clusters/${nextId}/jobs`),
+        selected?.role === 'owner' ? api<ActiveInvite[]>(`/api/clusters/${nextId}/invites`) : Promise.resolve([]),
       ])
-      const nextJobs = await api<ComputeJob[]>(`/api/clusters/${nextId}/jobs`)
+      if (generation !== refreshGeneration.current || activeSelection.current !== nextId) return
       setNodes(nextNodes); setMembers(nextMembers)
-      setJobs(nextJobs)
+      setJobs(nextJobs); setInvites(nextInvites)
       const tokens = getSessionNodeTokens()
       for (const node of nextNodes) {
         const token = tokens[node.id]
@@ -137,8 +148,6 @@ function App() {
           connectBrowserNode(node.id, `${wsProto}//${location.host}/api/nodes/connect?token=${token}`)
         }
       }
-      const selected = data.find(c => c.id === nextId)
-      setInvites(selected?.role === 'owner' ? await api<ActiveInvite[]>(`/api/clusters/${nextId}/invites`) : [])
     } else { setNodes([]); setMembers([]); setInvites([]); setJobs([]) }
   }
 
@@ -173,15 +182,16 @@ function App() {
 
   useEffect(() => {
     if (!activeId) return
+    let stopped = false
     const timer = window.setInterval(() => {
-      void api<ComputeJob[]>(`/api/clusters/${activeId}/jobs`).then(setJobs).catch(() => undefined)
+      void api<ComputeJob[]>(`/api/clusters/${activeId}/jobs`).then(jobs => { if (!stopped) setJobs(jobs) }).catch(() => undefined)
     }, 5000)
-    return () => window.clearInterval(timer)
+    return () => { stopped = true; window.clearInterval(timer) }
   }, [activeId])
 
   useEffect(() => {
     if (!activeId) return
-    const timer = window.setInterval(() => { void refreshClusters(activeId).catch(e => setError(e instanceof Error ? e.message : 'Refresh failed')) }, 12000)
+    const timer = window.setInterval(() => { void refreshClusters(activeSelection.current).catch(e => setError(e instanceof Error ? e.message : 'Refresh failed')) }, 12000)
     return () => window.clearInterval(timer)
   }, [activeId])
 
@@ -299,7 +309,7 @@ function App() {
       connection.custody?.close()
       connection.custody = new HolderCustody(id, socket)
       connection.peerMesh = createPeerMesh(id, socket, connection.custody)
-      void refreshClusters(activeId).catch(() => undefined)
+      void refreshClusters(activeSelection.current).catch(() => undefined)
     })
     socket.addEventListener('message', event => {
       try {
@@ -343,7 +353,7 @@ function App() {
       if (connection.socket === socket) connection.socket = null
       if (connection.stopped || sockets.current.get(id) !== connection) return
       setNotice(`${nameForNode(id)} disconnected; retrying automatically`)
-      void refreshClusters(activeId).catch(() => undefined)
+      void refreshClusters(activeSelection.current).catch(() => undefined)
       scheduleBrowserReconnect(id, connection)
     })
     socket.addEventListener('error', () => socket.close())
@@ -384,16 +394,16 @@ function App() {
     if (!source || !target || !source[1].peerMesh) { setError('Keep this tab connected to a node and connect a second node in the same cluster first.'); return }
     setError(''); setNotice('Establishing a direct peer channel…')
     const bytes = new TextEncoder().encode(JSON.stringify({ kind: 'checkpoint-transfer-probe', cluster_id: active.id, generated_at: Date.now(), payload: 'mesh-peer-transfer'.repeat(2048) }))
-    let lastError: unknown
+    const failures: string[] = []
     const candidates = nodes.filter(node => node.cluster_id === active.id && node.online && !node.paused && node.holder_ready && node.id !== source[0])
     for (const peer of candidates) {
       try {
         const result = await source[1].peerMesh.sendArtifact(peer.id, `mesh-p2p-probe-${crypto.randomUUID()}`, bytes)
         setNotice(`Peer transfer verified: ${result.bytes.toLocaleString()} bytes, SHA-256 ${result.sha256.slice(0, 16)}…`)
-        return
-      } catch (e) { lastError = e }
+      } catch (e) { failures.push(`${peer.name}: ${e instanceof Error ? e.message : 'transfer failed'}`) }
     }
-    setError(lastError instanceof Error ? lastError.message : 'Peer transfer failed; no active peer acknowledged the test artifact')
+    if (failures.length) setError(`Peer check failed for ${failures.join('; ')}. Cross-network connections may require a TURN relay.`)
+    else setNotice(`Peer transfers verified to all ${candidates.length} other connected node(s). Run this test on every device to check all network pairs.`)
   }
   async function createComputeJob(workload: ComputeJob['workload']) {
     if (!active) return
@@ -405,6 +415,7 @@ function App() {
   }
   async function runComputeJob(job: ComputeJob) {
     if (!active) return
+    if (runningJobs.current.has(job.id)) return
     const tokens = getSessionNodeTokens()
     const workers = [...sockets.current.entries()].filter(([nodeId, connection]) =>
       Object.prototype.hasOwnProperty.call(tokens, nodeId) && nodes.some(node => node.id === nodeId && node.cluster_id === active.id && node.online && !node.paused)
@@ -412,17 +423,18 @@ function App() {
     const source = workers[0]
     const replicas = nodes.filter(node => node.cluster_id === active.id && node.online && !node.paused && node.holder_ready && node.id !== source?.[0])
     if (!source?.[1].peerMesh || !replicas.length) { setError('Connect this browser and a peer with verified storage ready. Refresh older node tabs so they can register holder receipts.'); return }
-    if (job.workload === 'vector-add' && replicas.length < 2) { setError('This vector-add job produces a large checkpoint and needs three online nodes: this worker plus two peers.'); return }
     const peerMesh = source[1].peerMesh
     if (!peerMesh) { setError('The worker peer transport is not ready.'); return }
     const availableCheckpointPeers = async (excluded: Set<string> = new Set()) => {
       const currentNodes = await api<Node[]>(`/api/clusters/${job.cluster_id}/nodes`)
-      setNodes(currentNodes)
+      if (activeSelection.current === job.cluster_id) setNodes(currentNodes)
       return currentNodes.filter(node => node.cluster_id === job.cluster_id && node.online && !node.paused && node.holder_ready && node.id !== source[0]
         && !excluded.has(node.id) && peerMesh.canTransferTo(node.id))
     }
     let gpuWorker: Awaited<ReturnType<typeof createVectorAddWorker>> = null
     let executionMode: 'webgpu' | 'cpu-fallback' | 'cpu' = 'cpu'
+    runningJobs.current.add(job.id)
+    setRunningJobIds([...runningJobs.current])
     if (job.workload === 'vector-add') {
       try { gpuWorker = await createVectorAddWorker() } catch { gpuWorker = null }
       executionMode = gpuWorker ? 'webgpu' : 'cpu-fallback'
@@ -452,9 +464,9 @@ function App() {
           : null
         const result = vectorResult ? await digestVectorAddResult(vectorResult) : computeBatch(claim.start, claim.end)
         const artifact = new TextEncoder().encode(JSON.stringify({
-          type: 'mesh-compute-checkpoint-v2', workload: job.workload, execution_mode: executionMode,
+          type: 'mesh-compute-checkpoint-v3', workload: job.workload, execution_mode: executionMode,
           job_id: job.id, batch_index: claim.batch_index, start: claim.start, end: claim.end,
-          result_digest: result, output: vectorResult ? Array.from(vectorResult) : undefined,
+          result_digest: result, output: vectorResult ? encodeVectorAddOutput(vectorResult) : undefined,
           worker_node_id: source[0], generation: claim.lease.generation,
         }))
         const shardReceipts: ShardReceipt[] = []
@@ -499,19 +511,30 @@ function App() {
         } else {
           shardReceipts.push(...await tryReplicatedCheckpoint(new Set()))
         }
-        await api(`/api/jobs/${job.id}/commit`, { method: 'POST', body: JSON.stringify({
+        const commit = () => api(`/api/jobs/${job.id}/commit`, { method: 'POST', body: JSON.stringify({
           lease: heartbeat.current(), sha256: checkpointDigest, bytes: artifact.byteLength, shards: shardReceipts,
         }) })
+        try { await commit() }
+        catch (error) {
+          // A holder can leave after its ACK but before the coordinator commits.
+          // Replan only this explicitly retryable custody failure; lease fencing,
+          // auth failures and storage errors must keep their original semantics.
+          if ((error as { status?: number }).status !== 409 || !/active cluster nodes|independently confirmed storage/.test((error as Error).message)) throw error
+          heartbeat.current()
+          setNotice('A holder changed before commit; placing two fresh full copies…')
+          shardReceipts.splice(0, shardReceipts.length, ...await tryReplicatedCheckpoint(new Set()))
+          await commit()
+        }
         checkpointPolicy = shardReceipts.length === 3 ? '2+1 shards' : 'two replicas'
         } finally { heartbeat.stop() }
         const current = await api<ComputeJob[]>(`/api/clusters/${job.cluster_id}/jobs`)
         setJobs(current)
         const updated = current.find(item => item.id === job.id)
         setNotice(`Checkpointed ${job.workload === 'vector-add' ? 'vector-add' : 'CPU'} batch ${claim.batch_index + 1} of ${job.total_batches} using ${checkpointPolicy}`)
-        if (updated && updated.completed_batches >= updated.total_batches) { setNotice('All job batches completed and replicated'); return }
+        if (updated && updated.completed_batches >= updated.total_batches) { setNotice(`All job batches completed and replicated (${executionMode})`); return }
       }
       throw new Error('No batches became available before the worker wait limit. You can run the job again after active leases expire.')
-      } finally { gpuWorker?.close() }
+      } finally { gpuWorker?.close(); runningJobs.current.delete(job.id); setRunningJobIds([...runningJobs.current]) }
     })
   }
   async function restoreLatestCheckpoint(job: ComputeJob) {
@@ -593,9 +616,9 @@ function App() {
         <aside className="cluster-rail"><div className="rail-title">YOUR CLUSTERS <span>{clusters.length}</span></div>{clusters.map(c=><button key={c.id} className={`rail-cluster ${active?.id===c.id?'active':''}`} onClick={()=>void run(()=>refreshClusters(c.id))}><span className="rail-icon">{c.name.slice(0,2).toUpperCase()}</span><span className="rail-label"><b>{c.name}</b><small>{c.role} · {c.members} members</small></span><span className={`rail-state ${c.online_nodes?'online':''}`}/></button>)}{!clusters.length&&<p className="rail-empty">No clusters yet.</p>}<button className="rail-create" onClick={() => void createCluster()}><Plus size={14}/>Create cluster</button><div className="identity-note"><Shield size={14}/><span>Your browser holds your private Mesh identity key. Clearing site data loses access to this anonymous account.</span></div></aside>
         <section className="cluster-content">{!active ? <div className="empty-state"><div className="empty-symbol"><Boxes size={22}/></div><h2>Start your first cluster</h2><p>Create a pool, then invite members and register their nodes.</p><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>Create cluster</button></div> : <>
           <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions">{active.role==='owner'?<><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button" onClick={() => void renameCluster()}><Settings size={15}/>Rename</button><button className="manage-button danger" onClick={() => void deleteCluster()}><Trash2 size={15}/>Delete cluster</button></>:<button className="manage-button" onClick={() => void leaveCluster()}><LogOut size={15}/>Leave cluster</button>}</div></div>
-          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.paused?'Paused':n.online?(n.holder_ready?'Connected · storage verified':'Connected · refresh to enable storage verification'):'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
+          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused&&node.holder_ready).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-row" key={n.id}><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.paused?'Paused':n.online?(n.holder_ready?'Connected · storage verified':'Connected · refresh to enable storage verification'):'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>)}</div>}</article>
             <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.token.slice(0,10)}…</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
-          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Compute jobs</h3><p>Small checkpoints use two copies; larger results use 2+1 shards across three nodes.</p></div><div className="heading-buttons"><button className="manage-button small" onClick={() => void createComputeJob('cpu-hash')}>Create CPU demo</button><button className="manage-button small primary" onClick={() => void createComputeJob('vector-add')}>Create WebGPU job</button></div></div>{jobs.length===0?<div className="table-empty">Create a bounded CPU or WebGPU vector-add workload to exercise leases and recoverable checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);const online=nodes.filter(node=>node.online&&!node.paused).length;return <div className="job-row" key={job.id}><div className="job-title"><b>{job.workload==='vector-add'?'Vector addition (WebGPU with CPU fallback)':'Deterministic CPU hash'}</b><small>{job.total_units.toLocaleString()} elements · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}{job.checkpoints.length?` · ${job.checkpoints.length} recoverable checkpoint(s)`:''}</small>{job.checkpoints.length>0&&<small className="checkpoint-durability">{checkpointHealth(job)}</small>}<div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><div className="heading-buttons">{job.checkpoints.some(checkpoint=>checkpoint.shards.length>0)&&<button className="manage-button small" onClick={()=>void restoreLatestCheckpoint(job)}>Test restore</button>}<button className="manage-button small" disabled={done||online<(job.workload==='vector-add'?3:2)} onClick={() => void runComputeJob(job)}>{done?'Complete':'Run on this node'}</button></div></div>})}</div>}</article>
+          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Compute jobs</h3><p>Two nodes use full copies; three nodes prefer 2+1 shards. If the compute worker leaves, run on a surviving node to resume.</p></div><div className="heading-buttons"><button className="manage-button small" onClick={() => void createComputeJob('cpu-hash')}>Create CPU demo</button><button className="manage-button small primary" onClick={() => void createComputeJob('vector-add')}>Create WebGPU job</button></div></div>{jobs.length===0?<div className="table-empty">Create a bounded CPU or WebGPU vector-add workload to exercise leases and recoverable checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);const online=nodes.filter(node=>node.online&&!node.paused&&node.holder_ready).length;return <div className="job-row" key={job.id}><div className="job-title"><b>{job.workload==='vector-add'?'Vector addition (WebGPU with CPU fallback)':'Deterministic CPU hash'}</b><small>{job.total_units.toLocaleString()} elements · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}{job.checkpoints.length?` · ${job.checkpoints.length} recoverable checkpoint(s)`:''}</small>{job.checkpoints.length>0&&<small className="checkpoint-durability">{checkpointHealth(job)}</small>}<div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><div className="heading-buttons">{active.role==='owner'&&<button aria-label="Delete job" title="Delete job" className="icon-button" onClick={()=>openConfirmDialog({title: 'Delete job?', description: 'Remove this job and its checkpoint metadata? Browser artifact bytes are retained until local storage is cleared.', confirmLabel: 'Delete job', onConfirm: ()=>{void run(async()=>{await api(`/api/jobs/${job.id}`,{method:'DELETE'});await refreshClusters(activeSelection.current)})}})}><Trash2 size={16}/></button>}{job.checkpoints.some(checkpoint=>checkpoint.shards.length>0)&&<button className="manage-button small" onClick={()=>void restoreLatestCheckpoint(job)}>Test restore</button>}<button className="manage-button small" disabled={done||online<2||runningJobIds.includes(job.id)} onClick={() => void runComputeJob(job)}>{done?'Complete':runningJobIds.includes(job.id)?'Running…':'Run on this node'}</button></div></div>})}</div>}</article>
           <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages leases and manifests; artifact bytes move peer to peer.</b><span>Large batches are split into two data shards plus XOR parity and written to three distinct nodes. Any two verified shards can reconstruct a checkpoint; use “Test restore” to request shards, reconstruct the latest checkpoint, and verify its full-artifact digest. This prototype does not yet attest to trusted computation or issue rewards.</span></div></div>
         </>}</section>
       </div>}
@@ -607,4 +630,3 @@ function App() {
 }
 
 export default App
-

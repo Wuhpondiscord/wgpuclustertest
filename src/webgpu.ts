@@ -50,18 +50,33 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `
 
-export function runVectorAddCpu(start: number, end: number) {
+function vectorInputs(start: number, end: number) {
   const count = end - start
   const left = new Float32Array(count)
   const right = new Float32Array(count)
-  const output = new Float32Array(count)
   for (let i = 0; i < count; i++) {
     const n = start + i
     left[i] = ((n * 17) % 100_003) / 100_003
     right[i] = ((n * 29 + 7) % 100_019) / 100_019
-    output[i] = left[i] + right[i]
   }
+  return { left, right }
+}
+
+export function runVectorAddCpu(start: number, end: number) {
+  const { left, right } = vectorInputs(start, end)
+  const output = new Float32Array(left.length)
+  for (let i = 0; i < output.length; i++) output[i] = left[i] + right[i]
   return output
+}
+
+/** Portable f32 checkpoint representation, bounded to 2.67 MB at 500k values. */
+export function encodeVectorAddOutput(values: Float32Array) {
+  const bytes = new Uint8Array(values.length * 4)
+  const view = new DataView(bytes.buffer)
+  for (let i = 0; i < values.length; i++) view.setFloat32(i * 4, values[i], true)
+  let binary = ''
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+  return { encoding: 'f32-le-base64', elements: values.length, data: btoa(binary) }
 }
 
 export async function digestVectorAddResult(values: Float32Array) {
@@ -80,6 +95,8 @@ export async function createVectorAddWorker() {
   let disposed = false
   let lost = false
   void device.lost.then(() => { lost = true })
+  const module = device.createShaderModule({ code: VECTOR_ADD_SHADER })
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } })
 
   return {
     async run(start: number, end: number) {
@@ -91,13 +108,7 @@ export async function createVectorAddWorker() {
         throw new Error('This GPU cannot fit one batch within its storage-buffer limits.')
       }
 
-      const left = new Float32Array(count)
-      const right = new Float32Array(count)
-      for (let i = 0; i < count; i++) {
-        const n = start + i
-        left[i] = ((n * 17) % 100_003) / 100_003
-        right[i] = ((n * 29 + 7) % 100_019) / 100_019
-      }
+      const { left, right } = vectorInputs(start, end)
 
       const usage = STORAGE | COPY_DST
       const leftBuffer = device.createBuffer({ size: byteLength, usage })
@@ -107,8 +118,6 @@ export async function createVectorAddWorker() {
       try {
         device.queue.writeBuffer(leftBuffer, 0, left)
         device.queue.writeBuffer(rightBuffer, 0, right)
-        const module = device.createShaderModule({ code: VECTOR_ADD_SHADER })
-        const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } })
         const bindGroup = device.createBindGroup({
           layout: (pipeline as { getBindGroupLayout(index: number): unknown }).getBindGroupLayout(0),
           entries: [
@@ -129,10 +138,9 @@ export async function createVectorAddWorker() {
         const result = new Float32Array(readbackBuffer.getMappedRange().slice(0))
         readbackBuffer.unmap()
 
-        // Check a small deterministic sample on the CPU so shader or transfer errors fail the batch.
-        for (const i of [0, Math.floor(count / 2), count - 1]) {
-          const expected = left[i] + right[i]
-          if (Math.abs(result[i] - expected) > 1e-6) throw new Error('WebGPU batch validation failed; result was not checkpointed.')
+        for (let i = 0; i < count; i++) {
+          const expected = Math.fround(left[i] + right[i])
+          if (!Number.isFinite(result[i]) || result[i] !== expected) throw new Error('WebGPU batch validation failed; result was not checkpointed.')
         }
         return result
       } finally {
@@ -147,4 +155,3 @@ export async function createVectorAddWorker() {
     },
   }
 }
-

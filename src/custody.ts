@@ -7,7 +7,7 @@ function base64(bytes: ArrayBuffer) {
 /** Session keys attest to storage on this authenticated node connection. */
 export class HolderCustody {
   private pending = new Map<string, PendingReply>()
-  private key = crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])
+  private key = crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify'])
   private nonce = ''
   private publicKey = ''
   private closed = false
@@ -84,4 +84,3 @@ export class HolderCustody {
     this.socket.removeEventListener('close', this.close)
   }
 }
-
