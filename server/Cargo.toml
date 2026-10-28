@@ -16,3 +16,5 @@ tower-http = { version = "0.5", features = ["fs"] }
 ureq = { version = "2.12", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

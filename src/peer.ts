@@ -3,6 +3,7 @@ const CHUNK_BYTES = 16 * 1024
 const MAX_FRAME_CHARS = 24 * 1024
 const BUFFER_LIMIT_BYTES = 256 * 1024
 const MAX_CONCURRENT_TRANSFERS = 2
+const validArtifactName = (name: string) => /^[A-Za-z0-9._-]{1,128}$/.test(name)
 
 type SignalPayload = { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
 type TransferStart = { type: 'artifact_start'; transfer_id: string; name: string; total_bytes: number; chunks: number; sha256: string }
@@ -79,6 +80,7 @@ export class PeerMeshNode {
   private pendingArtifactReads = new Map<string, PendingArtifactRead>()
   private signalQueues = new Map<string, Promise<void>>()
   private earlyCandidates = new WeakMap<RTCPeerConnection, RTCIceCandidateInit[]>()
+  private servingReads = new Set<string>()
   private closed = false
 
   constructor(
@@ -123,7 +125,7 @@ export class PeerMeshNode {
 
   private considerPeer(peerId: string) {
     if (peerId === this.nodeId || this.closed || this.peers.has(peerId)) return
-    const initiates = this.nodeId.localeCompare(peerId) < 0
+    const initiates = this.nodeId < peerId
     const peer = this.createPeer(peerId, initiates)
     if (initiates) void peer.createOffer().then(async offer => {
       await peer.setLocalDescription(offer)
@@ -173,7 +175,7 @@ export class PeerMeshNode {
     // Browser E2E runs three peer pages on the same host, so local host
     // candidates are enough and avoid making CI depend on an external STUN
     // service. Production keeps the normal STUN-assisted ICE configuration.
-    const localE2e = new URLSearchParams(location.search).get('mesh-e2e') === 'local'
+    const localE2e = import.meta.env.DEV && new URLSearchParams(location.search).get('mesh-e2e') === 'local'
     const peer = new RTCPeerConnection({ iceServers: localE2e ? [] : [{ urls: 'stun:stun.l.google.com:19302' }] })
     this.peers.set(peerId, peer)
     peer.onicecandidate = event => { if (event.candidate) this.signal(peerId, { candidate: event.candidate.toJSON() }) }
@@ -206,12 +208,16 @@ export class PeerMeshNode {
       if (pending?.peerId === peerId) { window.clearTimeout(pending.timer); this.pending.delete(message.transfer_id); pending.resolve(message.sha256) }
       return
     }
-    if (message.type === 'artifact_get' && typeof message.name === 'string' && message.name.length > 0 && message.name.length <= 128) {
+    if (message.type === 'artifact_get' && typeof message.name === 'string' && validArtifactName(message.name)) {
+      const key = `${peerId}:${message.name}`
+      if (this.servingReads.size >= MAX_CONCURRENT_TRANSFERS || this.servingReads.has(key)) return
+      this.servingReads.add(key)
       try {
         const artifact = await loadArtifact(message.name)
         if (!artifact) { channel.send(JSON.stringify({ type: 'artifact_missing', name: message.name })); return }
-        void this.sendArtifact(peerId, message.name, artifact, false).catch(() => undefined)
-      } catch { channel.send(JSON.stringify({ type: 'artifact_missing', name: message.name })) }
+        await this.sendArtifact(peerId, message.name, artifact, false)
+      } catch { if (channel.readyState === 'open') channel.send(JSON.stringify({ type: 'artifact_missing', name: message.name })) }
+      finally { this.servingReads.delete(key) }
       return
     }
     if (message.type === 'artifact_missing' && typeof message.name === 'string') {
@@ -222,10 +228,12 @@ export class PeerMeshNode {
     }
     if (message.type === 'artifact_start') {
       const start = message as unknown as TransferStart
-      if (typeof start.transfer_id !== 'string' || start.transfer_id.length > 64 || !start.transfer_id || typeof start.name !== 'string' || !start.name || start.name.length > 128 || !Number.isSafeInteger(start.total_bytes) || start.total_bytes <= 0 || start.total_bytes > MAX_ARTIFACT_BYTES
+      if (typeof start.transfer_id !== 'string' || start.transfer_id.length > 64 || !start.transfer_id || typeof start.name !== 'string' || !validArtifactName(start.name) || !Number.isSafeInteger(start.total_bytes) || start.total_bytes <= 0 || start.total_bytes > MAX_ARTIFACT_BYTES
         || !Number.isSafeInteger(start.chunks) || start.chunks < 0 || start.chunks > Math.ceil(MAX_ARTIFACT_BYTES / CHUNK_BYTES)
         || !/^[a-f0-9]{64}$/i.test(start.sha256) || start.chunks !== Math.ceil(start.total_bytes / CHUNK_BYTES)) return
-      if (this.incoming.size >= MAX_CONCURRENT_TRANSFERS && !this.incoming.has(start.transfer_id)) {
+      // An existing transfer belongs to its original authenticated peer.
+      if (this.incoming.has(start.transfer_id)) return
+      if (this.incoming.size >= MAX_CONCURRENT_TRANSFERS) {
         channel.send(JSON.stringify({ type: 'artifact_nack', transfer_id: start.transfer_id, reason: 'receiver_busy' }))
         return
       }
@@ -236,13 +244,19 @@ export class PeerMeshNode {
       const index = Number(message.index)
       if (!Number.isSafeInteger(index)) return
       const transfer = this.incoming.get(message.transfer_id)
-      if (!transfer || index < 0 || index >= transfer.start.chunks || transfer.chunks.has(index)) return
+      if (!transfer || transfer.peerId !== peerId || index < 0 || index >= transfer.start.chunks || transfer.chunks.has(index)) return
       let bytes: Uint8Array
       try { bytes = decode(message.data) } catch { this.incoming.delete(message.transfer_id); return }
       if (bytes.length > CHUNK_BYTES || transfer.bytes + bytes.length > transfer.start.total_bytes) { this.incoming.delete(message.transfer_id); return }
       transfer.chunks.set(index, bytes)
       transfer.bytes += bytes.length
       transfer.lastActivity = at
+      const readKey = `${peerId}:${transfer.start.name}`
+      const activeRead = this.pendingArtifactReads.get(readKey)
+      if (activeRead) {
+        window.clearTimeout(activeRead.timer)
+        activeRead.timer = window.setTimeout(() => { this.pendingArtifactReads.delete(readKey); activeRead.reject(new Error('Shard transfer stopped making progress')) }, 45_000)
+      }
       if (transfer.chunks.size !== transfer.start.chunks) return
       const result = new Uint8Array(transfer.bytes)
       let offset = 0
@@ -276,13 +290,13 @@ export class PeerMeshNode {
 
   async sendArtifact(peerId: string, name: string, bytes: Uint8Array, persistLocally = true) {
     if (this.closed) throw new Error('Node connection closed')
-    if (!name || name.length > 128) throw new Error('Peer artifact names must contain 1–128 characters')
+    if (!validArtifactName(name)) throw new Error('Peer artifact names must contain 1–128 letters, numbers, dots, underscores or hyphens')
     if (!bytes.length) throw new Error('Peer artifacts must contain at least one byte')
     if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Peer artifact exceeds the 8 MiB transfer limit')
     this.onNotice(`Sending checkpoint artifact “${name}” to peer ${peerId}…`)
     // Give the local end-to-end harness a window to inject a peer failure while
     // a transfer is in flight. Production transfers are not delayed.
-    if (new URLSearchParams(location.search).get('mesh-e2e') === 'local') await new Promise(resolve => window.setTimeout(resolve, 750))
+    if (import.meta.env.DEV && new URLSearchParams(location.search).get('mesh-e2e') === 'local') await new Promise(resolve => window.setTimeout(resolve, 750))
     const deadline = Date.now() + 20_000
     let channel = this.channels.get(peerId)
     while ((!channel || channel.readyState !== 'open') && Date.now() < deadline) {
@@ -295,8 +309,7 @@ export class PeerMeshNode {
     const sha256 = await digest(bytes)
     const chunks = Math.ceil(bytes.length / CHUNK_BYTES)
     const acknowledged = new Promise<string>((resolve, reject) => {
-      const timer = window.setTimeout(() => { this.pending.delete(transferId); reject(new Error('Peer did not confirm the artifact before timeout')) }, 30_000)
-      this.pending.set(transferId, { peerId, resolve, reject, timer })
+      this.pending.set(transferId, { peerId, resolve, reject, timer: 0 })
     })
     // Disconnect can reject the acknowledgement while chunk sends are awaiting
     // backpressure. Observe it immediately, then propagate it at the await below.
@@ -304,9 +317,14 @@ export class PeerMeshNode {
     try {
       await this.sendFrame(channel, { type: 'artifact_start', transfer_id: transferId, name, total_bytes: bytes.length, chunks, sha256 } satisfies TransferStart)
       for (let index = 0; index < chunks; index++) {
+        if (!this.pending.has(transferId)) { await acknowledged; break }
         const part = bytes.subarray(index * CHUNK_BYTES, Math.min(bytes.length, (index + 1) * CHUNK_BYTES))
         await this.sendFrame(channel, { type: 'artifact_chunk', transfer_id: transferId, index, data: encode(part) } satisfies TransferChunk)
       }
+      // Allow slow links to keep making progress. Only start the receipt wait
+      // once every chunk has actually been queued, preserving early ACKs.
+      const pending = this.pending.get(transferId)
+      if (pending) pending.timer = window.setTimeout(() => { this.pending.delete(transferId); pending.reject(new Error('Peer did not confirm the artifact before timeout')) }, 30_000)
     } catch (error) {
       const pending = this.pending.get(transferId)
       if (pending) { window.clearTimeout(pending.timer); this.pending.delete(transferId) }
@@ -322,7 +340,7 @@ export class PeerMeshNode {
   }
 
   async storeArtifact(name: string, bytes: Uint8Array) {
-    if (!name || name.length > 128 || !bytes.length || bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Local shard is outside artifact limits')
+    if (!validArtifactName(name) || !bytes.length || bytes.length > MAX_ARTIFACT_BYTES) throw new Error('Local shard is outside artifact limits')
     const sha256 = await digest(bytes)
     await persistArtifact(`artifact:${name}`, { name, bytes: bytes.slice(), sha256, receivedAt: Date.now() })
     await this.onStored?.(name, sha256, bytes.length)
@@ -386,4 +404,3 @@ export class PeerMeshNode {
     this.pendingArtifactReads.clear()
   }
 }
-

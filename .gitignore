@@ -1,0 +1,10 @@
+node_modules/
+dist/
+server/target/
+test-results/
+playwright-report/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+mesh-state*.json
