@@ -2,6 +2,7 @@ export type ContributionSettings = { clusterId: string; enabled: boolean; dutyCy
 const TOKENS = 'mesh.node-tokens'
 const REMEMBERED = 'mesh.remembered-node-tokens'
 const SETTINGS = 'mesh.contribution-settings'
+const CHANNEL = 'mesh.contribution-controls'
 
 function read<T>(storage: Storage, key: string): Record<string, T> {
   try { const value: unknown = JSON.parse(storage.getItem(key) ?? '{}'); return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, T> : {} }
@@ -42,4 +43,32 @@ export function saveContributionSettings(id: string, value: ContributionSettings
   if (isRemembered(id)) persisted[id] = value
   else delete persisted[id]
   localStorage.setItem(SETTINGS, JSON.stringify(persisted))
+  // Session-only nodes can exist in duplicated tabs too. Broadcast controls
+  // without persisting a credential or opt-in that the user did not remember.
+  if (typeof BroadcastChannel !== 'undefined') {
+    const channel = new BroadcastChannel(CHANNEL)
+    channel.postMessage({ id, value }); channel.close()
+  }
+}
+
+export function subscribeContributionSettings(changed: (id: string, value: ContributionSettings) => void) {
+  const accept = (id: unknown, value: unknown) => {
+    if (typeof id !== 'string' || !getNodeTokens()[id] || !value || typeof value !== 'object') return
+    const item = value as Partial<ContributionSettings>
+    if (typeof item.clusterId !== 'string' || typeof item.enabled !== 'boolean') return
+    const normalized: ContributionSettings = { clusterId: item.clusterId, enabled: item.enabled,
+      dutyCycle: [10, 25, 50, 100].includes(item.dutyCycle ?? 0) ? item.dutyCycle! : 100,
+      allowCpuFallback: item.allowCpuFallback !== false, pauseWhenHidden: item.pauseWhenHidden === true }
+    // Replace this tab's stale session override without writing/broadcasting back.
+    sessionStorage.setItem(SETTINGS, JSON.stringify({ ...read<ContributionSettings>(sessionStorage, SETTINGS), [id]: normalized }))
+    changed(id, normalized)
+  }
+  const storageChanged = (event: StorageEvent) => {
+    if (event.storageArea !== localStorage || event.key !== SETTINGS || !event.newValue) return
+    try { for (const [id, value] of Object.entries(JSON.parse(event.newValue))) accept(id, value) } catch { /* Ignore malformed external storage. */ }
+  }
+  window.addEventListener('storage', storageChanged)
+  const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(CHANNEL) : null
+  if (channel) channel.onmessage = event => accept(event.data?.id, event.data?.value)
+  return () => { window.removeEventListener('storage', storageChanged); channel?.close() }
 }

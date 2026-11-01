@@ -27,6 +27,17 @@ struct TaskRecord {
     observation: Option<AttemptObservation>,
     #[serde(skip)]
     unavailable_at_ms: Option<u64>,
+    #[serde(skip)]
+    unavailable_reason: Option<AttemptEndReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptEndReason {
+    Disconnect,
+    Expiry,
+    Release,
+    Revoked,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -39,6 +50,10 @@ pub struct AttemptObservation {
     pub claimed_at_ms: u64,
     pub failure_detected_at_ms: Option<u64>,
     pub reassigned_at_ms: Option<u64>,
+    #[serde(default)]
+    pub previous_attempt_reason: Option<AttemptEndReason>,
+    #[serde(default)]
+    pub previous_attempt_ended_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -86,6 +101,8 @@ impl RecoveryLedger {
         for record in self.tasks.values_mut() {
             record.lease = None;
             record.unavailable_at_ms = None;
+            record.unavailable_reason = None;
+            record.observation = None;
         }
     }
 
@@ -101,12 +118,27 @@ impl RecoveryLedger {
                     record.lease = runtime.lease.clone();
                     record.observation = runtime.observation.clone();
                     record.unavailable_at_ms = runtime.unavailable_at_ms;
+                    record.unavailable_reason = runtime.unavailable_reason;
                 }
             }
         }
     }
 
     pub fn shorten_worker_leases(&mut self, worker_id: &str, now_ms: u64, grace_ms: u64) {
+        self.end_worker_attempts(worker_id, now_ms, grace_ms, AttemptEndReason::Disconnect);
+    }
+
+    pub fn revoke_worker_leases(&mut self, worker_id: &str, now_ms: u64) {
+        self.end_worker_attempts(worker_id, now_ms, 0, AttemptEndReason::Revoked);
+    }
+
+    fn end_worker_attempts(
+        &mut self,
+        worker_id: &str,
+        now_ms: u64,
+        grace_ms: u64,
+        reason: AttemptEndReason,
+    ) {
         let deadline = now_ms.saturating_add(grace_ms);
         for record in self.tasks.values_mut() {
             if let Some(lease) = record
@@ -114,7 +146,10 @@ impl RecoveryLedger {
                 .as_mut()
                 .filter(|lease| lease.worker_id == worker_id)
             {
-                record.unavailable_at_ms.get_or_insert(now_ms);
+                if record.unavailable_at_ms.is_none() {
+                    record.unavailable_at_ms = Some(now_ms);
+                    record.unavailable_reason = Some(reason);
+                }
                 lease.expires_at_ms = lease.expires_at_ms.min(deadline);
             }
         }
@@ -129,6 +164,7 @@ impl RecoveryLedger {
             {
                 lease.expires_at_ms = now_ms.saturating_add(duration_ms);
                 record.unavailable_at_ms = None;
+                record.unavailable_reason = None;
             }
         }
     }
@@ -146,6 +182,7 @@ impl RecoveryLedger {
                 result_digest: None,
                 observation: None,
                 unavailable_at_ms: None,
+                unavailable_reason: None,
             },
         );
         Ok(())
@@ -196,7 +233,21 @@ impl RecoveryLedger {
             .observation
             .as_ref()
             .map(|observation| observation.worker_id.clone());
-        let failure_detected_at_ms = record.unavailable_at_ms.take();
+        let expired = record.lease.is_some(); // A live unexpired lease was rejected above.
+        let previous_attempt_reason = record
+            .unavailable_reason
+            .take()
+            .or(expired.then_some(AttemptEndReason::Expiry));
+        let previous_attempt_ended_at_ms = record
+            .unavailable_at_ms
+            .take()
+            .or(expired.then_some(now_ms));
+        let failure_detected_at_ms = match previous_attempt_reason {
+            Some(AttemptEndReason::Disconnect | AttemptEndReason::Expiry) => {
+                previous_attempt_ended_at_ms
+            }
+            _ => None,
+        };
         record.observation = Some(AttemptObservation {
             worker_id: worker_id.clone(),
             previous_worker_id,
@@ -206,6 +257,8 @@ impl RecoveryLedger {
             claimed_at_ms: now_ms,
             failure_detected_at_ms,
             reassigned_at_ms: if generation > 1 { Some(now_ms) } else { None },
+            previous_attempt_reason,
+            previous_attempt_ended_at_ms,
         });
         let lease = TaskLease {
             task_id: task_id.to_owned(),
@@ -291,6 +344,9 @@ impl RecoveryLedger {
         for record in self.tasks.values_mut() {
             if record.result_digest.is_none() {
                 record.lease = None;
+                record.observation = None;
+                record.unavailable_at_ms = None;
+                record.unavailable_reason = None;
             }
         }
         Ok(self.coordinator_epoch)
@@ -328,8 +384,15 @@ impl RecoveryLedger {
         if !same_attempt(current, lease) {
             return Err(LeaseError::StaleLease);
         }
+        if record.unavailable_at_ms.is_none() {
+            record.unavailable_at_ms = Some(now_ms);
+            record.unavailable_reason = Some(if now_ms >= current.expires_at_ms {
+                AttemptEndReason::Expiry
+            } else {
+                AttemptEndReason::Release
+            });
+        }
         current.expires_at_ms = current.expires_at_ms.min(now_ms);
-        record.unavailable_at_ms.get_or_insert(now_ms);
         Ok(())
     }
 }
@@ -353,6 +416,13 @@ mod tests {
         let first = ledger.claim("batch", "a", 0, 100).unwrap();
         ledger.release(&first, 10).unwrap();
         let retry = ledger.claim("batch", "a", 11, 100).unwrap();
+        let released = ledger.observation("batch").unwrap();
+        assert_eq!(
+            released.previous_attempt_reason,
+            Some(AttemptEndReason::Release)
+        );
+        assert_eq!(released.previous_attempt_ended_at_ms, Some(10));
+        assert_eq!(released.failure_detected_at_ms, None);
         assert_eq!(ledger.release(&first, 12), Err(LeaseError::StaleLease));
         assert_eq!(
             ledger
@@ -370,9 +440,44 @@ mod tests {
         assert_eq!(observed.claimed_at_ms, 30);
         assert_eq!(observed.reassigned_at_ms, Some(30));
         assert_eq!(observed.failure_detected_at_ms, Some(20));
+        assert_eq!(
+            observed.previous_attempt_reason,
+            Some(AttemptEndReason::Disconnect)
+        );
         ledger.commit_result(&takeover, 40, "hash").unwrap();
         assert_eq!(ledger.release(&retry, 41), Err(LeaseError::AlreadyComplete));
         assert_eq!(ledger.observation("batch").unwrap(), observed);
+    }
+
+    #[test]
+    fn expiry_and_revocation_have_separate_causes_and_old_observations_load() {
+        let mut ledger = RecoveryLedger::default();
+        ledger.add_task("batch").unwrap();
+        ledger.claim("batch", "a", 0, 10).unwrap();
+        ledger.claim("batch", "b", 20, 100).unwrap();
+        let expired = ledger.observation("batch").unwrap();
+        assert_eq!(
+            expired.previous_attempt_reason,
+            Some(AttemptEndReason::Expiry)
+        );
+        assert_eq!(expired.failure_detected_at_ms, Some(20));
+        ledger.revoke_worker_leases("b", 30);
+        ledger.claim("batch", "c", 40, 100).unwrap();
+        let revoked = ledger.observation("batch").unwrap();
+        assert_eq!(
+            revoked.previous_attempt_reason,
+            Some(AttemptEndReason::Revoked)
+        );
+        assert_eq!(revoked.failure_detected_at_ms, None);
+        let mut old = serde_json::to_value(&expired).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("previous_attempt_reason");
+        old.as_object_mut()
+            .unwrap()
+            .remove("previous_attempt_ended_at_ms");
+        let old: AttemptObservation = serde_json::from_value(old).unwrap();
+        assert_eq!(old.previous_attempt_reason, None);
     }
 
     #[test]

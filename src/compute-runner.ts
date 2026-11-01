@@ -5,7 +5,7 @@ import { maintainLease } from './lease'
 import { PeerMeshNode, PeerTransferError } from './peer'
 import { delay, errorStatus, isCustodyConflict, isTransient, retryDelay, WorkWake } from './runner-policy'
 import { encode2Plus1, sha256Hex } from './sharding'
-import { createVectorAddExecutor, digestVectorAddResult, encodeVectorAddOutput, runVectorAddCpu } from './webgpu'
+import { createVectorAddExecutor, digestVectorAddResult, encodeVectorAddOutput, GpuValidationError, runVectorAddCpu } from './webgpu'
 
 export type RunnerState = {
   phase: 'waiting' | 'running' | 'backoff' | 'paused' | 'stopped' | 'error'; message: string;
@@ -78,6 +78,7 @@ export class ComputeRunner {
           await this.wakeEvent.wait(2_000, signal); continue
         }
         let claim: JobLease | null = null
+        let attemptCommitted = false
         let job: ComputeJob | undefined
         try {
           const jobs = await this.readJobs()
@@ -96,11 +97,18 @@ export class ComputeRunner {
             this.jobCursor = (this.jobCursor + index + 1) % candidates.length
             const began = performance.now()
             await this.execute(job, claim, mesh, claimedAt)
+            attemptCommitted = true
             this.failures = 0
             this.report({ completed: this.state.completed + 1, phase: 'waiting', message: 'Waiting for the next batch', lastError: undefined })
-            const updated = await this.readJobs()
-            this.options.jobs(updated)
-            if (this.options.jobId && updated.some(item => item.id === job!.id && item.completed_batches === item.total_batches)) {
+            // Observation failure after acceptance is not a failed compute attempt.
+            // The normal loop will read again without releasing committed work.
+            const updated = await this.readJobs().catch(error => {
+              if ([401, 403].includes(errorStatus(error) ?? 0)) throw error
+              this.report({ message: 'Batch committed; job refresh will retry', lastError: error instanceof Error ? error.message : 'Job refresh failed' })
+              return null
+            })
+            if (updated) this.options.jobs(updated)
+            if (this.options.jobId && updated?.some(item => item.id === job!.id && item.completed_batches === item.total_batches)) {
               this.options.notice(`All job batches completed and replicated (${this.state.executionMode})`); return
             }
             const cooldown = (performance.now() - began) * (100 / this.options.settings().dutyCycle - 1)
@@ -120,7 +128,7 @@ export class ComputeRunner {
           // A failed attempt never takes the contributor out of service.
           // Release only its exact fenced lease; an already committed attempt
           // or a reassigned lease is harmlessly rejected by the coordinator.
-          if (claim && job) await api(`/api/jobs/${job.id}/release`, {
+          if (claim && job && !attemptCommitted) await api(`/api/jobs/${job.id}/release`, {
             method: 'POST', body: JSON.stringify({ lease: claim.lease }), signal: AbortSignal.timeout(5_000),
           }).catch(() => undefined)
           if (job && (status === 400 || status === 422)) {
@@ -170,7 +178,7 @@ export class ComputeRunner {
             this.gpuReason = gpuFailure(error, 'WebGPU batch failed')
             // An invalid numerical result is never silently accepted by switching
             // execution mode. Device loss/unavailability can use an allowed fallback.
-            if (this.gpuReason.includes('validation failed')) throw new ApiError(422, this.gpuReason)
+            if (error instanceof GpuValidationError) throw new ApiError(422, this.gpuReason)
           }
         }
         lease.current()
