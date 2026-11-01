@@ -200,8 +200,8 @@ test('contributors survive more than a minute idle then automatically take over 
     await peers[0].page.getByRole('button', { name: 'Run on this node', exact: true }).click()
     await inFlight
     const read = () => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{
-      batch_index: number; sha256: string; worker_node_id: string; execution: { execution_mode: string; compute_ms: number; transfer_ms: number };
-      attempt: { generation: number; previous_worker_id: string | null; claimed_at_ms: number; failure_detected_at_ms: number | null; reassigned_at_ms: number | null }
+      batch_index: number; sha256: string; worker_node_id: string; committed_at_ms: number; execution: { execution_mode: string; compute_ms: number; transfer_ms: number };
+      attempt: { generation: number; previous_worker_id: string | null; claimed_at_ms: number; failure_detected_at_ms: number | null; reassigned_at_ms: number | null; previous_attempt_reason: string }
     }> }>>(identities[0], `/api/clusters/${clusterId}/jobs`)
     const first = (await read()).find(item => item.id === job.id)!.checkpoints[0]
     for (const peer of peers.slice(1)) await peer.page.getByRole('button', { name: 'Contribute compute', exact: true }).click()
@@ -217,6 +217,9 @@ test('contributors survive more than a minute idle then automatically take over 
     expect(takenOver.attempt.generation).toBeGreaterThan(1)
     expect(takenOver.attempt.previous_worker_id).toBe(nodes[0].node.id)
     expect(takenOver.attempt.failure_detected_at_ms).not.toBeNull()
+    expect(takenOver.attempt.previous_attempt_reason).toBe('disconnect')
+    expect(takenOver.committed_at_ms).toBeGreaterThanOrEqual(takenOver.attempt.failure_detected_at_ms!)
+    await expect(peers[nodes.findIndex(node => node.node.id === takenOver.worker_node_id)].page.locator('.execution-diagnostics')).toContainText('coordinator detection → commit')
     expect(takenOver.attempt.reassigned_at_ms).toBeGreaterThanOrEqual(takenOver.attempt.failure_detected_at_ms!)
     expect(['webgpu', 'cpu-fallback']).toContain(takenOver.execution.execution_mode)
     expect(takenOver.execution.transfer_ms).toBeGreaterThanOrEqual(0)
@@ -309,6 +312,116 @@ test('busy peers answer immediately and bounded transfer retries recover when ca
     } finally { sender.close(); receiver.close() }
   })
   expect(result).toEqual({ busyReplies: 2, bytes: 3, replies: ['artifact_busy'] })
+})
+
+test('stopping a remembered node in a second tab stops its lock-holding contributor', async ({ browser }) => {
+  const fixture = await threePeerFixture(browser)
+  try {
+    const first = fixture.peers[0].page
+    await first.getByLabel('Remember this device', { exact: true }).check()
+    await first.getByRole('button', { name: 'Contribute compute', exact: true }).click()
+    const second = await fixture.peers[0].context.newPage()
+    await second.goto(`${baseURL}/?mesh-e2e=local`)
+    await expect(second.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
+    await second.getByRole('button', { name: 'Stop contributing', exact: true }).click()
+    await expect(first.getByRole('button', { name: 'Contribute compute', exact: true })).toBeVisible()
+    expect(await first.evaluate(id => JSON.parse(sessionStorage.getItem('mesh.contribution-settings') ?? '{}')[id].enabled, fixture.nodes[0].node.id)).toBe(false)
+    const job = await api<{ id: string }>(fixture.identities[0], `/api/clusters/${fixture.clusterId}/jobs`, 'POST', { workload: 'cpu-hash', total_units: 1000, batch_units: 1000 })
+    // Stopping compute preserves the node's storage session.
+    await expect(first.getByText('Connected · storage verified', { exact: false })).toHaveCount(3)
+    await first.getByRole('button', { name: 'Contribute compute', exact: true }).click()
+    await waitFor(() => api<Array<{ id: string; completed_batches: number }>>(fixture.identities[0], `/api/clusters/${fixture.clusterId}/jobs`),
+      jobs => jobs.some(item => item.id === job.id && item.completed_batches === 1), 'work after cross-tab restart')
+  } finally { await fixture.close() }
+})
+
+test('a bare proxy 404 during reconnect retains the remembered device and opt-in', async ({ browser }) => {
+  const fixture = await threePeerFixture(browser)
+  const { peers, nodes, clusterId } = fixture
+  try {
+    const page = peers[0].page
+    await page.getByLabel('Remember this device', { exact: true }).check()
+    await page.getByRole('button', { name: 'Contribute compute', exact: true }).click()
+    await peers[0].context.addInitScript(() => {
+      const NativeSocket = window.WebSocket
+      const sockets: WebSocket[] = []
+      window.WebSocket = class extends NativeSocket {
+        constructor(url: string | URL, protocols?: string | string[]) { super(url, protocols); sockets.push(this) }
+      }
+      Object.assign(window, { dropTestSockets: () => sockets.forEach(socket => socket.close()) })
+    })
+    await page.reload()
+    await expect(page.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
+    let outage = true
+    let denials = 0
+    await page.route(`**/api/clusters/${clusterId}/nodes`, async route => {
+      if (outage) { denials++; await route.fulfill({ status: 404, contentType: 'text/plain', body: 'proxy restarting' }) }
+      else await route.continue()
+    })
+    await page.evaluate(() => (window as unknown as { dropTestSockets(): void }).dropTestSockets())
+    await expect.poll(() => denials).toBeGreaterThan(0)
+    await expect.poll(() => page.evaluate(id => ({ token: Boolean(JSON.parse(localStorage.getItem('mesh.remembered-node-tokens') ?? '{}')[id]),
+      enabled: JSON.parse(localStorage.getItem('mesh.contribution-settings') ?? '{}')[id]?.enabled }), nodes[0].node.id)).toEqual({ token: true, enabled: true })
+    outage = false
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await expect(page.getByText('Connected · storage verified', { exact: false })).toHaveCount(3)
+    await expect(page.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
+  } finally { await fixture.close() }
+})
+
+test('a job-list failure after commit does not release accepted work or count a compute retry', async ({ browser }) => {
+  const fixture = await threePeerFixture(browser)
+  const { peers, identities, clusterId } = fixture
+  try {
+    const page = peers[0].page
+    const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', { workload: 'cpu-hash', total_units: 1000, batch_units: 1000 })
+    let failRead = false
+    let failedRead = false
+    let releases = 0
+    await page.route(`**/api/jobs/${job.id}/release`, async route => { releases++; await route.continue() })
+    await page.route(`**/api/jobs/${job.id}/commit`, async route => {
+      const response = await route.fetch()
+      expect(response.status()).toBe(204)
+      failRead = true
+      await route.fulfill({ response })
+    })
+    await page.route(`**/api/clusters/${clusterId}/jobs`, async route => {
+      if (failRead && !failedRead) { failedRead = true; await route.fulfill({ status: 503, body: 'temporary list outage' }) }
+      else await route.continue()
+    })
+    await page.getByRole('button', { name: 'Contribute compute', exact: true }).click()
+    await expect.poll(() => failedRead).toBe(true)
+    await expect(page.locator('.contributor-controls').first()).toContainText('1 batches completed · 0 retries')
+    await expect(page.locator('.contributor-controls').first()).toContainText('Waiting for available work')
+    expect(releases).toBe(0)
+  } finally { await fixture.close() }
+})
+
+test('typed GPU validation errors quarantine invalid results while other jobs still execute', async ({ browser }) => {
+  const fixture = await threePeerFixture(browser)
+  const { peers, identities, clusterId } = fixture
+  try {
+    await peers[0].page.evaluate(async () => {
+      const path = '/src/webgpu.ts'
+      const { GpuValidationError } = await import(path)
+      const buffer = { destroy() {}, mapAsync: async () => {}, unmap() {}, getMappedRange() { throw new GpuValidationError('Numerical output rejected') } }
+      const pass = { setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {}, end() {} }
+      Object.defineProperty(navigator, 'gpu', { configurable: true, value: { requestAdapter: async () => ({ requestDevice: async () => ({
+        lost: new Promise(() => {}), destroy() {}, limits: { maxStorageBufferBindingSize: 1_000_000, maxBufferSize: 1_000_000 },
+        queue: { writeBuffer() {}, submit() {} }, createBuffer() { return buffer }, createShaderModule() { return {} },
+        createComputePipeline() { return { getBindGroupLayout() { return {} } } }, createBindGroup() {},
+        createCommandEncoder() { return { beginComputePass() { return pass }, copyBufferToBuffer() {}, finish() {} } },
+      }) }) } })
+    })
+    const invalid = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', { workload: 'vector-add', total_units: 1000, batch_units: 1000 })
+    await peers[0].page.getByRole('button', { name: 'Contribute compute', exact: true }).click()
+    await expect(peers[0].page.locator('.contributor-controls').first()).toContainText('Numerical output rejected')
+    const valid = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', { workload: 'cpu-hash', total_units: 1000, batch_units: 1000 })
+    const current = await waitFor(() => api<Array<{ id: string; completed_batches: number }>>(identities[0], `/api/clusters/${clusterId}/jobs`),
+      jobs => jobs.some(item => item.id === valid.id && item.completed_batches === 1), 'other work after validation quarantine')
+    expect(current.find(item => item.id === invalid.id)?.completed_batches).toBe(0)
+    await expect(peers[0].page.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
+  } finally { await fixture.close() }
 })
 
 test('GPU device loss has an explicit per-batch CPU fallback and diagnostic reason', async ({ browser }) => {

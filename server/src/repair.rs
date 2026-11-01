@@ -412,6 +412,7 @@ mod tests {
             connections.insert(
                 id,
                 NodeConnection {
+                    signal_budget: crate::delivery::SignalBudget::default(),
                     session_id: Uuid::new_v4(),
                     cluster_id: cluster,
                     sender: sender.into(),

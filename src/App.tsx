@@ -3,12 +3,11 @@ import { Activity, ArrowRight, Boxes, Check, Copy, Cpu, Link2, LogOut, Pause, Pl
 import { PeerMeshNode } from './peer'
 import { HolderCustody } from './custody'
 import { executeRepair, type RepairTask } from './repair'
-import { api, getIdentity } from './api'
+import { api, getIdentity, isRevokedAccess } from './api'
 import { ComputeRunner, type RunnerState } from './compute-runner'
 import { ContributorControls } from './ContributorControls'
-import { allContributionSettings, forgetNode, getNodeTokens, isRemembered, rememberNode, saveContributionSettings, setNodeToken, type ContributionSettings } from './contribution-settings'
+import { allContributionSettings, forgetNode, getNodeTokens, isRemembered, rememberNode, saveContributionSettings, setNodeToken, subscribeContributionSettings, type ContributionSettings } from './contribution-settings'
 import type { ClusterNode as Node, ComputeCheckpoint, ComputeJob } from './compute-types'
-import { errorStatus } from './runner-policy'
 import { reconstruct2Plus1, sha256Hex, type EncodedShard } from './sharding'
 
 type Cluster = { id: string; name: string; role: 'owner' | 'member'; members: number; nodes: number; online_nodes: number }
@@ -32,7 +31,10 @@ function checkpointDiagnostics(checkpoint: ComputeCheckpoint) {
   const execution = checkpoint.execution
   const attempt = checkpoint.attempt
   const timings = execution ? `${execution.execution_mode} · self-reported: compute ${execution.compute_ms.toFixed(1)} ms, CPU validation ${execution.validation_ms.toFixed(1)} ms, encoding ${execution.encoding_ms.toFixed(1)} ms, transfer ${execution.transfer_ms.toFixed(1)} ms${execution.fallback_reason ? ` · ${execution.fallback_reason}` : ''}` : 'Execution timings unavailable for this older checkpoint'
-  const recovery = attempt?.failure_detected_at_ms != null && attempt.reassigned_at_ms != null ? ` · coordinator detection → claim ${attempt.reassigned_at_ms-attempt.failure_detected_at_ms} ms` : ''
+  const reason = attempt?.previous_attempt_reason
+  const end = attempt?.previous_attempt_ended_at_ms
+  const failure = reason === 'disconnect' || reason === 'expiry'
+  const recovery = reason ? ` · previous attempt: ${reason}${failure && attempt?.failure_detected_at_ms != null && checkpoint.committed_at_ms != null ? ` · coordinator detection → commit ${Math.max(0,checkpoint.committed_at_ms-attempt.failure_detected_at_ms)} ms` : !failure && end != null && checkpoint.committed_at_ms != null ? ` → commit ${Math.max(0,checkpoint.committed_at_ms-end)} ms` : ''}` : ''
   return `Worker ${checkpoint.worker_node_id?.slice(0,8) ?? 'unknown'}${attempt ? ` · generation ${attempt.generation}${attempt.previous_worker_id && attempt.previous_worker_id !== attempt.worker_id ? ' · different-worker takeover' : ''}` : ''} · ${timings}${recovery}`
 }
 
@@ -148,6 +150,15 @@ function App() {
   }, [activeId])
 
   useEffect(() => () => { for (const runner of runners.current.values()) runner.stop(); for (const id of sockets.current.keys()) stopBrowserNode(id) }, [])
+
+  useEffect(() => subscribeContributionSettings((id, settings) => {
+    contributionOptions.current = { ...contributionOptions.current, [id]: settings }
+    setContributions(contributionOptions.current)
+    if (!settings.enabled) runners.current.get(id)?.stop()
+    else runners.current.get(id)?.wake()
+    // Re-read membership before restoring any newly enabled contributor.
+    if (settings.enabled) void refreshClusters(activeSelection.current).catch(() => undefined)
+  }), [])
 
   useEffect(() => {
     const reconnect = () => {
@@ -332,7 +343,7 @@ function App() {
           stopContributor(id); forgetNode(id); stopBrowserNode(id)
         }
       }).catch(error => {
-        if (sockets.current.get(id) === connection && [401, 403, 404].includes(errorStatus(error) ?? 0)) {
+        if (sockets.current.get(id) === connection && isRevokedAccess(error)) {
           stopContributor(id); forgetNode(id); stopBrowserNode(id)
           setError('This node no longer has cluster access. Its local contributor has stopped.')
         }
@@ -444,7 +455,7 @@ function App() {
     })
   }
   function toggleContribution(node: Node) {
-    if (runners.current.has(node.id)) { stopContributor(node.id); return }
+    if (settingsFor(node).enabled || runners.current.has(node.id)) { stopContributor(node.id); return }
     const connection = sockets.current.get(node.id)
     if (!connection?.hasLock || connection.socket?.readyState !== WebSocket.OPEN) {
       setError('Wait for this browser node to connect. If it is active in another tab, manage its compute there.'); return

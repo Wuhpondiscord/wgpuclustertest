@@ -103,7 +103,7 @@ impl Store {
         for id in current.nodes.keys() {
             if !self.nodes.get(id).is_some_and(|node| !node.paused) {
                 self.recovery
-                    .shorten_worker_leases(&id.to_string(), now_ms(), 0);
+                    .revoke_worker_leases(&id.to_string(), now_ms());
             }
         }
     }
@@ -229,6 +229,7 @@ struct NodeConnection {
     sender: delivery::Outbound,
     receipt_nonce: String,
     receipt_key: Option<String>,
+    signal_budget: delivery::SignalBudget,
 }
 
 #[derive(Deserialize)]
@@ -363,7 +364,11 @@ struct InviteCreated {
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, self.1).into_response()
+        (
+            self.0,
+            Json(serde_json::json!({"source":"mesh-coordinator","error":self.1})),
+        )
+            .into_response()
     }
 }
 type ApiResult<T> = Result<T, ApiError>;
@@ -1924,7 +1929,7 @@ async fn set_node_paused(
         if paused {
             store
                 .recovery
-                .shorten_worker_leases(&id.to_string(), now_ms(), 0);
+                .revoke_worker_leases(&id.to_string(), now_ms());
         }
         Ok(summary)
     })
@@ -1994,7 +1999,7 @@ async fn delete_node(
         store.nodes.remove(&id);
         store
             .recovery
-            .shorten_worker_leases(&id.to_string(), now_ms(), 0);
+            .revoke_worker_leases(&id.to_string(), now_ms());
         Ok(())
     })
     .await?;
@@ -2027,7 +2032,7 @@ fn end_removed_node_sessions(state: &AppState, ids: &[Uuid]) {
         for id in ids {
             store
                 .recovery
-                .shorten_worker_leases(&id.to_string(), now_ms(), 0);
+                .revoke_worker_leases(&id.to_string(), now_ms());
         }
     }
 }
@@ -2088,6 +2093,10 @@ fn register_node_connection(
         } else {
             return false;
         }
+        let signal_budget = connections
+            .get(&id)
+            .map(|connection| connection.signal_budget.clone())
+            .unwrap_or_default();
         let previous = connections.insert(
             id,
             NodeConnection {
@@ -2096,6 +2105,7 @@ fn register_node_connection(
                 sender,
                 receipt_nonce,
                 receipt_key: None,
+                signal_budget,
             },
         );
         if let Some(previous) = previous {
@@ -2263,7 +2273,10 @@ async fn route_peer_signal(state: &AppState, from_id: Uuid, session_id: Uuid, te
     let Some(payload) = value.get("payload") else {
         return;
     };
-    if serde_json::to_vec(payload).map_or(true, |bytes| bytes.len() > 32 * 1024) {
+    let Ok(payload_bytes) = serde_json::to_vec(payload) else {
+        return;
+    };
+    if payload_bytes.len() > 32 * 1024 || peer_id == from_id {
         return;
     }
     let same_active_cluster = state.store.lock().ok().is_some_and(|store| {
@@ -2278,7 +2291,7 @@ async fn route_peer_signal(state: &AppState, from_id: Uuid, session_id: Uuid, te
     if !same_active_cluster {
         return;
     }
-    let Ok(connections) = state.node_connections.lock() else {
+    let Ok(mut connections) = state.node_connections.lock() else {
         return;
     };
     let Some(from) = connections
@@ -2294,10 +2307,18 @@ async fn route_peer_signal(state: &AppState, from_id: Uuid, session_id: Uuid, te
         return;
     };
     let sender = to.sender.clone();
+    if !connections.get_mut(&from_id).is_some_and(|from| {
+        from.signal_budget
+            .allow(payload_bytes.len(), Instant::now())
+    }) {
+        return;
+    }
     drop(connections);
     let forwarded =
         serde_json::json!({"type":"signal","peer_node_id":from_id,"payload":payload}).to_string();
-    let _ = sender.try_send(Message::Text(forwarded));
+    // A peer controls this traffic. Congestion must not invalidate its target's
+    // session or consume the capacity reserved for authoritative messages.
+    sender.optional(Message::Text(forwarded));
 }
 
 fn node_reply(
@@ -2885,6 +2906,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["source"], "mesh-coordinator");
+        assert!(error["error"].is_string());
         let response = router
             .clone()
             .oneshot(
@@ -3545,6 +3573,38 @@ mod tests {
         let forwarded: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
         assert_eq!(forwarded["peer_node_id"], sender_id.to_string());
         assert!(other_rx.try_recv().is_err());
+
+        // A malicious source must not evict a slow destination's session or
+        // consume its critical reserve, even if it reconnects over an active socket.
+        for _ in 0..1000 {
+            route_peer_signal(&state, sender_id, sender_session, &signal).await;
+        }
+        let target = state
+            .node_connections
+            .lock()
+            .unwrap()
+            .get(&same_cluster_id)
+            .unwrap()
+            .sender
+            .clone();
+        target
+            .try_send(Message::Text("critical-receipt".into()))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), target.failed())
+                .await
+                .is_err()
+        );
+        let mut received = Vec::new();
+        while let Ok(message) = same_rx.try_recv() {
+            received.push(message);
+        }
+        assert!(received.contains(&Message::Text("critical-receipt".into())));
+        let replacement = Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert!(register_node_connection(&state, sender_id, replacement, tx));
+        route_peer_signal(&state, sender_id, sender_session, &signal).await;
+        assert!(same_rx.try_recv().is_err());
 
         let cross_cluster = serde_json::json!({"type":"signal","peer_node_id":other_cluster_id,"payload":{"description":{"type":"offer","sdp":"test"}}}).to_string();
         route_peer_signal(&state, sender_id, sender_session, &cross_cluster).await;

@@ -5,7 +5,40 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Instant;
 use tokio::sync::{mpsc, Notify};
+
+// Per sending node/session, bounded by both message count and payload bytes.
+// This is runtime-only; replacing an active socket preserves its budget.
+#[derive(Clone)]
+pub(crate) struct SignalBudget {
+    messages: f64,
+    bytes: f64,
+    updated: Instant,
+}
+impl Default for SignalBudget {
+    fn default() -> Self {
+        Self {
+            messages: 128.0,
+            bytes: 524_288.0,
+            updated: Instant::now(),
+        }
+    }
+}
+impl SignalBudget {
+    pub(crate) fn allow(&mut self, bytes: usize, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        self.updated = now;
+        self.messages = (self.messages + elapsed * 32.0).min(128.0);
+        self.bytes = (self.bytes + elapsed * 131_072.0).min(524_288.0);
+        if self.messages < 1.0 || self.bytes < bytes as f64 {
+            return false;
+        }
+        self.messages -= 1.0;
+        self.bytes -= bytes as f64;
+        true
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Outbound {
@@ -34,9 +67,18 @@ impl Outbound {
         result
     }
     pub(crate) fn hint(&self, message: Message) {
-        // Hints carry no authoritative state. Polling supplies missed hints,
-        // and a hint must never displace a receipt or control response.
-        let _ = self.sender.try_send(message);
+        self.optional(message);
+    }
+    pub(crate) fn optional(&self, message: Message) {
+        // Reserve capacity for control and receipts. Check AFTER reserving a
+        // permit so simultaneous optional producers cannot consume the reserve.
+        // Hints have polling fallback; signaling can retry on peer rediscovery.
+        let reserve = (self.sender.max_capacity() / 4).clamp(1, 16);
+        if let Ok(permit) = self.sender.try_reserve() {
+            if self.sender.capacity() >= reserve {
+                permit.send(message);
+            }
+        }
     }
     pub(crate) fn invalidate(&self) {
         self.failed.store(true, Ordering::Release);
@@ -70,5 +112,41 @@ mod tests {
         outbound.hint(Message::Text("work_available".into()));
         assert!(!outbound.failed.load(Ordering::Acquire));
         assert_eq!(receiver.recv().await, Some(Message::Text("receipt".into())));
+    }
+
+    #[tokio::test]
+    async fn optional_flood_leaves_capacity_for_critical_delivery() {
+        let (sender, mut receiver) = mpsc::channel(128);
+        let outbound = Outbound::from(sender);
+        for _ in 0..1000 {
+            outbound.hint(Message::Text("hint".into()));
+            outbound.optional(Message::Text("signal".into()));
+        }
+        assert_eq!(outbound.sender.capacity(), 16);
+        outbound.try_send(Message::Text("control".into())).unwrap();
+        assert!(!outbound.failed.load(Ordering::Acquire));
+        let mut control = false;
+        while let Ok(message) = receiver.try_recv() {
+            control |= message == Message::Text("control".into());
+        }
+        assert!(control);
+    }
+
+    #[test]
+    fn signal_budget_limits_count_and_bytes_and_refills_without_deny_extension() {
+        let mut budget = SignalBudget::default();
+        let at = budget.updated;
+        for _ in 0..128 {
+            assert!(budget.allow(1, at));
+        }
+        assert!(!budget.allow(1, at));
+        assert!(budget.allow(1, at + std::time::Duration::from_millis(32)));
+        let mut budget = SignalBudget::default();
+        let at = budget.updated;
+        for _ in 0..16 {
+            assert!(budget.allow(32_768, at));
+        }
+        assert!(!budget.allow(1, at));
+        assert!(budget.allow(32_768, at + std::time::Duration::from_millis(250)));
     }
 }

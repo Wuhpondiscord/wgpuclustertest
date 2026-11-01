@@ -5,6 +5,10 @@ type GpuBuffer = {
   unmap(): void
 }
 
+export class GpuValidationError extends Error {
+  constructor(message = 'WebGPU batch validation failed; result was not checkpointed.') { super(message); this.name = 'GpuValidationError' }
+}
+
 type GpuComputePass = {
   setPipeline(pipeline: unknown): void
   setBindGroup(index: number, group: unknown): void
@@ -85,7 +89,7 @@ export async function digestVectorAddResult(values: Float32Array) {
   return Array.from(new Uint8Array(result), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
-/** Creates a bounded WebGPU vector-add worker, or null when WebGPU is unavailable. */
+/** Creates a bounded WebGPU vector-add executor, or null when WebGPU is unavailable. */
 export async function createVectorAddExecutor() {
   const gpu = (navigator as Navigator & { gpu?: GpuNavigator }).gpu
   if (!gpu) return null
@@ -146,7 +150,7 @@ export async function createVectorAddExecutor() {
         const validationStarted = performance.now()
         for (let i = 0; i < count; i++) {
           const expected = Math.fround(left[i] + right[i])
-          if (!Number.isFinite(result[i]) || result[i] !== expected) throw new Error('WebGPU batch validation failed; result was not checkpointed.')
+          if (!Number.isFinite(result[i]) || result[i] !== expected) throw new GpuValidationError()
         }
         validationMs = performance.now() - validationStarted
         return result
