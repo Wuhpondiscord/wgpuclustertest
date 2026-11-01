@@ -9,7 +9,7 @@ Use three separate browser devices, A, B and C. Join with the cluster invite, th
 3. Keep the node tabs open and devices awake. Create a CPU demo, click **Run on this node**, let it finish, then run **Test restore**.
 4. Create a WebGPU job and run it on A. The completion notice identifies `webgpu` or `cpu-fallback`. A CPU fallback validates transport and recovery but does not validate your GPU or driver.
 
-The current workloads execute bounded independent batches on the browser where **Run on this node** is clicked. The coordinator schedules leases; other devices store checkpoint shards. This is not one GPU kernel spread across three devices.
+Workloads execute independent bounded batches on manually selected or opted-in contributing browsers. The coordinator schedules leases and peers store checkpoint shards; a single GPU kernel is not spread across devices.
 
 ## Trial 1: lose a storage holder while A continues computing
 
@@ -26,13 +26,13 @@ Also finish one job with all three connected, disconnect B afterward, then run *
 
 ## Trial 2: lose the device doing the computation
 
-Reconnect all three devices, create a fresh job, and run it on A. Disconnect A during an unfinished batch. Wait until A is marked offline, then click **Run on this node** on B.
+Reconnect all three devices, create a fresh job, and run it on A. Enable **Contribute compute** on B and C, then disconnect A during an unfinished batch. The survivors can remain idle while A holds the last unfinished batch.
 
 Expected results:
 
 - Already committed batches remain committed.
 - B completes independent pending batches and reclaims the interrupted batch after its old lease expires. Two connected devices are sufficient to resume with full copies.
-- There is no automatic compute takeover until a survivor is told to run the job. The storage repair loop is automatic, but compute participation is currently explicit.
+- Opted-in contributors reclaim work automatically after lease expiry; no second button press is required. A connected storage-only node must explicitly opt in or use **Run on this node** to compute.
 
 A clean browser socket close is usually detected promptly. A network blackhole can take roughly a minute to be declared offline, followed by the worker's ten-second reconnect grace. Allow this time before treating a reclaim wait as a failure.
 

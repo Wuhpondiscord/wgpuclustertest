@@ -29,6 +29,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "server -> target"
       - run: cargo fmt --manifest-path server/Cargo.toml --check
       - run: cargo clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path server/Cargo.toml --locked
@@ -68,6 +70,8 @@ jobs:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "server -> target"
       - run: npm ci --no-audit --no-fund
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e

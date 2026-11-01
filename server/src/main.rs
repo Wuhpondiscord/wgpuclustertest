@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use mesh_coordinator::recovery;
 mod custody;
+mod delivery;
 mod repair;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";
@@ -101,11 +102,8 @@ impl Store {
         // Durable removals and pauses must win over runtime lease preservation.
         for id in current.nodes.keys() {
             if !self.nodes.get(id).is_some_and(|node| !node.paused) {
-                self.recovery.shorten_worker_leases(
-                    &id.to_string(),
-                    now().saturating_mul(1_000),
-                    0,
-                );
+                self.recovery
+                    .shorten_worker_leases(&id.to_string(), now_ms(), 0);
             }
         }
     }
@@ -152,6 +150,41 @@ struct BatchOutput {
     holder_proofs: Vec<custody::HolderProof>,
     #[serde(default)]
     manifest_revision: u64,
+    #[serde(default)]
+    execution: Option<ExecutionReport>,
+    #[serde(default)]
+    attempt: Option<recovery::AttemptObservation>,
+    #[serde(default)]
+    committed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExecutionReport {
+    execution_mode: String,
+    fallback_reason: Option<String>,
+    compute_ms: f64,
+    validation_ms: f64,
+    encoding_ms: f64,
+    transfer_ms: f64,
+}
+impl ExecutionReport {
+    fn valid(&self) -> bool {
+        matches!(
+            self.execution_mode.as_str(),
+            "webgpu" | "cpu-fallback" | "cpu"
+        ) && self
+            .fallback_reason
+            .as_ref()
+            .is_none_or(|reason| reason.len() <= 512 && !reason.chars().any(char::is_control))
+            && [
+                self.compute_ms,
+                self.validation_ms,
+                self.encoding_ms,
+                self.transfer_ms,
+            ]
+            .iter()
+            .all(|ms| ms.is_finite() && *ms >= 0.0 && *ms <= 86_400_000.0)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -193,7 +226,7 @@ struct DurabilityRuntime {
 struct NodeConnection {
     session_id: Uuid,
     cluster_id: Uuid,
-    sender: tokio::sync::mpsc::Sender<Message>,
+    sender: delivery::Outbound,
     receipt_nonce: String,
     receipt_key: Option<String>,
 }
@@ -234,6 +267,8 @@ struct CommitBatch {
     shards: Vec<ShardReceipt>,
     sha256: String,
     bytes: u64,
+    #[serde(default)]
+    execution: Option<ExecutionReport>,
 }
 #[derive(Deserialize)]
 struct JoinInvite {
@@ -277,6 +312,10 @@ struct CheckpointSummary {
     verified_holders: usize,
     durability: String,
     manifest_revision: u64,
+    worker_node_id: Uuid,
+    committed_at_ms: u64,
+    execution: Option<ExecutionReport>,
+    attempt: Option<recovery::AttemptObservation>,
 }
 #[derive(Serialize)]
 struct JobSummary {
@@ -433,6 +472,14 @@ fn job_summary(job: &ComputeJob, store: &Store) -> JobSummary {
             let threshold = if output.shards.len() == 3 { 2 } else { 1 };
             CheckpointSummary {
                 batch_index: *batch_index,
+                worker_node_id: output.worker_node_id,
+                committed_at_ms: if output.committed_at_ms == 0 {
+                    output.committed_at.saturating_mul(1000)
+                } else {
+                    output.committed_at_ms
+                },
+                execution: output.execution.clone(),
+                attempt: output.attempt.clone(),
                 sha256: output.sha256.clone(),
                 bytes: output.bytes,
                 shards: output.shards.clone(),
@@ -1044,6 +1091,7 @@ async fn create_job(
         Ok(summary)
     })
     .await?;
+    notify_work_available(&state, cluster_id);
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -1106,7 +1154,7 @@ async fn claim_job_batch(
                 "The worker node must be online and active".into(),
             ));
         }
-        let now_ms = now().saturating_mul(1_000);
+        let now_ms = now_ms();
         let total_batches = job.total_units.div_ceil(job.batch_units);
         for batch_index in 0..total_batches {
             if job.outputs.contains_key(&batch_index) {
@@ -1141,8 +1189,90 @@ async fn claim_job_batch(
         }
         Ok(None)
     })(&mut current)?;
+    if let Some(claim) = result.as_ref() {
+        coordinator_event(
+            "batch_claimed",
+            serde_json::json!({"job_id":job_id,"worker_node_id":claim.lease.worker_id,"generation":claim.lease.generation,"attempt_id":claim.lease.attempt_id}),
+        );
+    }
     Ok(Json(result))
 }
+async fn release_job_batch(
+    State(state): State<AppState>,
+    Path(job_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<RenewJob>,
+) -> ApiResult<StatusCode> {
+    let user = identity(&headers)?;
+    let cluster_id = {
+        let mut store = state.store.lock().map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Store unavailable".into(),
+            )
+        })?;
+        let job = store
+            .jobs
+            .get(&job_id)
+            .ok_or(ApiError(StatusCode::NOT_FOUND, "Job not found".into()))?;
+        require_member(&store, job.cluster_id, &user)?;
+        let cluster_id = job.cluster_id;
+        let worker_id = Uuid::parse_str(&input.lease.worker_id)
+            .map_err(|_| ApiError(StatusCode::FORBIDDEN, "Invalid worker".into()))?;
+        if !input.lease.task_id.starts_with(&format!("{job_id}:"))
+            || !store
+                .nodes
+                .get(&worker_id)
+                .is_some_and(|node| node.cluster_id == cluster_id && node.owner_id == user)
+        {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "The lease does not belong to this worker and job".into(),
+            ));
+        }
+        store
+            .recovery
+            .release(&input.lease, now_ms())
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "The lease is complete or no longer current".into(),
+                )
+            })?;
+        cluster_id
+    };
+    notify_work_available(&state, cluster_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn notify_work_available(state: &AppState, cluster_id: Uuid) {
+    if let Ok(connections) = state.node_connections.lock() {
+        for connection in connections
+            .values()
+            .filter(|connection| connection.cluster_id == cluster_id)
+        {
+            connection
+                .sender
+                .hint(Message::Text("{\"type\":\"work_available\"}".into()));
+        }
+    }
+}
+
+fn coordinator_event(event: &str, details: serde_json::Value) {
+    eprintln!(
+        "{}",
+        serde_json::json!({"event":event,"server_at_ms":now_ms(),"details":details})
+    );
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 async fn renew_job_batch(
     State(state): State<AppState>,
     Path(job_id): Path<Uuid>,
@@ -1198,11 +1328,7 @@ async fn renew_job_batch(
     }
     let renewed = store
         .recovery
-        .renew(
-            &input.lease,
-            now().saturating_mul(1_000),
-            JOB_LEASE_DURATION_MS,
-        )
+        .renew(&input.lease, now_ms(), JOB_LEASE_DURATION_MS)
         .map_err(|_| {
             ApiError(
                 StatusCode::CONFLICT,
@@ -1218,6 +1344,16 @@ async fn commit_job_batch(
     Json(input): Json<CommitBatch>,
 ) -> ApiResult<StatusCode> {
     let user = identity(&headers)?;
+    if input
+        .execution
+        .as_ref()
+        .is_some_and(|report| !report.valid())
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid self-reported execution metrics".into(),
+        ));
+    }
     if input.bytes == 0
         || input.bytes > MAX_PEER_ARTIFACT_BYTES
         || input.sha256.len() != 64
@@ -1367,11 +1503,7 @@ async fn commit_job_batch(
             .map_err(|message| ApiError(StatusCode::CONFLICT, message))?;
         store
             .recovery
-            .commit_result(
-                &input.lease,
-                now().saturating_mul(1_000),
-                input.sha256.clone(),
-            )
+            .commit_result(&input.lease, now_ms(), input.sha256.clone())
             .map_err(|error| match error {
                 recovery::LeaseError::LeaseExpired => ApiError(
                     StatusCode::CONFLICT,
@@ -1385,6 +1517,7 @@ async fn commit_job_batch(
                     "The result could not be committed".into(),
                 ),
             })?;
+        let observation = store.recovery.observation(&input.lease.task_id);
         store
             .jobs
             .get_mut(&job_id)
@@ -1393,6 +1526,9 @@ async fn commit_job_batch(
             .insert(
                 batch_index,
                 BatchOutput {
+                    execution: input.execution.clone(),
+                    attempt: observation,
+                    committed_at_ms: now_ms(),
                     sha256: input.sha256.clone(),
                     bytes: input.bytes,
                     worker_node_id: worker_id,
@@ -1406,6 +1542,18 @@ async fn commit_job_batch(
         Ok(())
     })
     .await?;
+    let cluster_id = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|store| store.jobs.get(&job_id).map(|job| job.cluster_id));
+    if let Some(cluster_id) = cluster_id {
+        coordinator_event(
+            "checkpoint_published",
+            serde_json::json!({"job_id":job_id,"cluster_id":cluster_id}),
+        );
+        notify_work_available(&state, cluster_id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn delete_cluster(
@@ -1776,7 +1924,7 @@ async fn set_node_paused(
         if paused {
             store
                 .recovery
-                .shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), 0);
+                .shorten_worker_leases(&id.to_string(), now_ms(), 0);
         }
         Ok(summary)
     })
@@ -1846,7 +1994,7 @@ async fn delete_node(
         store.nodes.remove(&id);
         store
             .recovery
-            .shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), 0);
+            .shorten_worker_leases(&id.to_string(), now_ms(), 0);
         Ok(())
     })
     .await?;
@@ -1879,7 +2027,7 @@ fn end_removed_node_sessions(state: &AppState, ids: &[Uuid]) {
         for id in ids {
             store
                 .recovery
-                .shorten_worker_leases(&id.to_string(), now().saturating_mul(1_000), 0);
+                .shorten_worker_leases(&id.to_string(), now_ms(), 0);
         }
     }
 }
@@ -1921,8 +2069,9 @@ fn register_node_connection(
     state: &AppState,
     id: Uuid,
     session_id: Uuid,
-    sender: tokio::sync::mpsc::Sender<Message>,
+    sender: impl Into<delivery::Outbound>,
 ) -> bool {
+    let sender = sender.into();
     let cluster_id = if let Ok(store) = state.store.lock() {
         if let Some(node) = store.nodes.get(&id) {
             node.cluster_id
@@ -1939,7 +2088,7 @@ fn register_node_connection(
         } else {
             return false;
         }
-        connections.insert(
+        let previous = connections.insert(
             id,
             NodeConnection {
                 session_id,
@@ -1949,6 +2098,9 @@ fn register_node_connection(
                 receipt_key: None,
             },
         );
+        if let Some(previous) = previous {
+            previous.sender.invalidate();
+        }
         true
     } else {
         false
@@ -1956,30 +2108,25 @@ fn register_node_connection(
     if !inserted {
         return false;
     }
-    if let Ok(mut store) = state.store.lock() {
+    let registered = if let Ok(mut store) = state.store.lock() {
         if let Some(node) = store.nodes.get_mut(&id) {
             node.online = true;
             node.last_seen = Some(now());
-            store.recovery.resume_worker_leases(
-                &id.to_string(),
-                now().saturating_mul(1_000),
-                JOB_LEASE_DURATION_MS,
-            );
+            store
+                .recovery
+                .resume_worker_leases(&id.to_string(), now_ms(), JOB_LEASE_DURATION_MS);
             true
         } else {
-            if let Ok(mut connections) = state.node_connections.lock() {
-                if connections
-                    .get(&id)
-                    .is_some_and(|connection| connection.session_id == session_id)
-                {
-                    connections.remove(&id);
-                }
-            }
             false
         }
     } else {
         false
+    };
+    // Release the store guard before acquiring connection/durability registries.
+    if !registered {
+        disconnect_node(state, id, session_id);
     }
+    registered
 }
 
 fn is_current_node_connection(state: &AppState, id: Uuid, session_id: Uuid) -> bool {
@@ -2078,8 +2225,12 @@ fn disconnect_node(state: &AppState, id: Uuid, session_id: Uuid) {
             }
             store.recovery.shorten_worker_leases(
                 &id.to_string(),
-                now().saturating_mul(1_000),
+                now_ms(),
                 WORKER_RECONNECT_GRACE_MS,
+            );
+            coordinator_event(
+                "node_disconnected",
+                serde_json::json!({"node_id":id,"grace_ms":WORKER_RECONNECT_GRACE_MS}),
             );
         }
         // Tell remaining same-cluster workers to close stale peer channels.
@@ -2347,7 +2498,8 @@ fn route_durability_message(state: &AppState, node: Uuid, session: Uuid, text: &
 }
 
 async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_id: Uuid) {
-    let (outbound, mut queued) = tokio::sync::mpsc::channel::<Message>(128);
+    let (sender, mut queued) = tokio::sync::mpsc::channel::<Message>(128);
+    let outbound = delivery::Outbound::from(sender);
     if !register_node_connection(&state, id, session_id, outbound.clone()) {
         return;
     }
@@ -2366,11 +2518,16 @@ async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_i
     let mut last_paused = None;
     loop {
         tokio::select! {
+            _ = outbound.failed() => {
+                eprintln!("{{\"event\":\"node_delivery_resync\",\"node_id\":\"{id}\"}}");
+                let _ = tokio::time::timeout(Duration::from_secs(2), sink.send(Message::Close(None))).await;
+                break;
+            },
             message = stream.next() => match message {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(Message::Ping(bytes))) => {
                     if !update_node_heartbeat(&state, id, session_id) { break; }
-                    if sink.send(Message::Pong(bytes)).await.is_err() { break; }
+                    if !matches!(tokio::time::timeout(Duration::from_secs(5), sink.send(Message::Pong(bytes))).await, Ok(Ok(()))) { break; }
                 }
                 Some(Ok(Message::Text(text))) => {
                     if !update_node_heartbeat(&state, id, session_id) { break; }
@@ -2381,7 +2538,7 @@ async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_i
                 }
             },
             outgoing = queued.recv() => match outgoing {
-                Some(message) => if sink.send(message).await.is_err() { break; },
+                Some(message) => if !matches!(tokio::time::timeout(Duration::from_secs(5), sink.send(message)).await, Ok(Ok(()))) { break; },
                 None => break,
             },
             _ = tick.tick() => {
@@ -2390,10 +2547,10 @@ async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_i
                 match status {
                     Some((paused, last_seen)) => {
                         if now().saturating_sub(last_seen.unwrap_or_default()) > NODE_HEARTBEAT_TIMEOUT_SECS { break; }
-                        if sink.send(Message::Ping(Vec::new())).await.is_err() { break; }
+                        if !matches!(tokio::time::timeout(Duration::from_secs(5), sink.send(Message::Ping(Vec::new()))).await, Ok(Ok(()))) { break; }
                         if last_paused != Some(paused) {
                             let message = serde_json::json!({"type": "control", "paused": paused}).to_string();
-                            if sink.send(Message::Text(message)).await.is_err() { break; }
+                            if !matches!(tokio::time::timeout(Duration::from_secs(5), sink.send(Message::Text(message))).await, Ok(Ok(()))) { break; }
                             last_paused = Some(paused);
                         }
                     }
@@ -2416,6 +2573,7 @@ fn app(state: AppState) -> Router {
         .route("/api/clusters/:id/jobs", get(list_jobs).post(create_job))
         .route("/api/jobs/:id/claim", post(claim_job_batch))
         .route("/api/jobs/:id/renew", post(renew_job_batch))
+        .route("/api/jobs/:id/release", post(release_job_batch))
         .route("/api/jobs/:id/commit", post(commit_job_batch))
         .route("/api/jobs/:id", axum::routing::delete(delete_job))
         .route(
@@ -2514,6 +2672,130 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_reports_are_bounded_and_modes_are_explicit() {
+        let mut report = ExecutionReport {
+            execution_mode: "webgpu".into(),
+            fallback_reason: None,
+            compute_ms: 1.0,
+            validation_ms: 2.0,
+            encoding_ms: 3.0,
+            transfer_ms: 4.0,
+        };
+        assert!(report.valid());
+        report.compute_ms = f64::NAN;
+        assert!(!report.valid());
+        report.compute_ms = -1.0;
+        assert!(!report.valid());
+        report.compute_ms = 1.0;
+        report.execution_mode = "trusted-gpu".into();
+        assert!(!report.valid());
+        report.execution_mode = "cpu-fallback".into();
+        report.fallback_reason = Some("x".repeat(513));
+        assert!(!report.valid());
+    }
+
+    #[tokio::test]
+    async fn release_authorizes_the_exact_job_and_does_not_persist_runtime_leases() {
+        let state = AppState::for_test();
+        let owner = test_headers(&"a".repeat(64));
+        let (_, Json(cluster)) = create_cluster(
+            State(state.clone()),
+            owner.clone(),
+            Json(CreateCluster {
+                name: "release".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let (_, Json(worker)) = create_node(
+            State(state.clone()),
+            Path(cluster.id),
+            owner.clone(),
+            Json(CreateNode {
+                name: "worker".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&worker.node.id)
+            .unwrap()
+            .online = true;
+        let (_, Json(job)) = create_job(
+            State(state.clone()),
+            Path(cluster.id),
+            owner.clone(),
+            Json(CreateJob {
+                workload: ComputeWorkload::CpuHash,
+                total_units: 1000,
+                batch_units: 1000,
+            }),
+        )
+        .await
+        .unwrap();
+        let disk = std::fs::read(state.data_file.as_path()).unwrap();
+        let Json(Some(claim)) = claim_job_batch(
+            State(state.clone()),
+            Path(job.id),
+            owner.clone(),
+            Json(ClaimJob {
+                node_id: worker.node.id,
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!("missing claim")
+        };
+        assert!(release_job_batch(
+            State(state.clone()),
+            Path(job.id),
+            test_headers(&"b".repeat(64)),
+            Json(RenewJob {
+                lease: claim.lease.clone()
+            })
+        )
+        .await
+        .is_err());
+        release_job_batch(
+            State(state.clone()),
+            Path(job.id),
+            owner.clone(),
+            Json(RenewJob {
+                lease: claim.lease.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(Some(next)) = claim_job_batch(
+            State(state.clone()),
+            Path(job.id),
+            owner.clone(),
+            Json(ClaimJob {
+                node_id: worker.node.id,
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!("released batch was not reclaimable")
+        };
+        assert!(next.lease.generation > claim.lease.generation);
+        assert!(release_job_batch(
+            State(state.clone()),
+            Path(job.id),
+            owner,
+            Json(RenewJob { lease: claim.lease })
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read(state.data_file.as_path()).unwrap(), disk);
+        let _ = std::fs::remove_file(state.data_file.as_path());
+    }
 
     impl AppState {
         fn for_test() -> Self {
@@ -3135,7 +3417,7 @@ mod tests {
             new_session,
             new_tx
         ));
-        let now_ms = now().saturating_mul(1_000);
+        let now_ms = crate::now_ms();
         let lease = {
             let mut store = state.store.lock().unwrap();
             store.recovery.add_task("connection-test").unwrap();
@@ -3187,7 +3469,7 @@ mod tests {
             .claim(
                 "connection-test",
                 "other-worker",
-                now().saturating_mul(1_000) + WORKER_RECONNECT_GRACE_MS,
+                crate::now_ms() + WORKER_RECONNECT_GRACE_MS,
                 JOB_LEASE_DURATION_MS,
             )
             .unwrap();
@@ -3455,6 +3737,7 @@ mod tests {
             Path(job.id),
             owner_headers.clone(),
             Json(CommitBatch {
+                execution: None,
                 lease: claim.lease.clone(),
                 replica_node_id: Some(replica.node.id),
                 shards: Vec::new(),
@@ -3478,6 +3761,7 @@ mod tests {
             Path(job.id),
             owner_headers.clone(),
             Json(CommitBatch {
+                execution: None,
                 lease: claim.lease.clone(),
                 replica_node_id: Some(replica.node.id),
                 shards: Vec::new(),
@@ -3498,6 +3782,7 @@ mod tests {
             custody::tests::confirm(&mut state.durability.lock().unwrap().custody, &shard, now());
         }
         let commit = CommitBatch {
+            execution: None,
             lease: claim.lease.clone(),
             replica_node_id: Some(replica.node.id),
             shards: Vec::new(),
@@ -3521,6 +3806,7 @@ mod tests {
                 Path(job.id),
                 owner_headers.clone(),
                 Json(CommitBatch {
+                    execution: None,
                     lease: claim.lease,
                     replica_node_id: Some(replica.node.id),
                     shards: Vec::new(),
@@ -3673,6 +3959,7 @@ mod tests {
             .unwrap()
             .online = false;
         let request = || CommitBatch {
+            execution: None,
             lease: claim.lease.clone(),
             replica_node_id: None,
             shards: shards.clone(),
@@ -3707,6 +3994,7 @@ mod tests {
             custody::tests::confirm(&mut state.durability.lock().unwrap().custody, shard, now());
         }
         let fallback = CommitBatch {
+            execution: None,
             lease: claim.lease.clone(),
             replica_node_id: None,
             shards: replicas,

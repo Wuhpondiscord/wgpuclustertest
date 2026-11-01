@@ -86,7 +86,7 @@ export async function digestVectorAddResult(values: Float32Array) {
 }
 
 /** Creates a bounded WebGPU vector-add worker, or null when WebGPU is unavailable. */
-export async function createVectorAddWorker() {
+export async function createVectorAddExecutor() {
   const gpu = (navigator as Navigator & { gpu?: GpuNavigator }).gpu
   if (!gpu) return null
   const adapter = await gpu.requestAdapter()
@@ -95,10 +95,15 @@ export async function createVectorAddWorker() {
   let disposed = false
   let lost = false
   void device.lost.then(() => { lost = true })
-  const module = device.createShaderModule({ code: VECTOR_ADD_SHADER })
-  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } })
+  let pipeline: unknown
+  try {
+    const module = device.createShaderModule({ code: VECTOR_ADD_SHADER })
+    pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } })
+  } catch (error) { device.destroy(); throw error }
 
+  let validationMs = 0
   return {
+    get validationMs() { return validationMs },
     async run(start: number, end: number) {
       if (disposed || lost) throw new Error('WebGPU device was lost. Reconnect this node and retry the job.')
       const count = end - start
@@ -138,10 +143,12 @@ export async function createVectorAddWorker() {
         const result = new Float32Array(readbackBuffer.getMappedRange().slice(0))
         readbackBuffer.unmap()
 
+        const validationStarted = performance.now()
         for (let i = 0; i < count; i++) {
           const expected = Math.fround(left[i] + right[i])
           if (!Number.isFinite(result[i]) || result[i] !== expected) throw new Error('WebGPU batch validation failed; result was not checkpointed.')
         }
+        validationMs = performance.now() - validationStarted
         return result
       } finally {
         leftBuffer.destroy()

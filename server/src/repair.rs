@@ -414,7 +414,7 @@ mod tests {
                 NodeConnection {
                     session_id: Uuid::new_v4(),
                     cluster_id: cluster,
-                    sender,
+                    sender: sender.into(),
                     receipt_nonce: "session".into(),
                     receipt_key: Some("ready".into()),
                 },
@@ -432,6 +432,9 @@ mod tests {
                 outputs: HashMap::from([(
                     0,
                     BatchOutput {
+                        execution: None,
+                        attempt: None,
+                        committed_at_ms: 0,
                         sha256: "a".repeat(64),
                         bytes: 65_536,
                         worker_node_id: shards[0].node_id,
