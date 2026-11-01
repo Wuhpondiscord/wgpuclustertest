@@ -1,6 +1,6 @@
 # Runtime review follow-up
 
-The review was checked against main `6fdad9a`. This batch prioritizes correctness and reproducible disconnect trials. A passing trial does not imply production readiness.
+The initial review was checked against main `6fdad9a`. The [persistent contributor follow-up](contributors.md) adds automatic work discovery, fenced per-attempt retries, critical-message queue invalidation, optional remembered credentials, and execution diagnostics. This batch prioritizes correctness and reproducible disconnect trials. A passing trial does not imply production readiness.
 
 | Finding | Result in this batch |
 | --- | --- |
@@ -24,7 +24,7 @@ The review was checked against main `6fdad9a`. This batch prioritizes correctnes
 ## Remaining work, in recommended order
 
 1. Validate all three physical network pairs. If direct ICE fails, add supported configurable ICE servers and short-lived TURN credentials. Do not use GitHub to relay frequent artifact data. Add connection diagnostics, ICE restart/retry, and worker session resynchronization.
-2. Add structured, secret-redacted coordinator logging, explicit backpressure for critical WebSocket messages, and graceful shutdown. `try_send` can still drop control/reply messages under queue saturation; overload behavior needs targeted tests.
+2. Critical WebSocket queue saturation now invalidates the affected session and triggers reconnect/resynchronization, with bounded socket writes and queue-overflow tests. Work hints remain explicitly coalescible. Broader structured coordinator logging and graceful shutdown remain outstanding.
 3. Move computation, encoding and hashing into a Web Worker; split the API/node lifecycle/job runner and dashboard components. Replace polling with versioned push invalidations. Binary transfer frames and cached IndexedDB connections can reduce overhead after correctness is established.
 4. Add storage possession audits and local artifact garbage collection. Online status and a historical receipt alone cannot prove the bytes still exist. Quotas are bounded in this batch but GitHub still rewrites a snapshot per durable mutation and is not a high-throughput transactional database.
 5. Harden WebSocket authentication so bearer tokens are not in URLs, add CSP, improve identity recovery, and audit lock poison recovery and lock ordering. Removing the repository fallback requires setting `MESH_STORAGE_REPO` on existing deployments first.

@@ -14,6 +14,8 @@ Mesh has a Rust coordinator for cluster and node management, plus bounded leased
 
 Before a multi-device trial, use the [three-device recovery test guide](docs/three-device-test.md). The [review follow-up](docs/review-follow-up.md) tracks fixed issues and remaining production work.
 
+[Persistent contributors](docs/contributors.md) explains opt-in compute, automatic takeover, device persistence, retry behavior and execution diagnostics.
+
 ## GitHub → Hugging Face
 
 GitHub Actions builds the React UI, runs Rust unit tests, and builds the Docker image on pull requests and pushes to `main`. A successful `main` push uploads the tested source to this Docker Space, which then builds the `Dockerfile`.

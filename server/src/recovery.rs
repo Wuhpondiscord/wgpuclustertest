@@ -23,6 +23,22 @@ struct TaskRecord {
     #[serde(skip)]
     lease: Option<TaskLease>,
     result_digest: Option<String>,
+    #[serde(skip)]
+    observation: Option<AttemptObservation>,
+    #[serde(skip)]
+    unavailable_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AttemptObservation {
+    pub worker_id: String,
+    pub previous_worker_id: Option<String>,
+    pub generation: u64,
+    pub attempt_id: u64,
+    pub coordinator_epoch: u64,
+    pub claimed_at_ms: u64,
+    pub failure_detected_at_ms: Option<u64>,
+    pub reassigned_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -69,6 +85,7 @@ impl RecoveryLedger {
         self.next_attempt_id = 0;
         for record in self.tasks.values_mut() {
             record.lease = None;
+            record.unavailable_at_ms = None;
         }
     }
 
@@ -82,6 +99,8 @@ impl RecoveryLedger {
                 if let Some(runtime) = current.tasks.get(id) {
                     record.generation = runtime.generation;
                     record.lease = runtime.lease.clone();
+                    record.observation = runtime.observation.clone();
+                    record.unavailable_at_ms = runtime.unavailable_at_ms;
                 }
             }
         }
@@ -95,6 +114,7 @@ impl RecoveryLedger {
                 .as_mut()
                 .filter(|lease| lease.worker_id == worker_id)
             {
+                record.unavailable_at_ms.get_or_insert(now_ms);
                 lease.expires_at_ms = lease.expires_at_ms.min(deadline);
             }
         }
@@ -108,6 +128,7 @@ impl RecoveryLedger {
                 .filter(|lease| lease.worker_id == worker_id && lease.expires_at_ms > now_ms)
             {
                 lease.expires_at_ms = now_ms.saturating_add(duration_ms);
+                record.unavailable_at_ms = None;
             }
         }
     }
@@ -123,6 +144,8 @@ impl RecoveryLedger {
                 generation: 0,
                 lease: None,
                 result_digest: None,
+                observation: None,
+                unavailable_at_ms: None,
             },
         );
         Ok(())
@@ -168,9 +191,25 @@ impl RecoveryLedger {
             .ok_or(LeaseError::CounterExhausted)?;
         record.generation = generation;
         self.next_attempt_id = attempt_id;
+        let worker_id = worker_id.into();
+        let previous_worker_id = record
+            .observation
+            .as_ref()
+            .map(|observation| observation.worker_id.clone());
+        let failure_detected_at_ms = record.unavailable_at_ms.take();
+        record.observation = Some(AttemptObservation {
+            worker_id: worker_id.clone(),
+            previous_worker_id,
+            generation,
+            attempt_id,
+            coordinator_epoch: self.coordinator_epoch,
+            claimed_at_ms: now_ms,
+            failure_detected_at_ms,
+            reassigned_at_ms: if generation > 1 { Some(now_ms) } else { None },
+        });
         let lease = TaskLease {
             task_id: task_id.to_owned(),
-            worker_id: worker_id.into(),
+            worker_id,
             coordinator_epoch: self.coordinator_epoch,
             generation,
             attempt_id,
@@ -268,6 +307,31 @@ impl RecoveryLedger {
             .get(task_id)
             .and_then(|record| record.result_digest.as_deref())
     }
+
+    pub fn observation(&self, task_id: &str) -> Option<AttemptObservation> {
+        self.tasks
+            .get(task_id)
+            .and_then(|record| record.observation.clone())
+    }
+
+    /// Voluntary release only affects the exact current attempt. It does not
+    /// advance the generation; the next claim performs the fencing transition.
+    pub fn release(&mut self, lease: &TaskLease, now_ms: u64) -> Result<(), LeaseError> {
+        let record = self
+            .tasks
+            .get_mut(&lease.task_id)
+            .ok_or(LeaseError::UnknownTask)?;
+        if record.result_digest.is_some() {
+            return Err(LeaseError::AlreadyComplete);
+        }
+        let current = record.lease.as_mut().ok_or(LeaseError::StaleLease)?;
+        if !same_attempt(current, lease) {
+            return Err(LeaseError::StaleLease);
+        }
+        current.expires_at_ms = current.expires_at_ms.min(now_ms);
+        record.unavailable_at_ms.get_or_insert(now_ms);
+        Ok(())
+    }
 }
 
 fn same_attempt(current: &TaskLease, submitted: &TaskLease) -> bool {
@@ -281,6 +345,35 @@ fn same_attempt(current: &TaskLease, submitted: &TaskLease) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_is_fenced_and_observation_distinguishes_retry_from_takeover() {
+        let mut ledger = RecoveryLedger::default();
+        ledger.add_task("batch").unwrap();
+        let first = ledger.claim("batch", "a", 0, 100).unwrap();
+        ledger.release(&first, 10).unwrap();
+        let retry = ledger.claim("batch", "a", 11, 100).unwrap();
+        assert_eq!(ledger.release(&first, 12), Err(LeaseError::StaleLease));
+        assert_eq!(
+            ledger
+                .observation("batch")
+                .unwrap()
+                .previous_worker_id
+                .as_deref(),
+            Some("a")
+        );
+        ledger.shorten_worker_leases("a", 20, 10);
+        let takeover = ledger.claim("batch", "b", 30, 100).unwrap();
+        let observed = ledger.observation("batch").unwrap();
+        assert_eq!(observed.worker_id, "b");
+        assert_eq!(observed.previous_worker_id.as_deref(), Some("a"));
+        assert_eq!(observed.claimed_at_ms, 30);
+        assert_eq!(observed.reassigned_at_ms, Some(30));
+        assert_eq!(observed.failure_detected_at_ms, Some(20));
+        ledger.commit_result(&takeover, 40, "hash").unwrap();
+        assert_eq!(ledger.release(&retry, 41), Err(LeaseError::AlreadyComplete));
+        assert_eq!(ledger.observation("batch").unwrap(), observed);
+    }
 
     #[test]
     fn renewal_survives_the_original_deadline_and_a_durable_snapshot_swap() {

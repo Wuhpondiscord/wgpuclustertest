@@ -2,6 +2,7 @@ node_modules/
 dist/
 server/target/
 test-results/
+test-results-ui/
 playwright-report/
 *.tsbuildinfo
 .env

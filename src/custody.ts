@@ -15,12 +15,14 @@ export class HolderCustody {
   private readyResolve!: () => void
   private readyReject!: (error: Error) => void
   private readyTimer: number
+  private initialized = false
+  isReady() { return this.initialized && !this.closed }
 
   constructor(private readonly nodeId: string, private readonly socket: WebSocket) {
     this.ready = new Promise<void>((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject })
     void this.ready.catch(() => undefined)
-    void this.key.catch(error => this.readyReject(error instanceof Error ? error : new Error('Holder signing is unavailable')))
-    this.readyTimer = window.setTimeout(() => this.readyReject(new Error('The coordinator did not establish a holder signing session')), 15_000)
+    void this.key.catch(error => { this.readyReject(error instanceof Error ? error : new Error('Holder signing is unavailable')); socket.close() })
+    this.readyTimer = window.setTimeout(() => { this.readyReject(new Error('The coordinator did not establish a holder signing session')); socket.close() }, 15_000)
     socket.addEventListener('message', this.onMessage)
     socket.addEventListener('close', this.close)
   }
@@ -30,7 +32,7 @@ export class HolderCustody {
     try { message = JSON.parse(String(event.data)) } catch { return }
     if (message.type === 'custody_welcome' && typeof message.nonce === 'string' && !this.nonce) {
       this.nonce = message.nonce
-      void this.initialize().catch(error => this.readyReject(error instanceof Error ? error : new Error('Holder key registration failed')))
+      void this.initialize().catch(error => { this.readyReject(error instanceof Error ? error : new Error('Holder key registration failed')); this.socket.close() })
     } else if (message.type === 'node_reply' && message.request_id) {
       const pending = this.pending.get(message.request_id)
       if (!pending) return
@@ -46,6 +48,7 @@ export class HolderCustody {
     this.publicKey = base64(await crypto.subtle.exportKey('raw', pair.publicKey))
     await this.request('custody_key', { nonce: this.nonce, public_key: this.publicKey })
     window.clearTimeout(this.readyTimer)
+    this.initialized = true
     this.readyResolve()
   }
 
@@ -76,6 +79,7 @@ export class HolderCustody {
   close = () => {
     if (this.closed) return
     this.closed = true
+    this.initialized = false
     window.clearTimeout(this.readyTimer)
     this.readyReject(new Error('The holder signing session closed'))
     for (const pending of this.pending.values()) { window.clearTimeout(pending.timer); pending.reject(new Error('The holder connection closed')) }
