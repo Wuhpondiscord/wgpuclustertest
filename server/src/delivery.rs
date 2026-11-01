@@ -3,7 +3,7 @@
 use axum::extract::ws::Message;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Instant;
 use tokio::sync::{mpsc, Notify};
@@ -43,6 +43,7 @@ impl SignalBudget {
 #[derive(Clone)]
 pub(crate) struct Outbound {
     sender: mpsc::Sender<Message>,
+    admission: Arc<Mutex<()>>,
     failed: Arc<AtomicBool>,
     notification: Arc<Notify>,
 }
@@ -50,6 +51,7 @@ impl From<mpsc::Sender<Message>> for Outbound {
     fn from(sender: mpsc::Sender<Message>) -> Self {
         Self {
             sender,
+            admission: Arc::new(Mutex::new(())),
             failed: Arc::new(AtomicBool::new(false)),
             notification: Arc::new(Notify::new()),
         }
@@ -60,6 +62,10 @@ impl Outbound {
         &self,
         message: Message,
     ) -> Result<(), mpsc::error::TrySendError<Message>> {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = self.sender.try_send(message);
         if result.is_err() {
             self.invalidate();
@@ -70,6 +76,10 @@ impl Outbound {
         self.optional(message);
     }
     pub(crate) fn optional(&self, message: Message) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Reserve capacity for control and receipts. Check AFTER reserving a
         // permit so simultaneous optional producers cannot consume the reserve.
         // Hints have polling fallback; signaling can retry on peer rediscovery.
@@ -130,6 +140,31 @@ mod tests {
             control |= message == Message::Text("control".into());
         }
         assert!(control);
+    }
+
+    #[test]
+    fn concurrent_optional_producers_cannot_temporarily_take_the_critical_reserve() {
+        let (sender, mut receiver) = mpsc::channel(128);
+        let outbound = Outbound::from(sender);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let outbound = outbound.clone();
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        outbound.optional(Message::Text("signal".into()));
+                    }
+                });
+            }
+            for _ in 0..100 {
+                outbound.try_send(Message::Text("control".into())).unwrap();
+                while let Ok(message) = receiver.try_recv() {
+                    if message == Message::Text("control".into()) {
+                        break;
+                    }
+                }
+            }
+        });
+        assert!(!outbound.failed.load(Ordering::Acquire));
     }
 
     #[test]
