@@ -34,6 +34,11 @@ export function AccountApplications({ clusterId, changed }: { clusterId?: string
   }
   useEffect(() => { let active = true; void refresh().catch(e => { if (active) setError(e.message) }); return () => { active = false } }, [clusterId])
   useEffect(() => {
+    const expired = () => { setAccount(null); setApplications([]); setSelected(null); setNotice('Sign in again to resume this account. Remembered node keys have been kept.') }
+    window.addEventListener('mesh-authentication-required', expired)
+    return () => window.removeEventListener('mesh-authentication-required', expired)
+  }, [])
+  useEffect(() => {
     if (!mode && !saved) return
     const dialogs = document.querySelectorAll<HTMLElement>('.account-applications [role="dialog"]')
     const activeDialog = dialogs[dialogs.length - 1]

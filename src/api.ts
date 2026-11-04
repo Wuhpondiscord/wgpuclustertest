@@ -1,9 +1,9 @@
 export class ApiError extends Error {
-  constructor(public readonly status: number, message: string, public readonly coordinator = false) { super(message); this.name = 'ApiError' }
+  constructor(public readonly status: number, message: string, public readonly coordinator = false, public readonly code?: string) { super(message); this.name = 'ApiError' }
 }
 
 export function isRevokedAccess(error: unknown) {
-  return error instanceof ApiError && error.coordinator && [401, 403, 404].includes(error.status)
+  return error instanceof ApiError && error.coordinator && error.code !== 'account_session_required' && [401, 403, 404].includes(error.status)
 }
 
 let bootstrap: Promise<string> | null = null
@@ -40,13 +40,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const text = await response.text()
     let message = text || `Request failed (${response.status})`
     let coordinator = false
+    let code: string | undefined
     if (response.headers.get('Content-Type')?.includes('application/json')) {
       try {
         const body = JSON.parse(text)
-        if (body?.source === 'mesh-coordinator' && typeof body.error === 'string') { message = body.error; coordinator = true }
+        if (body?.source === 'mesh-coordinator' && typeof body.error === 'string') { message = body.error; coordinator = true; code = typeof body.code === 'string' ? body.code : undefined }
       } catch { /* An intermediary's invalid response is never proof of revocation. */ }
     }
-    throw new ApiError(response.status, message, coordinator)
+    if (code === 'account_session_required' && typeof window !== 'undefined' && headers.get('X-Mesh-Identity') === sessionStorage.getItem('mesh.account-session')) window.dispatchEvent(new Event('mesh-authentication-required'))
+    throw new ApiError(response.status, message, coordinator, code)
   }
   return response.status === 204 ? undefined as T : response.json() as Promise<T>
 }

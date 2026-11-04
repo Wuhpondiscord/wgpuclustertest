@@ -301,7 +301,7 @@ fn issue_session_kind(
     user: String,
     recovery_authenticated: bool,
 ) -> ApiResult<String> {
-    let token = new_key()?;
+    let token = format!("ms_{}", new_key()?);
     let credential_hash = {
         let store = state.store.lock().map_err(|_| unavailable())?;
         account_for(&store, &user)?.key_hash.clone()
@@ -364,6 +364,9 @@ pub async fn authenticate(
                 }
                 return Ok(user);
             }
+            if raw.starts_with("ms_") {
+                return Err(denied());
+            }
             if store.revoked_credentials.contains(&hash)
                 || store.accounts.values().any(|a| a.key_hash == hash)
             {
@@ -378,6 +381,7 @@ pub async fn authenticate(
                     HeaderValue::from_str(&user).expect("hex principal"),
                 );
             }
+            Err(error) if raw.starts_with("ms_") && error.0 == StatusCode::UNAUTHORIZED => return private((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"source":"mesh-coordinator","code":"account_session_required","error":"Sign in again to resume this account session"}))).into_response()),
             Err(error) => return private(error.into_response()),
         }
     }

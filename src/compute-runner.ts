@@ -122,6 +122,10 @@ export class ComputeRunner {
         } catch (error) {
           if (signal.aborted) break
           const status = errorStatus(error)
+          if (error instanceof ApiError && error.code === 'account_session_required') {
+            this.report({ phase: 'waiting', message: 'Sign in again to resume this contributor' })
+            await this.wakeEvent.wait(5_000, signal); continue
+          }
           if (status === 401 || status === 403) {
             this.report({ phase: 'error', message: error instanceof Error ? error.message : 'Node authorization was revoked' }); return
           }

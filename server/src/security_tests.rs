@@ -195,6 +195,38 @@ async fn account_activation_is_recoverable_and_preserves_cluster_ownership() {
         serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
         serde_json::json!([])
     );
+    state
+        .durability
+        .lock()
+        .unwrap()
+        .accounts
+        .sessions
+        .get_mut(&secret_hash(session))
+        .unwrap()
+        .expires = 0;
+    let (status, expired) = call(
+        &crate::app(state.clone()),
+        "GET",
+        "/api/clusters",
+        session,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(expired["code"], "account_session_required");
+    state.durability.lock().unwrap().accounts.sessions.clear();
+    assert_eq!(
+        call(
+            &crate::app(state.clone()),
+            "GET",
+            "/api/clusters",
+            session,
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
     let persisted = std::fs::read_to_string(state.data_file.as_path()).unwrap();
     assert!(!persisted.contains(alice["key"].as_str().unwrap()));
     assert!(!persisted.contains(session));
