@@ -603,3 +603,13 @@ button { -webkit-tap-highlight-color: transparent; }
 .contributor-options{display:flex;flex-wrap:wrap;gap:10px 15px;font-size:11px}.contributor-options label{display:flex;gap:5px;align-items:center}.contributor-options select{font:inherit;padding:4px;border:1px solid #d8d1e6;border-radius:5px;background:#fff;color:#302840}.contributor-options input{accent-color:#7c3aed}
 .contributor-controls>small{font-size:10px;line-height:1.5;color:#625872;overflow-wrap:anywhere}.execution-diagnostics{display:block;overflow-wrap:anywhere;line-height:1.6}
 @media(max-width:650px){.contributor-controls{margin-left:0}.contributor-heading{align-items:stretch;flex-direction:column}.contributor-options{flex-direction:column;gap:8px}.job-row{flex-wrap:wrap}.job-title{flex-basis:100%}}
+
+.account-applications { margin-bottom: 24px; min-width: 0; }
+.application-content { padding: 20px; }
+.application-links { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.application-form { display: grid; gap: 12px; margin: 16px 0; }
+.application-form label { display: grid; gap: 6px; font-size: 13px; }
+.application-form input, .application-form select { width: 100%; box-sizing: border-box; min-width: 0; padding: 10px; border: 1px solid #cbd5e1; border-radius: 7px; background: white; color: #172033; }
+.account-secret { display: block; overflow-wrap: anywhere; user-select: all; padding: 14px; background: #eef2f6; font-family: monospace; margin: 12px 0; }
+.application-detail { border-top: 1px solid #e2e8f0; margin-top: 20px; padding-top: 18px; overflow-wrap: anywhere; }
+@media(max-width: 600px) { .account-applications .card-heading { flex-direction: column; align-items: flex-start; } .application-content { padding: 14px; } }

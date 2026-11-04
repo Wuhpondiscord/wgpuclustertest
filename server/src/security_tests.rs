@@ -1,0 +1,599 @@
+use super::*;
+use axum::{
+    body::{to_bytes, Body},
+    http::Request,
+    Router,
+};
+use std::sync::{Arc, Mutex};
+use tower::ServiceExt;
+
+fn test_state() -> AppState {
+    let mut runtime = crate::DurabilityRuntime::default();
+    runtime.accounts.encryption_key = Some([42; 32]);
+    AppState {
+        store: Arc::new(Mutex::new(Store::default())),
+        mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        data_file: Arc::new(
+            std::env::temp_dir().join(format!("mesh-accounts-{}.json", Uuid::new_v4())),
+        ),
+        github: None,
+        github_file_sha: Arc::new(Mutex::new(None)),
+        node_connections: Arc::new(Mutex::new(HashMap::new())),
+        durability: Arc::new(Mutex::new(runtime)),
+    }
+}
+async fn call(
+    router: &Router,
+    method: &str,
+    path: &str,
+    key: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json");
+    if !key.is_empty() {
+        request = request.header(IDENTITY_HEADER, key);
+    }
+    let response = router
+        .clone()
+        .oneshot(
+            request
+                .body(if body.is_null() {
+                    Body::empty()
+                } else {
+                    Body::from(body.to_string())
+                })
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let data = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
+    (status, data)
+}
+async fn register(router: &Router, raw: &str, name: &str) -> serde_json::Value {
+    let (status, data) = call(
+        router,
+        "POST",
+        "/api/accounts",
+        raw,
+        serde_json::json!({"username":name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert!(key_format(data["key"].as_str().unwrap()));
+    assert_eq!(
+        call(
+            router,
+            "POST",
+            "/api/account/activate",
+            data["session"].as_str().unwrap(),
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    data
+}
+#[test]
+fn random_keys_rfc_totp_and_authenticated_secret_storage() {
+    let mut keys = HashSet::new();
+    for _ in 0..256 {
+        let key = new_key().unwrap();
+        assert!(key_format(&key));
+        assert!(keys.insert(key));
+    }
+    // RFC 6238 SHA1 vectors, truncated to the interoperable six-digit format.
+    for (time, expected) in [
+        (59, "287082"),
+        (1_111_111_109, "081804"),
+        (1_111_111_111, "050471"),
+        (1_234_567_890, "005924"),
+        (2_000_000_000, "279037"),
+    ] {
+        assert_eq!(totp(b"12345678901234567890", time / 30), expected);
+    }
+    let encrypted = seal(&[42; 32], "owner", b"authenticator secret").unwrap();
+    assert_eq!(
+        unseal(&[42; 32], "owner", &encrypted).unwrap(),
+        b"authenticator secret"
+    );
+    assert!(unseal(&[43; 32], "owner", &encrypted).is_err());
+    assert!(unseal(&[42; 32], "other", &encrypted).is_err());
+    let mut tampered = encrypted.clone();
+    tampered.ciphertext = BASE64.encode([0; 32]);
+    assert!(unseal(&[42; 32], "owner", &tampered).is_err());
+}
+#[tokio::test]
+async fn account_activation_is_recoverable_and_preserves_cluster_ownership() {
+    let state = test_state();
+    let router = crate::app(state.clone());
+    let raw = "a".repeat(64);
+    let (_, cluster) = call(
+        &router,
+        "POST",
+        "/api/clusters",
+        &raw,
+        serde_json::json!({"name":"existing"}),
+    )
+    .await;
+    let (_, lost) = call(
+        &router,
+        "POST",
+        "/api/accounts",
+        &raw,
+        serde_json::json!({"username":"alice"}),
+    )
+    .await;
+    // Lost registration response must leave the old anonymous credential usable.
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            "/api/account",
+            &raw,
+            serde_json::Value::Null
+        )
+        .await
+        .1,
+        serde_json::Value::Null
+    );
+    let alice = register(&router, &raw, "alice").await;
+    assert_ne!(lost["key"], alice["key"]);
+    let session = alice["session"].as_str().unwrap();
+    let (_, clusters) = call(
+        &router,
+        "GET",
+        "/api/clusters",
+        session,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(clusters[0]["id"], cluster["id"]);
+    assert_eq!(clusters[0]["role"], "owner");
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            "/api/clusters",
+            &raw,
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A saved root key is not an API session and cannot bypass future 2FA.
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            "/api/account",
+            alice["key"].as_str().unwrap(),
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let request = Request::builder()
+        .uri("/api/clusters")
+        .header(IDENTITY_HEADER, "z".repeat(64))
+        .header(USER_HEADER, secret_hash(&raw));
+    let response = router
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!([])
+    );
+    let persisted = std::fs::read_to_string(state.data_file.as_path()).unwrap();
+    assert!(!persisted.contains(alice["key"].as_str().unwrap()));
+    assert!(!persisted.contains(session));
+}
+#[tokio::test]
+async fn authenticator_replay_recovery_rotation_and_restart_are_enforced() {
+    let state = test_state();
+    let router = crate::app(state.clone());
+    let alice = register(&router, &"a".repeat(64), "alice").await;
+    let root = alice["key"].as_str().unwrap();
+    let initial = alice["session"].as_str().unwrap();
+    let (status, setup) = call(
+        &router,
+        "POST",
+        "/api/account/totp/setup",
+        initial,
+        serde_json::json!({"key":root}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let secret = BASE32_NOPAD
+        .decode(setup["secret"].as_str().unwrap().as_bytes())
+        .unwrap();
+    let code = totp(&secret, now() / 30);
+    let (status, enabled) = call(
+        &router,
+        "POST",
+        "/api/account/totp/enable",
+        initial,
+        serde_json::json!({"challenge":setup["challenge"],"code":code}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{enabled}");
+    let credentials =
+        |key: &str, code: &str| serde_json::json!({"username":"alice","key":key,"code":code});
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(root, "")
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(root, &code)
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let recovery = enabled["recovery_codes"].as_array().unwrap();
+    assert_eq!(recovery.len(), 8);
+    let (status, logged_in) = call(
+        &router,
+        "POST",
+        "/api/accounts/login",
+        "",
+        credentials(root, recovery[0].as_str().unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(root, recovery[0].as_str().unwrap())
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let session = logged_in["session"].as_str().unwrap();
+    let (status, rotation) = call(
+        &router,
+        "POST",
+        "/api/account/key",
+        session,
+        serde_json::json!({"key":root,"code":recovery[1]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let replacement = rotation["key"].as_str().unwrap();
+    assert_ne!(replacement, root);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(replacement, recovery[2].as_str().unwrap())
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, new_session) = call(
+        &router,
+        "POST",
+        "/api/account/key/confirm",
+        session,
+        serde_json::json!({"key":replacement}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(root, recovery[2].as_str().unwrap())
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(replacement, recovery[2].as_str().unwrap())
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let persisted = std::fs::read_to_string(state.data_file.as_path()).unwrap();
+    for sensitive in [
+        root,
+        replacement,
+        setup["secret"].as_str().unwrap(),
+        recovery[3].as_str().unwrap(),
+        new_session["session"].as_str().unwrap(),
+    ] {
+        assert!(!persisted.contains(sensitive));
+    }
+    // Restore persisted state and a fresh runtime: encrypted seed and used-code state survive.
+    *state.store.lock().unwrap() = serde_json::from_str(&persisted).unwrap();
+    let runtime = Runtime {
+        encryption_key: Some([42; 32]),
+        ..Runtime::default()
+    };
+    state.durability.lock().unwrap().accounts = runtime;
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(replacement, recovery[0].as_str().unwrap())
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            credentials(replacement, recovery[3].as_str().unwrap())
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+#[tokio::test]
+async fn private_apps_require_explicit_grants_even_for_the_cluster_owner() {
+    let state = test_state();
+    let router = crate::app(state.clone());
+    let raw_a = "a".repeat(64);
+    let raw_b = "b".repeat(64);
+    let (_, cluster) = call(
+        &router,
+        "POST",
+        "/api/clusters",
+        &raw_a,
+        serde_json::json!({"name":"pool"}),
+    )
+    .await;
+    let cluster = cluster["id"].as_str().unwrap();
+    let (_, invite) = call(
+        &router,
+        "POST",
+        &format!("/api/clusters/{cluster}/invites"),
+        &raw_a,
+        serde_json::Value::Null,
+    )
+    .await;
+    call(
+        &router,
+        "POST",
+        "/api/invites/join",
+        &raw_b,
+        serde_json::json!({"token":invite["token"]}),
+    )
+    .await;
+    let a = register(&router, &raw_a, "alice").await;
+    let b = register(&router, &raw_b, "bob").await;
+    let a = a["session"].as_str().unwrap();
+    let b = b["session"].as_str().unwrap();
+    // Cluster member Bob creates an app; cluster owner Alice has no implicit access.
+    let (status, app) = call(
+        &router,
+        "POST",
+        &format!("/api/clusters/{cluster}/applications"),
+        b,
+        serde_json::json!({"slug":"private-app","name":"Secret project"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{app}");
+    let id = app["id"].as_str().unwrap();
+    for path in [
+        format!("/api/applications/{id}"),
+        "/api/applications/by-name/bob/private-app".into(),
+    ] {
+        assert_eq!(
+            call(&router, "GET", &path, a, serde_json::Value::Null)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            &format!("/api/clusters/{cluster}/applications"),
+            a,
+            serde_json::Value::Null
+        )
+        .await
+        .1,
+        serde_json::json!([])
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/api/applications/{id}/members"),
+            b,
+            serde_json::json!({"username":"alice","role":"viewer"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            &format!("/api/applications/{id}"),
+            a,
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/api/applications/{id}/members"),
+            a,
+            serde_json::json!({"username":"alice","role":"owner"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &router,
+            "DELETE",
+            &format!("/api/applications/{id}"),
+            a,
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    call(
+        &router,
+        "DELETE",
+        &format!("/api/applications/{id}/members/alice"),
+        b,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            &format!("/api/applications/{id}"),
+            a,
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    call(
+        &router,
+        "DELETE",
+        &format!("/api/clusters/{cluster}"),
+        a,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert!(state.store.lock().unwrap().applications.is_empty());
+}
+#[tokio::test]
+async fn authentication_limits_replay_and_failed_persistence_fail_closed() {
+    let state = test_state();
+    let router = crate::app(state.clone());
+    let alice = register(&router, &"a".repeat(64), "alice").await;
+    let session = alice["session"].as_str().unwrap();
+    let root = alice["key"].as_str().unwrap();
+    let (_, setup) = call(
+        &router,
+        "POST",
+        "/api/account/totp/setup",
+        session,
+        serde_json::json!({"key":root}),
+    )
+    .await;
+    let code = totp(
+        &BASE32_NOPAD
+            .decode(setup["secret"].as_str().unwrap().as_bytes())
+            .unwrap(),
+        now() / 30,
+    );
+    call(
+        &router,
+        "POST",
+        "/api/account/totp/enable",
+        session,
+        serde_json::json!({"challenge":setup["challenge"],"code":code}),
+    )
+    .await;
+    for _ in 0..6 {
+        assert_eq!(
+            call(
+                &router,
+                "POST",
+                "/api/accounts/login",
+                "",
+                serde_json::json!({"username":"alice","key":root,"code":"invalid"})
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/accounts/login",
+            "",
+            serde_json::json!({"username":"alice","key":root,"code":"invalid"})
+        )
+        .await
+        .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let blocked = test_state();
+    let directory = std::env::temp_dir();
+    let blocked = AppState {
+        data_file: Arc::new(directory),
+        ..blocked
+    };
+    let router = crate::app(blocked.clone());
+    assert!(call(
+        &router,
+        "POST",
+        "/api/accounts",
+        &"c".repeat(64),
+        serde_json::json!({"username":"carol"})
+    )
+    .await
+    .0
+    .is_server_error());
+    assert!(blocked.store.lock().unwrap().accounts.is_empty());
+}

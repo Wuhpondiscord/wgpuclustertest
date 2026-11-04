@@ -6,18 +6,28 @@ export function isRevokedAccess(error: unknown) {
   return error instanceof ApiError && error.coordinator && [401, 403, 404].includes(error.status)
 }
 
-export function getIdentity() {
-  let token = localStorage.getItem('mesh.identity')
-  if (!token) {
-    token = `${crypto.randomUUID().replace(/-/g, '')}${crypto.randomUUID().replace(/-/g, '')}`
-    localStorage.setItem('mesh.identity', token)
-  }
-  return token
+let bootstrap: Promise<string> | null = null
+export function setIdentity(session: string, username?: string) {
+  sessionStorage.setItem('mesh.account-session', session)
+  localStorage.removeItem('mesh.identity')
+  if (username) localStorage.setItem('mesh.last-account', username)
+}
+export async function getIdentity(): Promise<string> {
+  const token = (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('mesh.account-session') : null) || localStorage.getItem('mesh.identity')
+  if (token) return token
+  if (!bootstrap) bootstrap = (async () => {
+    const response = await fetch('/api/identities', { method: 'POST', cache: 'no-store' })
+    if (!response.ok) throw new ApiError(response.status, 'Could not establish a Mesh identity; retry shortly')
+    const value = await response.json() as { key: string }
+    localStorage.setItem('mesh.identity', value.key)
+    return value.key
+  })().finally(() => { bootstrap = null })
+  return bootstrap
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
-  headers.set('X-Mesh-Identity', getIdentity())
+  if (path !== '/api/accounts/login') headers.set('X-Mesh-Identity', await getIdentity())
   if (init.body) headers.set('Content-Type', 'application/json')
   const response = await fetch(path, { ...init, headers })
   if (!response.ok) {
