@@ -1,39 +1,7 @@
-type GpuBuffer = {
-  destroy(): void
-  mapAsync(mode: number): Promise<void>
-  getMappedRange(): ArrayBuffer
-  unmap(): void
-}
-
+/// <reference types="@webgpu/types" />
 export class GpuValidationError extends Error {
   constructor(message = 'WebGPU batch validation failed; result was not checkpointed.') { super(message); this.name = 'GpuValidationError' }
 }
-
-type GpuComputePass = {
-  setPipeline(pipeline: unknown): void
-  setBindGroup(index: number, group: unknown): void
-  dispatchWorkgroups(count: number): void
-  end(): void
-}
-
-type GpuDevice = {
-  limits: { maxStorageBufferBindingSize: number; maxBufferSize: number }
-  queue: { writeBuffer(buffer: GpuBuffer, offset: number, data: BufferSource): void; submit(commands: unknown[]): void }
-  createBuffer(descriptor: { size: number; usage: number; mappedAtCreation?: boolean }): GpuBuffer
-  createShaderModule(descriptor: { code: string }): unknown
-  createComputePipeline(descriptor: { layout: string; compute: { module: unknown; entryPoint: string } }): unknown
-  createBindGroup(descriptor: { layout: unknown; entries: Array<{ binding: number; resource: { buffer: GpuBuffer } }> }): unknown
-  createCommandEncoder(): {
-    beginComputePass(): GpuComputePass
-    copyBufferToBuffer(source: GpuBuffer, sourceOffset: number, destination: GpuBuffer, destinationOffset: number, size: number): void
-    finish(): unknown
-  }
-  destroy(): void
-  lost: Promise<{ message: string }>
-}
-
-type GpuAdapter = { requestDevice(): Promise<GpuDevice> }
-type GpuNavigator = { requestAdapter(): Promise<GpuAdapter | null> }
 
 const MAP_READ = 0x0001
 const STORAGE = 0x0080
@@ -91,7 +59,7 @@ export async function digestVectorAddResult(values: Float32Array) {
 
 /** Creates a bounded WebGPU vector-add executor, or null when WebGPU is unavailable. */
 export async function createVectorAddExecutor() {
-  const gpu = (navigator as Navigator & { gpu?: GpuNavigator }).gpu
+  const gpu = navigator.gpu
   if (!gpu) return null
   const adapter = await gpu.requestAdapter()
   if (!adapter) return null
@@ -99,7 +67,7 @@ export async function createVectorAddExecutor() {
   let disposed = false
   let lost = false
   void device.lost.then(() => { lost = true })
-  let pipeline: unknown
+  let pipeline: GPUComputePipeline
   try {
     const module = device.createShaderModule({ code: VECTOR_ADD_SHADER })
     pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } })
@@ -128,7 +96,7 @@ export async function createVectorAddExecutor() {
         device.queue.writeBuffer(leftBuffer, 0, left)
         device.queue.writeBuffer(rightBuffer, 0, right)
         const bindGroup = device.createBindGroup({
-          layout: (pipeline as { getBindGroupLayout(index: number): unknown }).getBindGroupLayout(0),
+          layout: pipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: leftBuffer } },
             { binding: 1, resource: { buffer: rightBuffer } },

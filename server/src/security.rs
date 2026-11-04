@@ -870,7 +870,7 @@ fn app_summary(app: &Application, store: &Store, user: &str) -> ApiResult<AppSum
                 })
             })
             .collect(),
-        runtime_status: "not_deployed",
+        runtime_status: "browser_jobs",
     })
 }
 #[derive(Deserialize)]
@@ -982,6 +982,26 @@ pub async fn by_name(
 pub struct Grant {
     username: String,
     role: AppRole,
+}
+pub(crate) fn application_access(
+    store: &Store,
+    id: Uuid,
+    user: &str,
+    write: bool,
+) -> ApiResult<()> {
+    let app = store.applications.get(&id).ok_or_else(hidden)?;
+    require_member(store, app.cluster_id, user).map_err(|_| hidden())?;
+    let role = app.members.get(user).ok_or_else(hidden)?;
+    if write
+        && (!matches!(role, AppRole::Owner | AppRole::Operator)
+            || !account_for(store, user)?.activated)
+    {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "An activated application owner or operator is required".into(),
+        ));
+    }
+    Ok(())
 }
 pub async fn grant(
     State(state): State<AppState>,

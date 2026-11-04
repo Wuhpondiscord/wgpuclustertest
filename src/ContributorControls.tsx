@@ -18,6 +18,7 @@ export function ContributorControls({ settings, state, remembered, onToggle, onC
         {[10, 25, 50, 100].map(value => <option key={value} value={value}>{value}%</option>)}
       </select></label>
       <label><input type="checkbox" checked={settings.allowCpuFallback} onChange={event => onChange({ allowCpuFallback: event.target.checked })}/>Allow CPU fallback</label>
+      <label><input type="checkbox" checked={settings.allowInference} onChange={event => onChange({ allowInference: event.target.checked })}/>ML inference (downloads a ~90 MB model plus runtime)</label>
       <label><input type="checkbox" checked={settings.pauseWhenHidden} onChange={event => onChange({ pauseWhenHidden: event.target.checked })}/>Pause new work when hidden</label>
       <label><input type="checkbox" checked={remembered} onChange={event => onRemember(event.target.checked)}/>Remember this device</label>
     </div>

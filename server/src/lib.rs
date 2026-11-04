@@ -1,4 +1,5 @@
 //! Shared recovery, checkpoint policy and erasure-coding primitives.
+pub mod browser_jobs;
 pub mod checkpoint;
 pub mod erasure;
 pub mod key_recovery;

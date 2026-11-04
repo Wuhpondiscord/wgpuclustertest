@@ -14,3 +14,6 @@ mesh-state*.json
 mesh-recovery-identity.txt
 recovered-space-keys*.json
 *.age
+
+# Generated from the locked ONNX runtime dependency.
+public/ort/

@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+# This project uses the browser ONNX runtime; skip native CUDA downloads.
+env:
+  ONNXRUNTIME_NODE_INSTALL: skip
+
 jobs:
   frontend:
     name: Frontend build
@@ -79,6 +83,11 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
+      - run: npm run build
+      - name: Test production browser runtime and inference assets
+        run: npx playwright test tests/e2e/application-runtime.spec.ts
+        env:
+          MESH_TEST_PRODUCTION: '1'
 
   container:
     name: Docker build

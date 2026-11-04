@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const baseURL = 'http://127.0.0.1:5173'
+const production = process.env.MESH_TEST_PRODUCTION === '1'
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -17,21 +18,21 @@ export default defineConfig({
     headless: true,
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
-    launchOptions: { args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] },
+    launchOptions: { args: ['--disable-features=WebRtcHideLocalIpsWithMdns', ...(process.env.MESH_TEST_GPU === '1' ? ['--enable-unsafe-webgpu', '--use-angle=swiftshader'] : [])] },
   },
   webServer: [
     {
       command: 'cargo run --manifest-path server/Cargo.toml --locked --bin mesh-coordinator',
-      url: 'http://127.0.0.1:7860/health',
+      url: production ? `${baseURL}/health` : 'http://127.0.0.1:7860/health',
       timeout: 180_000,
       reuseExistingServer: !process.env.CI,
-      env: { PORT: '7860', MESH_DATA_FILE: join(tmpdir(), `mesh-e2e-${process.pid}.json`), MESH_REPAIR_GRACE_SECS: '1', MESH_AUTH_ENCRYPTION_KEY: '42'.repeat(32), MESH_STATE_ENCRYPTION_KEY: '73'.repeat(32) },
+      env: { PORT: production ? '5173' : '7860', MESH_DATA_FILE: join(tmpdir(), `mesh-e2e-${process.pid}.json`), MESH_REPAIR_GRACE_SECS: '1', MESH_AUTH_ENCRYPTION_KEY: '42'.repeat(32), MESH_STATE_ENCRYPTION_KEY: '73'.repeat(32) },
     },
-    {
+    ...(production ? [] : [{
       command: 'npm run dev -- --host 127.0.0.1 --port 5173 --strictPort',
       url: baseURL,
       timeout: 60_000,
       reuseExistingServer: !process.env.CI,
-    },
+    }]),
   ],
 })
