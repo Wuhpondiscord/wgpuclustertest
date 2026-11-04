@@ -16,6 +16,7 @@ test('only coordinator JSON access denials can forget a saved device', async () 
       [404, 'proxy restart', 'text/plain', false],
       [403, '<h1>Space sleeping</h1>', 'text/html', false],
       [401, '{broken', 'application/json', false],
+      [401, JSON.stringify({ source: 'mesh-coordinator', code: 'account_session_required', error: 'Sign in again' }), 'application/json', false],
       [404, JSON.stringify({ error: 'not found' }), 'application/json', false],
       [404, JSON.stringify({ source: 'mesh-coordinator', error: 'Cluster not found' }), 'application/json', true],
       [503, JSON.stringify({ source: 'mesh-coordinator', error: 'Unavailable' }), 'application/json', false],

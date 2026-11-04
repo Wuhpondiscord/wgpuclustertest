@@ -109,6 +109,7 @@ jobs:
           python -m pip install --disable-pip-version-check 'huggingface_hub>=0.32,<2'
           python - <<'PY'
           import os
+          import secrets
           from urllib.parse import urlsplit
           from huggingface_hub import HfApi
 
@@ -123,6 +124,11 @@ jobs:
 
           repo_id = "/".join(parts)
           api = HfApi(token=token)
+          # Keep the authenticator encryption key out of GitHub state snapshots.
+          # Never replace an existing key: that would invalidate enrolled secrets.
+          if "MESH_AUTH_ENCRYPTION_KEY" not in api.get_space_secrets(repo_id=repo_id):
+              api.add_space_secret(repo_id=repo_id, key="MESH_AUTH_ENCRYPTION_KEY", value=secrets.token_hex(32))
+              print("Provisioned the Space authenticator encryption secret")
           api.upload_folder(
               folder_path=".",
               repo_id=repo_id,

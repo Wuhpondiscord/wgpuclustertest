@@ -30,6 +30,7 @@ use mesh_coordinator::recovery;
 mod custody;
 mod delivery;
 mod repair;
+mod security;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -81,6 +82,12 @@ struct Node {
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct Store {
+    #[serde(default)]
+    accounts: HashMap<String, security::Account>,
+    #[serde(default)]
+    applications: HashMap<Uuid, security::Application>,
+    #[serde(default)]
+    revoked_credentials: std::collections::HashSet<String>,
     clusters: HashMap<Uuid, Cluster>,
     invites: HashMap<String, Invite>,
     nodes: HashMap<Uuid, Node>,
@@ -217,6 +224,7 @@ struct AppState {
 
 #[derive(Default)]
 struct DurabilityRuntime {
+    accounts: security::Runtime,
     custody: custody::Registry,
     repairs: repair::RepairQueue,
     invite_refresh_after: Option<Instant>,
@@ -277,7 +285,7 @@ struct JoinInvite {
 }
 #[derive(Deserialize)]
 struct NodeSocketQuery {
-    token: String,
+    token: Option<String>,
 }
 #[derive(Serialize)]
 struct ClusterSummary {
@@ -388,6 +396,13 @@ fn now() -> u64 {
         .as_secs()
 }
 fn identity(headers: &HeaderMap) -> ApiResult<String> {
+    // The router strips this header from incoming traffic and resolves it itself.
+    if let Some(user) = headers
+        .get(security::USER_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        return Ok(user.to_owned());
+    }
     let id = headers
         .get(IDENTITY_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -1587,6 +1602,9 @@ async fn delete_cluster(
             }
         }
         store.jobs.retain(|_, job| job.cluster_id != id);
+        store
+            .applications
+            .retain(|_, application| application.cluster_id != id);
         store.clusters.remove(&id);
         store.nodes.retain(|_, node| node.cluster_id != id);
         store.invites.retain(|_, inv| inv.cluster_id != id);
@@ -1605,7 +1623,7 @@ async fn create_invite(
     let result = mutate_store(&state, move |store| {
         require_owner(store, id, &user)?;
         store.invites.retain(|_, invite| invite.expires_at > now());
-        let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
+        let token = security::new_key()?;
         let expires_at = now() + INVITE_TTL_SECS;
         store.invites.insert(
             secret_hash(&token),
@@ -1739,7 +1757,7 @@ async fn leave_cluster(
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     let user = identity(&headers)?;
-    mutate_store(&state, move |store| {
+    let removed = mutate_store(&state, move |store| {
         let cluster = require_member(store, id, &user)?;
         if cluster.owner_id == user {
             return Err(ApiError(
@@ -1753,11 +1771,29 @@ async fn leave_cluster(
             .expect("checked above")
             .members
             .remove(&user);
-        Ok(())
+        for application in store
+            .applications
+            .values_mut()
+            .filter(|a| a.cluster_id == id && a.owner_id != user)
+        {
+            application.members.remove(&user);
+        }
+        let removed: Vec<_> = store
+            .nodes
+            .values()
+            .filter(|node| node.cluster_id == id && node.owner_id == user)
+            .map(|node| node.id)
+            .collect();
+        store
+            .nodes
+            .retain(|_, node| node.cluster_id != id || node.owner_id != user);
+        Ok(removed)
     })
     .await?;
+    end_removed_node_sessions(&state, &removed);
     Ok(StatusCode::NO_CONTENT)
 }
+
 async fn list_members(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1807,6 +1843,13 @@ async fn remove_member(
             ));
         }
         cluster.members.remove(&target);
+        for application in store
+            .applications
+            .values_mut()
+            .filter(|a| a.cluster_id == id && a.owner_id != target)
+        {
+            application.members.remove(&target);
+        }
         let removed_nodes: Vec<Uuid> = store
             .nodes
             .values()
@@ -1872,7 +1915,7 @@ async fn create_node(
         StatusCode::BAD_REQUEST,
         "Node name must be 1–80 characters".into(),
     ))?;
-    let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
+    let token = security::new_key()?;
     let node_id = Uuid::new_v4();
     let token_hash = secret_hash(&token);
     let token_for_response = token.clone();
@@ -2016,9 +2059,10 @@ fn end_removed_node_sessions(state: &AppState, ids: &[Uuid]) {
         .map(|mut connections| {
             ids.iter()
                 .filter_map(|id| {
-                    connections
-                        .remove(id)
-                        .map(|connection| (*id, connection.receipt_nonce))
+                    connections.remove(id).map(|connection| {
+                        connection.sender.invalidate();
+                        (*id, connection.receipt_nonce)
+                    })
                 })
                 .collect()
         })
@@ -2041,35 +2085,60 @@ async fn node_socket(
     Query(query): Query<NodeSocketQuery>,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    if query.token.len() != 64 || !query.token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let node_id = query
+        .token
+        .as_deref()
+        .map(|token| node_for_token(&state, token))
+        .transpose()?;
+    Ok(ws
+        .max_message_size(64 * 1024)
+        .max_frame_size(16 * 1024)
+        .on_upgrade(move |mut socket| async move {
+            let id = match node_id {
+                Some(id) => id, // Compatibility for older clients; new clients authenticate in a frame.
+                None => {
+                    let token =
+                        match tokio::time::timeout(Duration::from_secs(5), socket.recv()).await {
+                            Ok(Some(Ok(Message::Text(text)))) => {
+                                serde_json::from_str::<serde_json::Value>(&text)
+                                    .ok()
+                                    .filter(|v| v["type"] == "authenticate")
+                                    .and_then(|v| v["token"].as_str().map(str::to_owned))
+                            }
+                            _ => None,
+                        };
+                    let Some(id) = token.and_then(|token| node_for_token(&state, &token).ok())
+                    else {
+                        let _ = socket.close().await;
+                        return;
+                    };
+                    id
+                }
+            };
+            run_node_socket(socket, state, id, Uuid::new_v4()).await;
+        }))
+}
+fn node_for_token(state: &AppState, token: &str) -> ApiResult<Uuid> {
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "Invalid node token".into(),
         ));
     }
-    let node_id = {
-        let store = state.store.lock().map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Store unavailable".into(),
-            )
-        })?;
-        store
-            .nodes
-            .values()
-            .find(|n| n.token_hash == secret_hash(&query.token))
-            .map(|n| n.id)
-            .ok_or(ApiError(
-                StatusCode::UNAUTHORIZED,
-                "Invalid node token".into(),
-            ))?
-    };
-    let session_id = Uuid::new_v4();
-    Ok(ws
-        .max_message_size(64 * 1024)
-        .max_frame_size(16 * 1024)
-        .on_upgrade(move |socket| run_node_socket(socket, state, node_id, session_id)))
+    state
+        .store
+        .lock()
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "Store unavailable".into()))?
+        .nodes
+        .values()
+        .find(|node| node.token_hash == secret_hash(token))
+        .map(|node| node.id)
+        .ok_or(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "Invalid node token".into(),
+        ))
 }
+
 fn register_node_connection(
     state: &AppState,
     id: Uuid,
@@ -2585,6 +2654,34 @@ async fn run_node_socket(socket: WebSocket, state: AppState, id: Uuid, session_i
 
 fn app(state: AppState) -> Router {
     Router::new()
+        .route("/api/identities", post(security::bootstrap))
+        .route("/api/accounts", post(security::signup))
+        .route("/api/accounts/login", post(security::login))
+        .route("/api/account", get(security::me))
+        .route("/api/account/logout", post(security::logout))
+        .route("/api/account/key", post(security::rotate_key))
+        .route("/api/account/key/confirm", post(security::confirm_rotation))
+        .route("/api/account/activate", post(security::activate))
+        .route("/api/account/totp/setup", post(security::begin_totp))
+        .route("/api/account/totp/enable", post(security::enable_totp))
+        .route("/api/account/totp/disable", post(security::disable_totp))
+        .route(
+            "/api/clusters/:id/applications",
+            get(security::list_apps).post(security::create_app),
+        )
+        .route(
+            "/api/applications/by-name/:username/:slug",
+            get(security::by_name),
+        )
+        .route(
+            "/api/applications/:id",
+            get(security::get_app).delete(security::delete_app),
+        )
+        .route("/api/applications/:id/members", post(security::grant))
+        .route(
+            "/api/applications/:id/members/:username",
+            axum::routing::delete(security::revoke),
+        )
         .route("/health", get(health))
         .route("/api/clusters", get(list_clusters).post(create_cluster))
         .route(
@@ -2619,7 +2716,13 @@ fn app(state: AppState) -> Router {
         .route("/api/nodes/:id", axum::routing::delete(delete_node))
         .route("/api/nodes/connect", get(node_socket))
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security::authenticate,
+        ))
         .with_state(state.clone())
+        .nest_service("/assets", ServeDir::new("dist/assets"))
+        .route("/:username/:application", get(security::application_page))
         .fallback_service(ServeDir::new("dist").append_index_html_on_directories(true))
 }
 
