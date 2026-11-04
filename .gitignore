@@ -9,3 +9,8 @@ playwright-report/
 .env.*
 !.env.example
 mesh-state*.json
+
+# Operator recovery material stays outside the source repository.
+mesh-recovery-identity.txt
+recovered-space-keys*.json
+*.age

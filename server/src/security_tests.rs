@@ -17,6 +17,7 @@ fn test_state() -> AppState {
             std::env::temp_dir().join(format!("mesh-accounts-{}.json", Uuid::new_v4())),
         ),
         snapshot: Arc::new(crate::snapshot::Codec::for_test()),
+        key_backup: None,
         github: None,
         github_file_sha: Arc::new(Mutex::new(None)),
         node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -612,9 +613,11 @@ async fn authentication_limits_replay_and_failed_persistence_fail_closed() {
         StatusCode::TOO_MANY_REQUESTS
     );
     let blocked = test_state();
-    let directory = std::env::temp_dir();
+    let blocker =
+        std::env::temp_dir().join(format!("mesh-account-write-blocker-{}", Uuid::new_v4()));
+    std::fs::write(&blocker, b"block parent directory creation").unwrap();
     let blocked = AppState {
-        data_file: Arc::new(directory),
+        data_file: Arc::new(blocker.join("state.json")),
         ..blocked
     };
     let router = crate::app(blocked.clone());
@@ -629,6 +632,7 @@ async fn authentication_limits_replay_and_failed_persistence_fail_closed() {
     .0
     .is_server_error());
     assert!(blocked.store.lock().unwrap().accounts.is_empty());
+    let _ = std::fs::remove_file(blocker);
 }
 
 #[tokio::test]

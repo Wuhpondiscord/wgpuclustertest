@@ -28,6 +28,9 @@ pub struct Codec {
     migration_open: AtomicBool,
 }
 impl Codec {
+    pub(crate) fn key_for_operator_backup(&self) -> [u8; 32] {
+        self.key
+    }
     pub fn from_env(context: &str) -> Result<Self, String> {
         let key = std::env::var("MESH_STATE_ENCRYPTION_KEY")
             .ok()

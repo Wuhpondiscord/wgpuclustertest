@@ -29,6 +29,7 @@ use uuid::Uuid;
 use mesh_coordinator::recovery;
 mod custody;
 mod delivery;
+mod operator_recovery;
 mod repair;
 mod security;
 mod snapshot;
@@ -218,6 +219,7 @@ struct AppState {
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
     data_file: Arc<PathBuf>,
     snapshot: Arc<snapshot::Codec>,
+    key_backup: Option<Arc<operator_recovery::Export>>,
     github: Option<Arc<GitHubStorage>>,
     github_file_sha: Arc<Mutex<Option<String>>>,
     node_connections: Arc<Mutex<HashMap<Uuid, NodeConnection>>>,
@@ -2752,6 +2754,7 @@ fn app(state: AppState) -> Router {
         .route("/api/nodes/:id/resume", post(resume_node))
         .route("/api/nodes/:id", axum::routing::delete(delete_node))
         .route("/api/nodes/connect", get(node_socket))
+        .route("/api/operator/key-backup", get(operator_recovery::download))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -2822,16 +2825,21 @@ async fn main() {
     for node in store.nodes.values_mut() {
         node.online = false;
     }
-    let state = AppState {
+    let mut state = AppState {
         store: Arc::new(Mutex::new(store)),
         mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         data_file: Arc::new(data_file),
         snapshot,
+        key_backup: None,
         github,
         github_file_sha: Arc::new(Mutex::new(github_sha)),
         node_connections: Arc::new(Mutex::new(HashMap::new())),
         durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
     };
+    let recipient = std::env::var("MESH_KEY_RECOVERY_RECIPIENT").ok();
+    state.key_backup = operator_recovery::prepare(&state, recipient.as_deref())
+        .expect("Invalid operator recovery configuration")
+        .map(Arc::new);
     finish_storage_startup(&state, needs_migration)
         .expect("Could not encrypt legacy state; refusing to serve it");
     if needs_migration {
@@ -2861,6 +2869,82 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operator_export_is_disabled_by_default_and_callers_cannot_select_a_recipient() {
+        use age::secrecy::ExposeSecret;
+        use axum::{
+            body::{to_bytes, Body},
+            http::Request,
+        };
+        use tower::ServiceExt;
+        let mut state = AppState::for_test();
+        assert!(operator_recovery::prepare(&state, None).unwrap().is_none());
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/operator/key-backup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(operator_recovery::prepare(&state, Some("invalid-public-recipient")).is_err());
+        let identity = age::x25519::Identity::generate();
+        let recipient = identity.to_public().to_string();
+        let other = age::x25519::Identity::generate();
+        state.key_backup = operator_recovery::prepare(&state, Some(&recipient))
+            .unwrap()
+            .map(Arc::new);
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/operator/key-backup?recipient={}",
+                        other.to_public()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-mesh-recovery-recipient"], recipient);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        assert!(
+            mesh_coordinator::key_recovery::decrypt(other.to_string().expose_secret(), &bytes)
+                .is_err()
+        );
+        let recovered =
+            mesh_coordinator::key_recovery::decrypt(identity.to_string().expose_secret(), &bytes)
+                .unwrap();
+        let json = serde_json::to_value(&recovered).unwrap();
+        assert_eq!(
+            json["MESH_STATE_ENCRYPTION_KEY"],
+            data_encoding::HEXLOWER.encode(&[73; 32])
+        );
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/operator/key-backup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        "{{\"recipient\":\"{}\"}}",
+                        other.to_public()
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
 
     #[test]
     fn startup_migration_preserves_data_and_failure_prevents_completion() {
@@ -3031,6 +3115,7 @@ mod tests {
                     std::env::temp_dir().join(format!("mesh-unit-{}.json", Uuid::new_v4())),
                 ),
                 snapshot: Arc::new(snapshot::Codec::for_test()),
+                key_backup: None,
                 github: None,
                 github_file_sha: Arc::new(Mutex::new(None)),
                 node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3349,6 +3434,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3430,6 +3516,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3497,6 +3584,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(blocker.join("state.json")),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3527,6 +3615,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(blocker.join("state.json")),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3562,6 +3651,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3640,6 +3730,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(PathBuf::from("unused")),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3753,6 +3844,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(PathBuf::from("unused")),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3867,6 +3959,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(PathBuf::from("unused")),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3918,6 +4011,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -4128,6 +4222,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -4331,6 +4426,7 @@ mod tests {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
             snapshot: Arc::new(snapshot::Codec::for_test()),
+            key_backup: None,
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),

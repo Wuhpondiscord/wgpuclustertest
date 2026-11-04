@@ -36,6 +36,8 @@ jobs:
       - run: cargo fmt --manifest-path server/Cargo.toml --check
       - run: cargo clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path server/Cargo.toml --locked
+      - name: Validate operator public recovery configuration
+        run: cargo run --manifest-path server/Cargo.toml --locked --bin mesh-key-recovery -- validate-config ops/key-recovery-recipients.json
       - name: Run discrete-event recovery simulation
         shell: bash
         run: |
@@ -111,6 +113,9 @@ jobs:
           python -m pip install --disable-pip-version-check 'huggingface_hub>=0.32,<2'
           python - <<'PY'
           import os
+          import json
+          import re
+          from pathlib import Path
           import secrets
           import time
           from urllib.request import urlopen
@@ -130,6 +135,20 @@ jobs:
           api = HfApi(token=token)
           # Keep the authenticator encryption key out of GitHub state snapshots.
           # Never replace an existing key: that would invalidate enrolled secrets.
+          # Public recipients are pinned per exact Space ID, so forks targeting a
+          # different Space never inherit another operator's recovery recipient.
+          recipients = json.loads(Path("ops/key-recovery-recipients.json").read_text(encoding="utf-8"))
+          recovery_recipient = recipients.get(repo_id)
+          if recovery_recipient:
+              if not re.fullmatch(r"age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}", recovery_recipient):
+                  raise SystemExit("Invalid public age recipient in operator configuration")
+              variables = api.get_space_variables(repo_id=repo_id)
+              current = variables.get("MESH_KEY_RECOVERY_RECIPIENT")
+              if current is not None and current.value != recovery_recipient:
+                  raise SystemExit("Recovery recipient differs from the configured Space; rotate it explicitly after preserving the old identity")
+              if current is None:
+                  api.add_space_variable(repo_id=repo_id, key="MESH_KEY_RECOVERY_RECIPIENT", value=recovery_recipient)
+                  print("Pinned the operator public recovery recipient")
           configured_secrets = api.get_space_secrets(repo_id=repo_id)
           if "MESH_AUTH_ENCRYPTION_KEY" not in configured_secrets:
               api.add_space_secret(repo_id=repo_id, key="MESH_AUTH_ENCRYPTION_KEY", value=secrets.token_hex(32))
@@ -145,7 +164,7 @@ jobs:
               repo_id=repo_id,
               repo_type="space",
               commit_message=f"Deploy GitHub {os.environ['GITHUB_SHA'][:7]}",
-              ignore_patterns=[".git/**", ".github/**", "node_modules/**", "server/target/**", "target/**", "work/**", "outputs/**"],
+              ignore_patterns=[".git/**", ".github/**", "node_modules/**", "server/target/**", "target/**", "work/**", "outputs/**", "mesh-recovery-identity.txt", "**/mesh-recovery-identity.txt", "recovered-space-keys*.json", "**/recovered-space-keys*.json", "*.age", "**/*.age"],
           )
           # Wait for this code generation, not the old container's plain /health.
           # No bearer credentials are sent to this public health endpoint.
@@ -172,6 +191,14 @@ jobs:
               # the retiring container before checking the replacement.
               time.sleep(10)
               wait_for_encrypted_state()
+          if recovery_recipient:
+              with urlopen(f"https://{space_host}/api/operator/key-backup", timeout=15) as response:
+                  if response.headers.get("x-mesh-recovery-recipient") != recovery_recipient:
+                      raise SystemExit("Space recovery export does not match the pinned public recipient")
+                  encrypted_backup = response.read(16 * 1024 + 1)
+                  if len(encrypted_backup) > 16 * 1024 or not encrypted_backup.startswith(b"age-encryption.org/v1\n"):
+                      raise SystemExit("Space did not return a bounded age-encrypted key backup")
+              print("Verified encrypted operator key export for the pinned recipient")
           print("Space healthy with authenticated encrypted state")
           print(f"Deployed tested source to https://huggingface.co/spaces/{repo_id}")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
