@@ -65,6 +65,7 @@ pub enum AppRole {
 struct Session {
     user: String,
     credential_hash: String,
+    recovery_authenticated: bool,
     expires: u64,
 }
 struct Pending {
@@ -279,6 +280,7 @@ fn account_for<'a>(store: &'a Store, user: &str) -> ApiResult<&'a Account> {
 pub struct AccountSummary {
     pub username: String,
     pub activated: bool,
+    pub recovery_session: bool,
     pub two_factor_enabled: bool,
     pub recovery_codes_remaining: usize,
 }
@@ -286,11 +288,19 @@ fn account_summary(a: &Account) -> AccountSummary {
     AccountSummary {
         username: a.username.clone(),
         activated: a.activated,
+        recovery_session: false,
         two_factor_enabled: a.totp.is_some(),
         recovery_codes_remaining: a.recovery.len(),
     }
 }
 fn issue_session(state: &AppState, user: String) -> ApiResult<String> {
+    issue_session_kind(state, user, false)
+}
+fn issue_session_kind(
+    state: &AppState,
+    user: String,
+    recovery_authenticated: bool,
+) -> ApiResult<String> {
     let token = new_key()?;
     let credential_hash = {
         let store = state.store.lock().map_err(|_| unavailable())?;
@@ -306,6 +316,7 @@ fn issue_session(state: &AppState, user: String) -> ApiResult<String> {
         Session {
             user,
             credential_hash,
+            recovery_authenticated,
             expires: now() + SESSION_SECONDS,
         },
     );
@@ -522,18 +533,21 @@ pub async fn login(
         .map_err(|_| unavailable())?
         .accounts
         .encryption_key;
-    let (user, summary) = mutate_store(&state, |store| {
+    let (user, mut summary, recovery_login) = mutate_store(&state, |store| {
         let account = store
             .accounts
             .get_mut(&username)
             .filter(|a| matches(&a.key_hash, &input.key))
             .ok_or_else(denied)?;
+        let recovery_login =
+            account.totp.is_some() && account.recovery.contains(&secret_hash(&input.code));
         consume_factor(account, &input.code, key.as_ref(), now())?;
-        Ok((account.id.clone(), account_summary(account)))
+        Ok((account.id.clone(), account_summary(account), recovery_login))
     })
     .await?;
+    summary.recovery_session = recovery_login;
     Ok(Json(
-        serde_json::json!({"account":summary,"session":issue_session(&state,user)?}),
+        serde_json::json!({"account":summary,"session":issue_session_kind(&state,user,recovery_login)?}),
     ))
 }
 pub async fn me(
@@ -541,6 +555,7 @@ pub async fn me(
     headers: HeaderMap,
 ) -> ApiResult<Json<Option<AccountSummary>>> {
     let user = identity(&headers)?;
+    let recovery_session = is_recovery_session(&state, &headers, &user);
     let store = state.store.lock().map_err(|_| unavailable())?;
     Ok(Json(
         store
@@ -556,7 +571,11 @@ pub async fn me(
                                 .unwrap_or(""),
                         ) != a.id)
             })
-            .map(account_summary),
+            .map(|a| {
+                let mut summary = account_summary(a);
+                summary.recovery_session = recovery_session;
+                summary
+            }),
     ))
 }
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
@@ -774,13 +793,16 @@ pub async fn disable_totp(
         .map_err(|_| unavailable())?
         .accounts
         .encryption_key;
+    let recovery_session = is_recovery_session(&state, &headers, &user);
     mutate_store(&state, |store| {
         let a = store
             .accounts
             .values_mut()
             .find(|a| a.id == user && a.totp.is_some() && matches(&a.key_hash, &proof.key))
             .ok_or_else(denied)?;
-        consume_factor(a, &proof.code, encryption.as_ref(), now())?;
+        if !recovery_session || !proof.code.is_empty() {
+            consume_factor(a, &proof.code, encryption.as_ref(), now())?;
+        }
         a.totp = None;
         a.last_step = None;
         a.recovery.clear();
@@ -1052,3 +1074,18 @@ pub async fn application_page() -> ApiResult<axum::response::Html<String>> {
 #[cfg(test)]
 #[path = "security_tests.rs"]
 mod tests;
+
+fn is_recovery_session(state: &AppState, headers: &HeaderMap, user: &str) -> bool {
+    let Some(raw) = headers.get(IDENTITY_HEADER).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    state.durability.lock().ok().is_some_and(|runtime| {
+        runtime
+            .accounts
+            .sessions
+            .get(&secret_hash(raw))
+            .is_some_and(|session| {
+                session.user == user && session.expires > now() && session.recovery_authenticated
+            })
+    })
+}

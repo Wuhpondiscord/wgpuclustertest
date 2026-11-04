@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api, setIdentity } from './api'
 
-type Account = { username: string; activated: boolean; two_factor_enabled: boolean; recovery_codes_remaining: number }
+type Account = { username: string; activated: boolean; recovery_session?: boolean; two_factor_enabled: boolean; recovery_codes_remaining: number }
 type Application = { id: string; cluster_id: string; name: string; slug: string; owner: string; url: string; role: 'owner' | 'operator' | 'viewer'; members: Array<{ username: string; role: string }>; runtime_status: string }
 type Setup = { secret: string; challenge: string; uri: string }
 const clearDeviceCredentials = () => {
@@ -107,10 +107,11 @@ export function AccountApplications({ clusterId, changed }: { clusterId?: string
       <h2>{mode === 'security' ? 'Account security' : mode === 'signup' ? 'Create account' : 'Sign in'}</h2>
       {error && <p role="alert">{error}</p>}
       {mode !== 'security' ? <form className="application-form" onSubmit={event => void submit(event)}><label>Username<input autoFocus required autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} pattern="[a-z0-9][a-z0-9-]{1,30}[a-z0-9]"/></label>{mode === 'login' && <><label>Account key<input type="password" required autoComplete="off" value={key} onChange={e => setKey(e.target.value)}/></label><label>Authenticator or recovery code<input autoComplete="one-time-code" value={code} onChange={e => setCode(e.target.value)}/></label></>}<p>{mode === 'signup' ? 'Your current cluster memberships move to this named account. Save the issued key before closing its dialog.' : 'Account keys stay in this form only. This tab receives a temporary session after sign-in.'}</p><button className="manage-button primary" disabled={busy}>{mode === 'signup' ? 'Register username' : 'Sign in to account'}</button></form> : <div className="application-form">
+        {account?.recovery_session && <p>You signed in with a recovery code. Enter your saved account key to reset the lost authenticator without spending another code, then set it up again.</p>}
         <p>{account?.two_factor_enabled ? `Authenticator enabled · ${account.recovery_codes_remaining} recovery codes remaining` : 'Use any authenticator supporting standard 6-digit TOTP codes.'}</p>
-        {!setup && <><label>Current account key<input type="password" autoComplete="off" value={key} onChange={e => setKey(e.target.value)}/></label>{account?.two_factor_enabled && <label>Authenticator or recovery code<input autoComplete="one-time-code" value={code} onChange={e => setCode(e.target.value)}/></label>}
+        {!setup && <><label>Current account key<input type="password" autoComplete="off" value={key} onChange={e => setKey(e.target.value)}/></label>{account?.two_factor_enabled && !account.recovery_session && <label>Authenticator or recovery code<input autoComplete="one-time-code" value={code} onChange={e => setCode(e.target.value)}/></label>}
           {!account?.two_factor_enabled && <button className="manage-button" disabled={busy || !key} onClick={() => void factor('setup')}>Set up authenticator</button>}
-          {account?.two_factor_enabled && <button className="manage-button" disabled={busy || !key || !code} onClick={() => void factor('disable')}>Disable authenticator</button>}
+          {account?.two_factor_enabled && <button className="manage-button" disabled={busy || !key || (!code && !account.recovery_session)} onClick={() => void factor('disable')}>Disable authenticator</button>}
           <button className="manage-button" disabled={busy || !key || Boolean(account?.two_factor_enabled && !code)} onClick={() => void factor('rotate')}>Rotate account key</button></>}
         {setup && <><p>In your authenticator choose “Enter setup key”, select time-based codes, and enter this secret. Code interval: 30 seconds.</p><code className="account-secret">{setup.secret}</code><button className="manage-button" onClick={() => void navigator.clipboard.writeText(setup.secret)}>Copy authenticator secret</button><label>Six-digit verification code<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={code} onChange={e => setCode(e.target.value)}/></label><button className="manage-button primary" disabled={busy || code.length !== 6} onClick={() => void factor('enable')}>Enable authenticator</button></>}
       </div>}

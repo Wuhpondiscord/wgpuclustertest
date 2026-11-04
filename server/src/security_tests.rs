@@ -597,3 +597,113 @@ async fn authentication_limits_replay_and_failed_persistence_fail_closed() {
     .is_server_error());
     assert!(blocked.store.lock().unwrap().accounts.is_empty());
 }
+
+#[tokio::test]
+async fn last_recovery_code_can_reset_the_lost_authenticator_but_normal_sessions_cannot() {
+    let state = test_state();
+    let router = crate::app(state.clone());
+    let alice = register(&router, &"a".repeat(64), "alice").await;
+    let key = alice["key"].as_str().unwrap();
+    let session = alice["session"].as_str().unwrap();
+    let (_, setup) = call(
+        &router,
+        "POST",
+        "/api/account/totp/setup",
+        session,
+        serde_json::json!({"key":key}),
+    )
+    .await;
+    let code = totp(
+        &BASE32_NOPAD
+            .decode(setup["secret"].as_str().unwrap().as_bytes())
+            .unwrap(),
+        now() / 30,
+    );
+    let (_, enabled) = call(
+        &router,
+        "POST",
+        "/api/account/totp/enable",
+        session,
+        serde_json::json!({"challenge":setup["challenge"],"code":code}),
+    )
+    .await;
+    let normal = enabled["session"].as_str().unwrap();
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/account/totp/disable",
+            normal,
+            serde_json::json!({"key":key})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let last = enabled["recovery_codes"][0].as_str().unwrap();
+    state
+        .store
+        .lock()
+        .unwrap()
+        .accounts
+        .get_mut("alice")
+        .unwrap()
+        .recovery = HashSet::from([secret_hash(last)]);
+    let (status, login) = call(
+        &router,
+        "POST",
+        "/api/accounts/login",
+        "",
+        serde_json::json!({"username":"alice","key":key,"code":last}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(login["account"]["recovery_codes_remaining"], 0);
+    let recovery = login["session"].as_str().unwrap();
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            "/api/account",
+            recovery,
+            serde_json::Value::Null
+        )
+        .await
+        .1["recovery_session"],
+        true
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/account/totp/disable",
+            recovery,
+            serde_json::json!({"key":"wrong"})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/account/totp/disable",
+            recovery,
+            serde_json::json!({"key":key})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, login) = call(
+        &router,
+        "POST",
+        "/api/accounts/login",
+        "",
+        serde_json::json!({"username":"alice","key":key}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(login["account"]["two_factor_enabled"], false);
+}
