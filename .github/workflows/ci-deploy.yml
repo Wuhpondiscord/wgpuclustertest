@@ -31,6 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "server -> target"
+      - name: Test deployment encryption and migration lifecycle
+        run: python3 -m unittest discover -s tests -p test_deployment.py
       - run: cargo fmt --manifest-path server/Cargo.toml --check
       - run: cargo clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo test --manifest-path server/Cargo.toml --locked
@@ -110,6 +112,8 @@ jobs:
           python - <<'PY'
           import os
           import secrets
+          import time
+          from urllib.request import urlopen
           from urllib.parse import urlsplit
           from huggingface_hub import HfApi
 
@@ -126,16 +130,49 @@ jobs:
           api = HfApi(token=token)
           # Keep the authenticator encryption key out of GitHub state snapshots.
           # Never replace an existing key: that would invalidate enrolled secrets.
-          if "MESH_AUTH_ENCRYPTION_KEY" not in api.get_space_secrets(repo_id=repo_id):
+          configured_secrets = api.get_space_secrets(repo_id=repo_id)
+          if "MESH_AUTH_ENCRYPTION_KEY" not in configured_secrets:
               api.add_space_secret(repo_id=repo_id, key="MESH_AUTH_ENCRYPTION_KEY", value=secrets.token_hex(32))
               print("Provisioned the Space authenticator encryption secret")
-          api.upload_folder(
+          if "MESH_STATE_ENCRYPTION_KEY" not in configured_secrets:
+              # Only first-time provisioning opens a short, bounded legacy import.
+              # The running server closes it immediately after its encrypted write.
+              api.add_space_secret(repo_id=repo_id, key="MESH_STATE_PLAINTEXT_MIGRATION_UNTIL", value=str(int(time.time()) + 900))
+              api.add_space_secret(repo_id=repo_id, key="MESH_STATE_ENCRYPTION_KEY", value=secrets.token_hex(32))
+              print("Provisioned separate state encryption secret and bounded migration")
+          uploaded = api.upload_folder(
               folder_path=".",
               repo_id=repo_id,
               repo_type="space",
               commit_message=f"Deploy GitHub {os.environ['GITHUB_SHA'][:7]}",
               ignore_patterns=[".git/**", ".github/**", "node_modules/**", "server/target/**", "target/**", "work/**", "outputs/**"],
           )
+          # Wait for this code generation, not the old container's plain /health.
+          # No bearer credentials are sent to this public health endpoint.
+          space_host = api.get_space_runtime(repo_id=repo_id).raw["domains"][0]["domain"]
+          health_url = f"https://{space_host}/health"
+          def wait_for_encrypted_state():
+              until = time.monotonic() + 600
+              while time.monotonic() < until:
+                  try:
+                      with urlopen(health_url, timeout=10) as response:
+                          ready = response.headers.get("x-mesh-state-format") == "mesh-state-aes256gcm-v1"
+                      runtime = api.get_space_runtime(repo_id=repo_id)
+                      if ready and runtime.stage == "RUNNING" and runtime.raw.get("sha") == uploaded.oid:
+                          return
+                  except Exception:
+                      pass
+                  time.sleep(5)
+              raise SystemExit("Space did not become healthy with encrypted state; inspect container logs")
+          wait_for_encrypted_state()
+          if "MESH_STATE_PLAINTEXT_MIGRATION_UNTIL" in api.get_space_secrets(repo_id=repo_id):
+              api.delete_space_secret(repo_id=repo_id, key="MESH_STATE_PLAINTEXT_MIGRATION_UNTIL")
+              print("Removed legacy import permission after encrypted-state readiness")
+              # Configuration changes restart the Space. A brief delay avoids reading
+              # the retiring container before checking the replacement.
+              time.sleep(10)
+              wait_for_encrypted_state()
+          print("Space healthy with authenticated encrypted state")
           print(f"Deployed tested source to https://huggingface.co/spaces/{repo_id}")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"## Hugging Face Space deployment\n\nUploaded tested commit `{os.environ['GITHUB_SHA']}` to [https://huggingface.co/spaces/{repo_id}](https://huggingface.co/spaces/{repo_id}). The Space now builds the Dockerfile.\n")

@@ -31,6 +31,7 @@ mod custody;
 mod delivery;
 mod repair;
 mod security;
+mod snapshot;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -216,6 +217,7 @@ struct AppState {
     // Serializes durable state changes while GitHub/file persistence runs off the async runtime.
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
     data_file: Arc<PathBuf>,
+    snapshot: Arc<snapshot::Codec>,
     github: Option<Arc<GitHubStorage>>,
     github_file_sha: Arc<Mutex<Option<String>>>,
     node_connections: Arc<Mutex<HashMap<Uuid, NodeConnection>>>,
@@ -531,18 +533,14 @@ fn job_summary(job: &ComputeJob, store: &Store) -> JobSummary {
     }
 }
 fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
-    let serialized = serde_json::to_vec(store).map_err(|_| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not serialize state".into(),
-        )
+    let serialized = state.snapshot.encode(store).map_err(|message| {
+        let status = if message.contains("16 MiB") {
+            StatusCode::INSUFFICIENT_STORAGE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        ApiError(status, message)
     })?;
-    if serialized.len() > MAX_STATE_BYTES {
-        return Err(ApiError(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Cluster metadata is full; delete old jobs before retrying".into(),
-        ));
-    }
     if let Some(github) = state.github.as_deref() {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(20))
@@ -610,32 +608,60 @@ fn persist(state: &AppState, store: &Store) -> ApiResult<()> {
             )
         })?;
     }
-    let temp_path = state.data_file.with_extension("json.tmp");
-    let mut temp = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_path)
-        .map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not open temporary state file".into(),
-            )
-        })?;
-    temp.write_all(&serialized)
+    let temp_path = state
+        .data_file
+        .with_extension(format!("{}.tmp", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp = options.open(&temp_path).map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not open temporary state file".into(),
+        )
+    })?;
+    let written = temp
+        .write_all(&serialized)
         .and_then(|_| temp.sync_all())
         .map_err(|_| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Could not write temporary state file".into(),
             )
-        })?;
-    std::fs::rename(&temp_path, state.data_file.as_path()).map_err(|_| {
+        });
+    drop(temp);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    let replaced = std::fs::rename(&temp_path, state.data_file.as_path()).map_err(|_| {
         ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Could not atomically replace persisted state".into(),
         )
-    })
+    });
+    if replaced.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    replaced
+}
+
+fn finish_storage_startup(state: &AppState, needs_migration: bool) -> ApiResult<()> {
+    if needs_migration {
+        let store = state.store.lock().map_err(|_| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Startup store unavailable".into(),
+            )
+        })?;
+        persist(state, &store)?;
+    }
+    state.snapshot.finish_migration();
+    Ok(())
 }
 
 async fn mutate_store<R, F>(state: &AppState, change: F) -> ApiResult<R>
@@ -657,6 +683,7 @@ where
     let mut change = change;
     for attempt in 0..=MAX_STORAGE_CONFLICT_RETRIES {
         let result = change(&mut next)?;
+        next.invites.retain(|_, invite| invite.expires_at > now());
         let persist_state = state.clone();
         let persistence_snapshot = next.clone();
         let persisted =
@@ -673,8 +700,9 @@ where
                 return Err(error);
             }
             let config = state.github.clone().expect("GitHub storage is configured");
-            let (mut latest, latest_sha) =
-                tokio::task::spawn_blocking(move || load_github_store(&config))
+            let snapshot = state.snapshot.clone();
+            let (mut latest, latest_sha, _) =
+                tokio::task::spawn_blocking(move || load_github_store(&config, &snapshot))
                     .await
                     .map_err(|_| {
                         ApiError(
@@ -775,20 +803,22 @@ async fn refresh_invite_from_github(state: &AppState, token: &str) -> ApiResult<
         return Ok(true);
     }
 
-    let (fresh_store, fresh_sha) = tokio::task::spawn_blocking(move || load_github_store(&config))
-        .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Storage worker stopped unexpectedly".into(),
-            )
-        })?
-        .map_err(|_| {
-            ApiError(
-                StatusCode::BAD_GATEWAY,
-                "Could not refresh invite state from GitHub storage".into(),
-            )
-        })?;
+    let snapshot = state.snapshot.clone();
+    let (fresh_store, fresh_sha, _) =
+        tokio::task::spawn_blocking(move || load_github_store(&config, &snapshot))
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Storage worker stopped unexpectedly".into(),
+                )
+            })?
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "Could not refresh invite state from GitHub storage".into(),
+                )
+            })?;
     let found = fresh_store
         .invites
         .get(&key)
@@ -850,7 +880,10 @@ fn has_active_invite(state: &AppState, token: &str) -> ApiResult<bool> {
         .is_some_and(|invite| invite.expires_at > now()))
 }
 
-fn load_github_store(config: &GitHubStorage) -> Result<(Store, Option<String>), String> {
+fn load_github_store(
+    config: &GitHubStorage,
+    codec: &snapshot::Codec,
+) -> Result<(Store, Option<String>, bool), String> {
     let repo_url = format!("https://api.github.com/repos/{}", config.repo);
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(20))
@@ -885,7 +918,7 @@ fn load_github_store(config: &GitHubStorage) -> Result<(Store, Option<String>), 
         .call();
     let response = match response {
         Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Ok((Store::default(), None)),
+        Err(ureq::Error::Status(404, _)) => return Ok((Store::default(), None, false)),
         Err(_) => return Err("Could not load state from the private GitHub storage repository. Check GH_TOKEN permissions, repo name, and branch.".into()),
     };
     let result: serde_json::Value = response
@@ -896,7 +929,7 @@ fn load_github_store(config: &GitHubStorage) -> Result<(Store, Option<String>), 
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "GitHub state file has no revision".to_string())?;
-    let store = decode_github_snapshot(&result, || {
+    let bytes = decode_github_snapshot(&result, || {
         // Fetch by immutable blob SHA, not by a branch that could change between requests.
         let blob_url = format!(
             "https://api.github.com/repos/{}/git/blobs/{sha}",
@@ -913,22 +946,23 @@ fn load_github_store(config: &GitHubStorage) -> Result<(Store, Option<String>), 
         let mut bytes = Vec::new();
         response
             .into_reader()
-            .take((MAX_STATE_BYTES + 1) as u64)
+            .take((snapshot::MAX_FILE_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| "Could not read the GitHub state blob".to_string())?;
         Ok(bytes)
     })?;
-    Ok((store, Some(sha)))
+    let (store, migration) = codec.decode(&bytes)?;
+    Ok((store, Some(sha), migration))
 }
 
 fn decode_github_snapshot(
     metadata: &serde_json::Value,
     blob: impl FnOnce() -> Result<Vec<u8>, String>,
-) -> Result<Store, String> {
+) -> Result<Vec<u8>, String> {
     if metadata
         .get("size")
         .and_then(serde_json::Value::as_u64)
-        .is_some_and(|size| size > MAX_STATE_BYTES as u64)
+        .is_some_and(|size| size > snapshot::MAX_FILE_BYTES as u64)
     {
         return Err("GitHub state exceeds the 16 MiB metadata limit".into());
     }
@@ -938,7 +972,7 @@ fn decode_github_snapshot(
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .ok_or("GitHub state file has no content")?;
-            if content.len() > (MAX_STATE_BYTES * 2) {
+            if content.len() > (snapshot::MAX_FILE_BYTES * 2) {
                 return Err("GitHub state content is too large".into());
             }
             BASE64
@@ -948,14 +982,17 @@ fn decode_github_snapshot(
         Some("none") => blob()?,
         _ => return Err("Unsupported GitHub state encoding".into()),
     };
-    if bytes.len() > MAX_STATE_BYTES {
-        return Err("GitHub state exceeds the 16 MiB metadata limit".into());
+    if bytes.len() > snapshot::MAX_FILE_BYTES {
+        return Err("GitHub state exceeds the encrypted metadata limit".into());
     }
-    serde_json::from_slice(&bytes).map_err(|_| "GitHub state file is not valid Mesh data".into())
+    Ok(bytes)
 }
 
-async fn health() -> &'static str {
-    "mesh coordinator ready"
+async fn health() -> impl IntoResponse {
+    (
+        [("x-mesh-state-format", snapshot::FORMAT)],
+        "mesh coordinator ready",
+    )
 }
 async fn list_clusters(
     State(state): State<AppState>,
@@ -2747,15 +2784,37 @@ async fn main() {
     if std::env::var("MESH_REQUIRE_GITHUB_STORAGE").as_deref() == Ok("1") && github.is_none() {
         panic!("Set the GH_TOKEN secret on the Hugging Face Space to enable persistent cluster storage");
     }
-    let (mut store, github_sha) = if let Some(config) = github.as_deref() {
-        load_github_store(config)
+    let context = if let Some(config) = github.as_deref() {
+        serde_json::to_string(&(&config.repo, &config.branch, &config.path))
+            .expect("storage context")
+    } else {
+        "local".to_owned()
+    };
+    let snapshot = Arc::new(
+        snapshot::Codec::from_env(&context).expect("State encryption configuration invalid"),
+    );
+    let (mut store, github_sha, needs_migration) = if let Some(config) = github.as_deref() {
+        load_github_store(config, &snapshot)
             .expect("GitHub cluster storage is configured but could not be loaded")
     } else {
-        let store = std::fs::read(&data_file)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        (store, None)
+        match std::fs::File::open(&data_file) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take((snapshot::MAX_FILE_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .expect("Could not read local state");
+                let (store, migration) = snapshot
+                    .decode(&bytes)
+                    .expect("Could not authenticate local state");
+                (store, None, migration)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Store::default(), None, false)
+            }
+            Err(_) => {
+                panic!("Could not open local state; refusing to initialize an empty database")
+            }
+        }
     };
     store
         .recovery
@@ -2767,11 +2826,17 @@ async fn main() {
         store: Arc::new(Mutex::new(store)),
         mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         data_file: Arc::new(data_file),
+        snapshot,
         github,
         github_file_sha: Arc::new(Mutex::new(github_sha)),
         node_connections: Arc::new(Mutex::new(HashMap::new())),
         durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
     };
+    finish_storage_startup(&state, needs_migration)
+        .expect("Could not encrypt legacy state; refusing to serve it");
+    if needs_migration {
+        println!("Legacy state migrated to authenticated encrypted storage");
+    }
     let app = app(state.clone());
     let port = std::env::var("PORT")
         .ok()
@@ -2796,6 +2861,42 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_migration_preserves_data_and_failure_prevents_completion() {
+        let mut state = AppState::for_test();
+        let id = Uuid::new_v4();
+        state.store.lock().unwrap().clusters.insert(
+            id,
+            Cluster {
+                id,
+                name: "migration-original-name".into(),
+                owner_id: "original-owner".into(),
+                members: HashMap::new(),
+            },
+        );
+        let legacy = serde_json::to_vec(&*state.store.lock().unwrap()).unwrap();
+        std::fs::write(state.data_file.as_path(), &legacy).unwrap();
+        finish_storage_startup(&state, true).unwrap();
+        let disk = std::fs::read(state.data_file.as_path()).unwrap();
+        assert!(!String::from_utf8_lossy(&disk).contains("migration-original-name"));
+        let (restored, migration) = state.snapshot.decode(&disk).unwrap();
+        assert!(!migration);
+        assert_eq!(restored.clusters[&id].owner_id, "original-owner");
+        assert!(state.snapshot.decode(&legacy).is_err());
+        let _ = std::fs::remove_file(state.data_file.as_path());
+        // A file in place of the parent directory forces a real persistence failure.
+        let blocker = std::env::temp_dir().join(format!("mesh-migration-{}", Uuid::new_v4()));
+        std::fs::write(&blocker, b"preserve-me").unwrap();
+        state.data_file = Arc::new(blocker.join("state.json"));
+        assert!(finish_storage_startup(&state, true).is_err());
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"preserve-me");
+        assert_eq!(
+            state.store.lock().unwrap().clusters[&id].owner_id,
+            "original-owner"
+        );
+        let _ = std::fs::remove_file(blocker);
+    }
 
     #[test]
     fn execution_reports_are_bounded_and_modes_are_explicit() {
@@ -2929,6 +3030,7 @@ mod tests {
                 data_file: Arc::new(
                     std::env::temp_dir().join(format!("mesh-unit-{}.json", Uuid::new_v4())),
                 ),
+                snapshot: Arc::new(snapshot::Codec::for_test()),
                 github: None,
                 github_file_sha: Arc::new(Mutex::new(None)),
                 node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -2967,25 +3069,28 @@ mod tests {
                 members: HashMap::new(),
             },
         );
-        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let codec = snapshot::Codec::for_test();
+        let bytes = codec.encode(&snapshot).unwrap();
         let metadata = serde_json::json!({"encoding":"none", "content":"", "size":bytes.len()});
-        let loaded = decode_github_snapshot(&metadata, || Ok(bytes)).unwrap();
+        let (loaded, migrated) = codec
+            .decode(&decode_github_snapshot(&metadata, || Ok(bytes)).unwrap())
+            .unwrap();
+        assert!(!migrated);
         assert_eq!(loaded.clusters[&id].name.len(), 1_100_000);
-        let inline = serde_json::json!({"encoding":"base64", "content":BASE64.encode(serde_json::to_vec(&Store::default()).unwrap())});
+        let inline = serde_json::json!({"encoding":"base64", "content":BASE64.encode(codec.encode(&Store::default()).unwrap())});
         assert!(
             decode_github_snapshot(&inline, || panic!("inline content must not fetch a blob"))
                 .is_ok()
         );
-        assert!(
-            decode_github_snapshot(&serde_json::json!({"size":MAX_STATE_BYTES+1}), || panic!(
-                "oversize metadata must not fetch a blob"
-            ))
-            .is_err()
-        );
+        assert!(decode_github_snapshot(
+            &serde_json::json!({"size":snapshot::MAX_FILE_BYTES+1}),
+            || panic!("oversize metadata must not fetch a blob")
+        )
+        .is_err());
         assert!(
             decode_github_snapshot(&serde_json::json!({"encoding":"none"}), || Ok(vec![
                 0;
-                MAX_STATE_BYTES
+                snapshot::MAX_FILE_BYTES
                     + 1
             ]))
             .is_err()
@@ -3243,6 +3348,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::default())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3323,6 +3429,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::default())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3389,6 +3496,7 @@ mod tests {
             store: Arc::new(Mutex::new(store)),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(blocker.join("state.json")),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3418,6 +3526,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::default())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(blocker.join("state.json")),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3452,6 +3561,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::default())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3487,7 +3597,10 @@ mod tests {
         );
 
         assert!(first.is_ok() && second.is_ok());
-        let disk: Store = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let (disk, _) = state
+            .snapshot
+            .decode(&std::fs::read(&file).unwrap())
+            .unwrap();
         assert_eq!(disk.clusters.len(), 2);
         assert_eq!(state.store.lock().unwrap().clusters.len(), 2);
         let _ = std::fs::remove_file(file);
@@ -3526,6 +3639,7 @@ mod tests {
             store: Arc::new(Mutex::new(store)),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(PathBuf::from("unused")),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3638,6 +3752,7 @@ mod tests {
             store: Arc::new(Mutex::new(store)),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(PathBuf::from("unused")),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3751,6 +3866,7 @@ mod tests {
             store: Arc::new(Mutex::new(store)),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(PathBuf::from("unused")),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -3801,6 +3917,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::default())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -4010,6 +4127,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::default())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -4212,6 +4330,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::default())),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(file.clone()),
+            snapshot: Arc::new(snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
