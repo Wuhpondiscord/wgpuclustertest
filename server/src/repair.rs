@@ -452,6 +452,7 @@ mod tests {
             store: Arc::new(Mutex::new(store)),
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             data_file: Arc::new(std::env::temp_dir().join(format!("mesh-repair-{job_id}.json"))),
+            snapshot: Arc::new(crate::snapshot::Codec::for_test()),
             github: None,
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(connections)),

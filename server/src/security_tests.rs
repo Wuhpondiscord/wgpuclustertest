@@ -16,6 +16,7 @@ fn test_state() -> AppState {
         data_file: Arc::new(
             std::env::temp_dir().join(format!("mesh-accounts-{}.json", Uuid::new_v4())),
         ),
+        snapshot: Arc::new(crate::snapshot::Codec::for_test()),
         github: None,
         github_file_sha: Arc::new(Mutex::new(None)),
         node_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -377,7 +378,7 @@ async fn authenticator_replay_recovery_rotation_and_restart_are_enforced() {
         assert!(!persisted.contains(sensitive));
     }
     // Restore persisted state and a fresh runtime: encrypted seed and used-code state survive.
-    *state.store.lock().unwrap() = serde_json::from_str(&persisted).unwrap();
+    *state.store.lock().unwrap() = state.snapshot.decode(persisted.as_bytes()).unwrap().0;
     let runtime = Runtime {
         encryption_key: Some([42; 32]),
         ..Runtime::default()

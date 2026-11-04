@@ -16,7 +16,7 @@ Before a multi-device trial, use the [three-device recovery test guide](docs/thr
 
 [Persistent contributors](docs/contributors.md) explains opt-in compute, automatic takeover, device persistence, retry behavior and execution diagnostics.
 
-[Accounts and private applications](docs/accounts-and-applications.md) describes server-generated account keys, authenticator setup, private management URLs and the execution trust boundary.
+[Accounts and private applications](docs/accounts-and-applications.md) describes server-generated account keys, authenticator setup, private management URLs and the execution trust boundary. [Database leak impact and encrypted storage](docs/database-leak-review.md) covers snapshot disclosure, migration, history and recovery limits.
 
 ## GitHub → Hugging Face
 
@@ -38,7 +38,7 @@ npm ci
 npm run dev
 ```
 
-In another terminal, run `cargo run --manifest-path server/Cargo.toml`. The Vite development server proxies `/api` to the Rust server on port 7860.
+In another terminal, set `MESH_STATE_ENCRYPTION_KEY` to a private, OS-random 32-byte lowercase hex key and preserve it for this database. Set a different `MESH_AUTH_ENCRYPTION_KEY` of the same format to enable authenticator enrollment. Then run `cargo run --manifest-path server/Cargo.toml --bin mesh-coordinator`. The Vite development server proxies `/api` to the Rust server on port 7860.
 
 ## Browser integration tests
 
@@ -63,7 +63,7 @@ Browser tests exercise immutable storage, rejection of fabricated holder receipt
 - The server issues anonymous Mesh identity keys, which browsers keep in local storage. Existing identities can register a unique username without losing cluster ownership, save a server-generated account key, and enable authenticator-app TOTP with single-use recovery codes. Named account sessions are temporary and kept in sessionStorage; saved account keys are not persisted by the UI. There is no email/password recovery. See [account security and private application access](docs/accounts-and-applications.md).
 - Users can create multiple clusters, invite others with seven-day bearer links, join clusters, rename/delete their own clusters, leave clusters they joined, view members, remove members, and revoke invite links as the owner.
 - A member can register a node. The current browser tab connects it over an outbound WebSocket, sends heartbeats, and receives pause/resume controls. Keep that tab open to keep the browser node online. Save the server-generated node connection key. New browser clients authenticate in the first WebSocket message; legacy query-token connections remain compatible for migration. Native worker agents can implement the same protocol.
-- When `GH_TOKEN` is present, state is loaded from and committed to the private `MESH_STORAGE_REPO` GitHub repository (default `Wuhpondiscord/gpuclustertest-state`), file `MESH_STORAGE_PATH` (default `mesh-state.json`) on `MESH_STORAGE_BRANCH` (default `main`). Invite and node bearer tokens are SHA-256 hashed before storage. For local development without `GH_TOKEN`, JSON is written to `MESH_DATA_FILE` (default `/tmp/mesh-state.json`).
+- When `GH_TOKEN` is present, state is loaded from and committed to the private `MESH_STORAGE_REPO` GitHub repository (default `Wuhpondiscord/gpuclustertest-state`), file `MESH_STORAGE_PATH` (default `mesh-state.json`) on `MESH_STORAGE_BRANCH` (default `main`). Invite and node bearer tokens are SHA-256 hashed before storage. For local development without `GH_TOKEN`, the same encrypted envelope is written to `MESH_DATA_FILE` (default `/tmp/mesh-state.json`). All durable storage requires the separate `MESH_STATE_ENCRYPTION_KEY`. Deployment provisions it only if missing, migrates existing plaintext during a bounded one-time window before serving traffic, then removes the import permission. Preserve both encryption secrets and read the [migration/history limitations](docs/database-leak-review.md) before restoring or moving storage.
 - GitHub snapshot storage is intended for one low-volume coordinator. Set the fine-grained token as the Hugging Face Space secret named `GH_TOKEN`, restricted to the private data repository with Contents read/write permission. The empty data repo can be initialized by the app on its first write. Optionally set the Space variable `MESH_STORAGE_REPO` to another `owner/repo`; the default is `Wuhpondiscord/gpuclustertest-state`. Do not put state in the public source repository. Each accepted update is one GitHub commit guarded by the saved file revision; if another writer wins first, the coordinator reloads the latest file and retries the mutation up to three times. This is best-effort optimistic concurrency for a single low-volume coordinator, not SQL transactions or a multi-replica database. Git history gives recovery points, but frequent writes grow the repository.
 
 ## Recovery prototype and benchmark
