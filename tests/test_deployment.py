@@ -1,6 +1,7 @@
 """Exercise the actual deployment script with fake HF/HTTP boundaries, no credentials."""
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -17,7 +18,7 @@ SCRIPT = textwrap.dedent(
 
 
 class DeploymentTests(unittest.TestCase):
-    def run_deployment(self, existing, ready=True):
+    def run_deployment(self, existing, ready=True, recipient=None, current_recipient=None, export_matches=True):
         events, configured = [], set(existing)
         clock = [0]
 
@@ -27,6 +28,13 @@ class DeploymentTests(unittest.TestCase):
 
             def get_space_secrets(self, **_):
                 return {key: object() for key in configured}
+
+            def get_space_variables(self, **_):
+                return {} if current_recipient is None else {"MESH_KEY_RECOVERY_RECIPIENT": types.SimpleNamespace(value=current_recipient)}
+
+            def add_space_variable(self, key, value, **_):
+                assert key == "MESH_KEY_RECOVERY_RECIPIENT" and value == recipient
+                events.append(("pin", value))
 
             def add_space_secret(self, key, value, **_):
                 if key.endswith("ENCRYPTION_KEY"):
@@ -50,7 +58,11 @@ class DeploymentTests(unittest.TestCase):
                 })
 
         class FakeResponse:
-            headers = {"x-mesh-state-format": "mesh-state-aes256gcm-v1"}
+            headers = {"x-mesh-state-format": "mesh-state-aes256gcm-v1",
+                       "x-mesh-recovery-recipient": recipient if export_matches else "wrong-recipient"}
+
+            def read(self, _):
+                return b"age-encryption.org/v1\nsynthetic encrypted backup"
 
             def __enter__(self):
                 events.append(("health",))
@@ -74,6 +86,7 @@ class DeploymentTests(unittest.TestCase):
             }), patch.dict("sys.modules", {"huggingface_hub": types.SimpleNamespace(HfApi=FakeApi)}), \
                 patch("urllib.request.urlopen", side_effect=lambda *_a, **_k: FakeResponse()), \
                 patch("time.monotonic", side_effect=monotonic), patch("time.sleep", side_effect=sleep), \
+                patch.object(Path, "read_text", return_value=json.dumps({"test/space": recipient} if recipient else {})), \
                 patch("secrets.token_hex", return_value="ab" * 32), contextlib.redirect_stdout(output):
                 failure = None
                 try:
@@ -108,6 +121,24 @@ class DeploymentTests(unittest.TestCase):
         self.assertIsNone(failure)
         self.assertFalse(any(e[0] == "add" for e in events))
         self.assertIn(("delete", "MESH_STATE_PLAINTEXT_MIGRATION_UNTIL"), events)
+
+    def test_recovery_pins_only_public_recipient_and_checks_export(self):
+        recipient = "age1" + "q" * 58
+        events, failure = self.run_deployment({"MESH_AUTH_ENCRYPTION_KEY", "MESH_STATE_ENCRYPTION_KEY"}, recipient=recipient)
+        self.assertIsNone(failure)
+        self.assertIn(("pin", recipient), events)
+        self.assertFalse(any(e[0] == "add" for e in events))
+
+    def test_recovery_never_silently_replaces_an_existing_recipient(self):
+        events, failure = self.run_deployment({"MESH_AUTH_ENCRYPTION_KEY", "MESH_STATE_ENCRYPTION_KEY"},
+            recipient="age1" + "q" * 58, current_recipient="age1" + "p" * 58)
+        self.assertIsInstance(failure, SystemExit)
+        self.assertFalse(any(e[0] in ("pin", "upload") for e in events))
+
+    def test_recovery_export_must_match_the_requested_recipient(self):
+        _, failure = self.run_deployment({"MESH_AUTH_ENCRYPTION_KEY", "MESH_STATE_ENCRYPTION_KEY"},
+            recipient="age1" + "q" * 58, export_matches=False)
+        self.assertIsInstance(failure, SystemExit)
 
 
 if __name__ == "__main__":

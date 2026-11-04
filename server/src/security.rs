@@ -104,6 +104,11 @@ pub struct Runtime {
     signup: Bucket,
     encryption_key: Option<[u8; 32]>,
 }
+impl Runtime {
+    pub(crate) fn key_for_operator_backup(&self) -> Option<[u8; 32]> {
+        self.encryption_key
+    }
+}
 impl Default for Runtime {
     fn default() -> Self {
         let encryption_key = std::env::var("MESH_AUTH_ENCRYPTION_KEY")

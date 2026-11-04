@@ -18,6 +18,8 @@ Before a multi-device trial, use the [three-device recovery test guide](docs/thr
 
 [Accounts and private applications](docs/accounts-and-applications.md) describes server-generated account keys, authenticator setup, private management URLs and the execution trust boundary. [Database leak impact and encrypted storage](docs/database-leak-review.md) covers snapshot disclosure, migration, history and recovery limits.
 
+[Operator key recovery](docs/operator-key-recovery.md) explains encrypted export and local recovery of the actual Space encryption values, without resetting account data.
+
 ## GitHub → Hugging Face
 
 GitHub Actions builds the React UI, runs Rust unit tests, and builds the Docker image on pull requests and pushes to `main`. A successful `main` push uploads the tested source to this Docker Space, which then builds the `Dockerfile`.
