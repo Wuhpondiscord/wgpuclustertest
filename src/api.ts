@@ -7,9 +7,15 @@ export function isRevokedAccess(error: unknown) {
 }
 
 let bootstrap: Promise<string> | null = null
-export function setIdentity(session: string, username?: string) {
+export function setIdentity(session: string, username?: string, preserveAnonymous = false) {
+  // Keep the actual pre-registration principal across a closed tab until save
+  // confirmation. Prefer an existing anonymous key over a pending session.
+  if (preserveAnonymous && !localStorage.getItem('mesh.identity')) {
+    const previous = sessionStorage.getItem('mesh.account-session')
+    if (previous) localStorage.setItem('mesh.identity', previous)
+  }
   sessionStorage.setItem('mesh.account-session', session)
-  localStorage.removeItem('mesh.identity')
+  if (!preserveAnonymous) localStorage.removeItem('mesh.identity')
   if (username) localStorage.setItem('mesh.last-account', username)
 }
 export async function getIdentity(): Promise<string> {

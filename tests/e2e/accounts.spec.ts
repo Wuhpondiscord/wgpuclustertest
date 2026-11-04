@@ -21,8 +21,10 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await expect(saved).toBeVisible()
   const root = (await saved.locator('.account-secret').innerText()).trim()
   expect(root).toMatch(/^[0-9a-f]{64}$/)
+  expect(await page.evaluate(() => Boolean(localStorage.getItem('mesh.identity')))).toBe(true)
   await saved.getByRole('button', { name: 'I saved these securely' }).click()
   await expect(saved).toHaveCount(0)
+  expect(await page.evaluate(() => localStorage.getItem('mesh.identity'))).toBeNull()
   const create = page.getByRole('button', { name: 'New cluster', exact: true })
   await create.click(); await page.getByTestId('app-dialog-input').fill('private application pool'); await page.getByTestId('app-dialog-submit').click()
   await page.getByLabel('Application name', { exact: true }).fill('Private image worker')
@@ -87,4 +89,32 @@ test('browser node keys authenticate in the first WebSocket message instead of t
   expect(urls.filter(url => url.includes('/api/nodes/connect')).every(url => !url.includes('token='))).toBe(true)
   await page.getByRole('button', { name: 'Close', exact: true }).click()
   await expect(page.getByText('Connected · storage verified', { exact: false })).toBeVisible()
+})
+
+test('closing before saving an account key preserves anonymous ownership for registration recovery', async ({ browser }) => {
+  const username = `pending-${randomBytes(4).toString('hex')}`
+  const first = await browser.newContext()
+  let reopened: import('@playwright/test').BrowserContext | undefined
+  try {
+    const page = await first.newPage(); await page.goto('/')
+    await page.getByRole('button', { name: 'New cluster', exact: true }).click()
+    await page.getByTestId('app-dialog-input').fill('preserved pending ownership')
+    await page.getByTestId('app-dialog-submit').click()
+    await page.getByRole('button', { name: 'Create account', exact: true }).click()
+    await page.getByLabel('Username', { exact: true }).fill(username)
+    await page.getByRole('button', { name: 'Register username', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: 'Save your account key', exact: true })).toBeVisible()
+    const state = await first.storageState(); await first.close()
+    // A fresh tab has localStorage but no account session or one-time key modal.
+    reopened = await browser.newContext({ storageState: state })
+    const second = await reopened.newPage(); await second.goto('/')
+    await expect(second.getByRole('button', { name: 'Create account', exact: true })).toBeVisible()
+    await second.getByRole('button', { name: 'Create account', exact: true }).click()
+    await second.getByLabel('Username', { exact: true }).fill(username)
+    await second.getByRole('button', { name: 'Register username', exact: true }).click()
+    const save = second.getByRole('dialog', { name: 'Save your account key', exact: true })
+    await expect(save).toBeVisible(); await save.getByRole('button', { name: 'I saved these securely' }).click()
+    await expect(second.getByRole('heading', { name: 'preserved pending ownership', exact: true })).toBeVisible()
+    await expect(second.getByRole('button', { name: 'Account security', exact: true })).toBeEnabled()
+  } finally { await first.close(); await reopened?.close() }
 })

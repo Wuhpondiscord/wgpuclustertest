@@ -35,7 +35,17 @@ export function AccountApplications({ clusterId, changed }: { clusterId?: string
   useEffect(() => { let active = true; void refresh().catch(e => { if (active) setError(e.message) }); return () => { active = false } }, [clusterId])
   useEffect(() => {
     if (!mode && !saved) return
-    const close = (event: KeyboardEvent) => { if (event.key === 'Escape' && !saved && !busy) { setMode(null); setKey(''); setCode(''); setSetup(null) } }
+    const dialogs = document.querySelectorAll<HTMLElement>('.account-applications [role="dialog"]')
+    const activeDialog = dialogs[dialogs.length - 1]
+    const focusable = () => [...(activeDialog?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href]') ?? [])]
+    if (!activeDialog?.contains(document.activeElement)) focusable()[0]?.focus()
+    const close = (event: KeyboardEvent) => {
+      if (event.key === 'Tab') {
+        const elements = focusable(); const index = elements.indexOf(document.activeElement as HTMLElement)
+        if (elements.length && (index === -1 || event.shiftKey && index === 0 || !event.shiftKey && index === elements.length - 1)) { event.preventDefault(); elements[event.shiftKey ? elements.length - 1 : 0].focus() }
+      }
+      if (event.key === 'Escape' && !saved && !busy) { setMode(null); setKey(''); setCode(''); setSetup(null) }
+    }
     document.addEventListener('keydown', close); return () => document.removeEventListener('keydown', close)
   }, [mode, saved, busy])
   async function run(action: () => Promise<void>) {
@@ -48,7 +58,7 @@ export function AccountApplications({ clusterId, changed }: { clusterId?: string
     await run(async () => {
       if (mode === 'signup') {
         const result = await api<{ account: Account; key: string; session: string }>('/api/accounts', { method: 'POST', body: JSON.stringify({ username }) })
-        setIdentity(result.session, result.account.username); setAccount(result.account); setSaved({ title: 'Save your account key', values: [result.key] }); setMode(null); changed()
+        setIdentity(result.session, result.account.username, true); setAccount(result.account); setSaved({ title: 'Save your account key', values: [result.key] }); setMode(null); changed()
       } else if (mode === 'login') {
         const result = await api<{ account: Account; session: string }>('/api/accounts/login', { method: 'POST', body: JSON.stringify({ username, key: key.trim(), code: code.trim() }) })
         if (localStorage.getItem('mesh.last-account') !== result.account.username) clearDeviceCredentials()
@@ -106,7 +116,7 @@ export function AccountApplications({ clusterId, changed }: { clusterId?: string
       </div>}
     </section></div>}
     {saved && <div className="dialog-shade"><section className="credentials-dialog" role="dialog" aria-modal="true" aria-label={saved.title}><h2>{saved.title}</h2><p>Shown once. Save these securely before continuing. Recovery codes are each usable once together with your account key.</p><div className="account-secret">{saved.values.map(value => <div key={value}>{value}</div>)}</div><button className="manage-button" onClick={() => void navigator.clipboard.writeText(saved.values.join('\n'))}>Copy saved credentials</button><button autoFocus className="manage-button primary" disabled={busy} onClick={() => void run(async () => {
-      if (saved.title === 'Save your account key') await api('/api/account/activate', { method: 'POST' })
+      if (saved.title === 'Save your account key') { await api('/api/account/activate', { method: 'POST' }); localStorage.removeItem('mesh.identity') }
       if (saved.title === 'Save your replacement account key') { const result = await api<{ session: string }>('/api/account/key/confirm', { method: 'POST', body: JSON.stringify({ key: saved.values[0] }) }); setIdentity(result.session) }
       setSaved(null); await refresh(); changed()
     })}>I saved these securely</button></section></div>}
