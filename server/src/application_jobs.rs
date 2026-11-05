@@ -855,6 +855,23 @@ pub struct ReleaseInput {
     lease: recovery::TaskLease,
     error: Option<String>,
 }
+fn note_failure(store: &mut Store, id: Uuid, error: &str) -> ApiResult<()> {
+    let job = store.application_jobs.get(&id).ok_or_else(hidden)?;
+    // A takeover may finish between the runtime release and this durable write.
+    // A late failure must never override an accepted or otherwise terminal job.
+    if !matches!(
+        status(job, store),
+        "queued" | "running" | "awaiting_verification"
+    ) {
+        return Ok(());
+    }
+    let job = store.application_jobs.get_mut(&id).ok_or_else(hidden)?;
+    job.failures += 1;
+    if job.failures >= 3 {
+        job.failed = Some(format!("Three worker attempts failed: {error}"));
+    }
+    Ok(())
+}
 pub async fn release(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -881,12 +898,7 @@ pub async fn release(
             .collect::<String>();
         mutate_store(&state, |store| {
             worker_access(store, id, &user, &input.lease, false)?;
-            let job = store.application_jobs.get_mut(&id).ok_or_else(hidden)?;
-            job.failures += 1;
-            if job.failures >= 3 {
-                job.failed = Some(format!("Three worker attempts failed: {error}"));
-            }
-            Ok(())
+            note_failure(store, id, &error)
         })
         .await?;
     }

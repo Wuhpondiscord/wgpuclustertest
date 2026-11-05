@@ -696,3 +696,45 @@ async fn browser_cors_and_result_body_limit_are_enforced_at_router() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn a_delayed_failure_counter_cannot_override_a_completed_takeover() {
+    let f = Fixture::new().await;
+    let job = f.submit(numeric()).await;
+    let id = Uuid::parse_str(job["id"].as_str().unwrap()).unwrap();
+    for node in 0..2 {
+        let attempt = f.claim(node, false).await;
+        let response = call(
+            &f.router,
+            "POST",
+            &format!("/api/application-work/{id}/release"),
+            &f.session,
+            json!({"lease":attempt["lease"],"error":"device failure"}),
+            None,
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::NO_CONTENT);
+    }
+    // Pause the third failure between its runtime release and durable counter.
+    let failed = f.claim(2, false).await;
+    call(
+        &f.router,
+        "POST",
+        &format!("/api/application-work/{id}/release"),
+        &f.session,
+        json!({"lease":failed["lease"]}),
+        None,
+    )
+    .await;
+    let takeover = f.claim(0, false).await;
+    assert_eq!(
+        f.commit(&takeover, json!([5., 7., 9.]), json!([3])).await.0,
+        StatusCode::OK
+    );
+    let mut store = f.state.store.lock().unwrap();
+    note_failure(&mut store, id, "late third failure").unwrap();
+    let result = summary(&store.application_jobs[&id], &store);
+    assert_eq!(result.status, "completed");
+    assert_eq!(result.output.unwrap().values, vec![5., 7., 9.]);
+    assert!(result.error.is_none());
+}
