@@ -20,9 +20,9 @@ sha1 = "0.10"
 subtle = "2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
-tower-http = { version = "0.5", features = ["fs"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
 ureq = { version = "2.12", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
-[dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+

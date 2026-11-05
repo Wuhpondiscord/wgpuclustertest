@@ -27,6 +27,7 @@ use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 use mesh_coordinator::recovery;
+mod application_jobs;
 mod custody;
 mod delivery;
 mod operator_recovery;
@@ -87,6 +88,10 @@ struct Store {
     #[serde(default)]
     accounts: HashMap<String, security::Account>,
     #[serde(default)]
+    application_jobs: HashMap<Uuid, application_jobs::Job>,
+    #[serde(default)]
+    application_keys: HashMap<Uuid, application_jobs::AppKey>,
+    #[serde(default)]
     applications: HashMap<Uuid, security::Application>,
     #[serde(default)]
     revoked_credentials: std::collections::HashSet<String>,
@@ -115,6 +120,7 @@ impl Store {
                     .revoke_worker_leases(&id.to_string(), now_ms());
             }
         }
+        application_jobs::revoke_ineligible_leases(self);
     }
 }
 
@@ -685,6 +691,7 @@ where
     let mut change = change;
     for attempt in 0..=MAX_STORAGE_CONFLICT_RETRIES {
         let result = change(&mut next)?;
+        application_jobs::prune(&mut next);
         next.invites.retain(|_, invite| invite.expires_at > now());
         let persist_state = state.clone();
         let persistence_snapshot = next.clone();
@@ -2755,6 +2762,7 @@ fn app(state: AppState) -> Router {
         .route("/api/nodes/:id", axum::routing::delete(delete_node))
         .route("/api/nodes/connect", get(node_socket))
         .route("/api/operator/key-backup", get(operator_recovery::download))
+        .merge(application_jobs::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -2762,6 +2770,13 @@ fn app(state: AppState) -> Router {
         ))
         .with_state(state.clone())
         .nest_service("/assets", ServeDir::new("dist/assets"))
+        .nest_service("/ort", ServeDir::new("dist/ort"))
+        .nest_service(
+            "/sdk",
+            tower::ServiceBuilder::new()
+                .layer(tower_http::cors::CorsLayer::new().allow_origin(tower_http::cors::Any))
+                .service(ServeDir::new("dist/sdk")),
+        )
         .route("/:username/:application", get(security::application_page))
         .fallback_service(ServeDir::new("dist").append_index_html_on_directories(true))
 }
@@ -3107,7 +3122,7 @@ mod tests {
     }
 
     impl AppState {
-        fn for_test() -> Self {
+        pub(crate) fn for_test() -> Self {
             Self {
                 store: Arc::new(Mutex::new(Store::default())),
                 mutation_lock: Arc::new(tokio::sync::Mutex::new(())),

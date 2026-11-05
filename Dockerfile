@@ -1,9 +1,11 @@
 FROM node:22-alpine AS frontend
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --no-audit --no-fund
 COPY index.html tsconfig.json tsconfig.app.json vite.config.ts ./
 COPY src ./src
+COPY scripts ./scripts
+COPY public ./public
 RUN npm run build
 
 FROM rust:1.99.1-slim AS backend

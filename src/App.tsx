@@ -156,7 +156,7 @@ function App() {
     contributionOptions.current = { ...contributionOptions.current, [id]: settings }
     setContributions(contributionOptions.current)
     if (!settings.enabled) runners.current.get(id)?.stop()
-    else runners.current.get(id)?.wake()
+    else runners.current.get(id)?.settingsChanged()
     // Re-read membership before restoring any newly enabled contributor.
     if (settings.enabled) void refreshClusters(activeSelection.current).catch(() => undefined)
   }), [])
@@ -413,14 +413,14 @@ function App() {
     })
   }
   function settingsFor(node: Node): ContributionSettings {
-    return contributionOptions.current[node.id] ?? { clusterId: node.cluster_id, enabled: false, dutyCycle: 100, allowCpuFallback: true, pauseWhenHidden: false }
+    return contributionOptions.current[node.id] ?? { clusterId: node.cluster_id, enabled: false, dutyCycle: 100, allowCpuFallback: true, pauseWhenHidden: false, allowInference: false }
   }
   function updateContribution(node: Node, patch: Partial<ContributionSettings>) {
     const settings = { ...settingsFor(node), ...patch }
     contributionOptions.current = { ...contributionOptions.current, [node.id]: settings }
     setContributions(contributionOptions.current)
     saveContributionSettings(node.id, settings)
-    runners.current.get(node.id)?.wake()
+    runners.current.get(node.id)?.settingsChanged()
     return settings
   }
   function stopContributor(id: string) {

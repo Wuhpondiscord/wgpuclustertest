@@ -370,6 +370,15 @@ impl RecoveryLedger {
             .and_then(|record| record.observation.clone())
     }
 
+    pub fn active_lease(&self, task_id: &str, now_ms: u64) -> Option<TaskLease> {
+        self.tasks
+            .get(task_id)?
+            .lease
+            .as_ref()
+            .filter(|lease| lease.expires_at_ms > now_ms)
+            .cloned()
+    }
+
     /// Voluntary release only affects the exact current attempt. It does not
     /// advance the generation; the next claim performs the fencing transition.
     pub fn release(&mut self, lease: &TaskLease, now_ms: u64) -> Result<(), LeaseError> {

@@ -1,7 +1,7 @@
 import { api, ApiError } from './api'
 import type { TaskLease } from './compute-types'
 
-export function maintainLease(jobId: string, initial: TaskLease, claimedAt: number, parent: AbortSignal) {
+export function maintainLease(jobId: string, initial: TaskLease, claimedAt: number, parent: AbortSignal, renewPath = `/api/jobs/${jobId}/renew`) {
   parent.throwIfAborted()
   let current = initial
   let stopped = false
@@ -19,7 +19,7 @@ export function maintainLease(jobId: string, initial: TaskLease, claimedAt: numb
     const startedAt = performance.now()
     let delay = 10_000
     try {
-      current = await api<TaskLease>(`/api/jobs/${jobId}/renew`, {
+      current = await api<TaskLease>(renewPath, {
         method: 'POST', body: JSON.stringify({ lease: current }), signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
       })
       if (!stopped && !signal.aborted) armExpiry(startedAt)

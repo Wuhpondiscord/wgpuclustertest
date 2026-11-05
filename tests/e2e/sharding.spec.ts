@@ -346,7 +346,7 @@ test('a bare proxy 404 during reconnect retains the remembered device and opt-in
       const NativeSocket = window.WebSocket
       const sockets: WebSocket[] = []
       window.WebSocket = class extends NativeSocket {
-        constructor(url: string | URL, protocols?: string | string[]) { super(url, protocols); sockets.push(this) }
+        constructor(url: string | URL, protocols?: string | string[]) { super(url, protocols); if (new URL(String(url), location.href).pathname === '/api/nodes/connect') sockets.push(this) }
       }
       Object.assign(window, { dropTestSockets: () => sockets.forEach(socket => socket.close()) })
     })
@@ -636,7 +636,7 @@ test('reconnecting an older cluster node preserves the selected cluster', async 
         const NativeSocket = window.WebSocket
         const sockets: WebSocket[] = []
         window.WebSocket = class extends NativeSocket {
-          constructor(url: string | URL, protocols?: string | string[]) { super(url, protocols); sockets.push(this) }
+          constructor(url: string | URL, protocols?: string | string[]) { super(url, protocols); if (new URL(String(url), location.href).pathname === '/api/nodes/connect') sockets.push(this) }
         }
         Object.assign(window, { dropTestSockets: () => sockets.forEach(socket => socket.close()) })
       })

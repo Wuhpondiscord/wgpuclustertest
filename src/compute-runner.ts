@@ -1,3 +1,5 @@
+import { ApplicationRunner } from './application-runner'
+import type { ApplicationWork } from './application-types'
 import { api, ApiError } from './api'
 import type { ClusterNode, ComputeJob, ExecutionReport, JobLease, ShardReceipt } from './compute-types'
 import type { ContributionSettings } from './contribution-settings'
@@ -43,6 +45,10 @@ export class ComputeRunner {
   private attempt: AbortController | null = null
   private wakeEvent = new WorkWake()
   private gpu: Awaited<ReturnType<typeof createVectorAddExecutor>> = null
+  private applications = new ApplicationRunner()
+  private preferApplications = true
+  private applicationRetryAt = 0
+  private activeInference = false
   private gpuRetryAt = 0
   private gpuReason: string | null = null
   private excludedUntil = new Map<string, number>()
@@ -53,6 +59,10 @@ export class ComputeRunner {
   private state: RunnerState = { phase: 'waiting', message: 'Waiting for work', completed: 0, retries: 0 }
   constructor(private readonly options: RunnerOptions) {}
   wake() { this.wakeEvent.wake() }
+  settingsChanged() {
+    if (this.activeInference && !this.options.settings().allowInference) this.attempt?.abort(new Error('ML participation disabled'))
+    this.wake()
+  }
   transportChanged() { this.attempt?.abort(new Error('Node transport changed; resynchronizing')); this.wake() }
   stop() { this.controller.abort(new DOMException('Contribution stopped', 'AbortError')); this.transportChanged() }
   private report(patch: Partial<RunnerState>) { this.state = { ...this.state, ...patch }; this.options.state(this.state) }
@@ -81,6 +91,33 @@ export class ComputeRunner {
         let attemptCommitted = false
         let job: ComputeJob | undefined
         try {
+          if (!this.options.jobId && this.preferApplications && performance.now() >= this.applicationRetryAt) {
+            this.preferApplications = false
+            const claimedAt = performance.now()
+            const work = await this.request<ApplicationWork | null>(`/api/clusters/${this.options.clusterId}/application-work/claim`, signal, { method: 'POST', body: JSON.stringify({ node_id: this.options.nodeId, inference: settings.allowInference }) })
+            if (work) {
+              // Consent can change while the claim request is in flight.
+              if (work.input.operation === 'embedding' && !this.options.settings().allowInference) {
+                await this.request(`/api/application-work/${work.job_id}/release`, signal, { method: 'POST', body: JSON.stringify({ lease: work.lease }) }).catch(() => undefined)
+                continue
+              }
+              const localAttempt = new AbortController(); this.attempt = localAttempt
+              this.activeInference = work.input.operation === 'embedding'
+              this.report({ phase: 'running', jobId: work.job_id, message: `Running private application ${work.input.operation}` })
+              try {
+                const result = await this.applications.execute(work, claimedAt, this.options.settings().allowCpuFallback, AbortSignal.any([signal, localAttempt.signal]), message => this.report({ message }))
+                this.report({ phase: 'waiting', completed: this.state.completed + 1, message: result.status === 'failed' ? 'Verification failed; output withheld' : 'Application result accepted', executionMode: result.backend, fallbackReason: result.fallback_reason, lastError: undefined })
+                const cooldown = result.compute_ms * (100 / this.options.settings().dutyCycle - 1)
+                if (cooldown > 0) await delay(cooldown, signal)
+              } catch (error) {
+                if (error instanceof ApiError && error.code === 'account_session_required') throw error
+                this.applicationRetryAt = performance.now() + 30_000
+                this.report({ phase: 'backoff', retries: this.state.retries + 1, message: `Application attempt interrupted: ${error instanceof Error ? error.message : 'Worker failure'}` })
+              } finally { this.activeInference = false; if (this.attempt === localAttempt) this.attempt = null }
+              continue
+            }
+          }
+          this.preferApplications = true
           const jobs = await this.readJobs()
           this.options.jobs(jobs)
           const candidates = jobs.filter(job => job.completed_batches < job.total_batches && !this.blockedJobs.has(job.id) && (!this.options.jobId || job.id === this.options.jobId))
@@ -150,6 +187,7 @@ export class ComputeRunner {
       if (!signal.aborted) this.report({ phase: 'error', message: error instanceof Error ? error.message : 'Worker stopped unexpectedly' })
     } finally {
       document.removeEventListener('visibilitychange', onVisibility)
+      this.applications.close()
       this.gpu?.close(); this.gpu = null
       if (this.state.phase !== 'error') this.report({ phase: 'stopped', message: 'Contribution stopped' })
     }

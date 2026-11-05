@@ -1,4 +1,4 @@
-export type ContributionSettings = { clusterId: string; enabled: boolean; dutyCycle: number; allowCpuFallback: boolean; pauseWhenHidden: boolean }
+export type ContributionSettings = { clusterId: string; enabled: boolean; dutyCycle: number; allowCpuFallback: boolean; pauseWhenHidden: boolean; allowInference: boolean }
 const TOKENS = 'mesh.node-tokens'
 const REMEMBERED = 'mesh.remembered-node-tokens'
 const SETTINGS = 'mesh.contribution-settings'
@@ -34,7 +34,7 @@ export function forgetNode(id: string) {
 export function allContributionSettings(): Record<string, ContributionSettings> {
   const settings = { ...read<ContributionSettings>(localStorage, SETTINGS), ...read<ContributionSettings>(sessionStorage, SETTINGS) }
   return Object.fromEntries(Object.entries(settings).filter(([, value]) => value && typeof value.clusterId === 'string' && typeof value.enabled === 'boolean')
-    .map(([id, value]) => [id, { ...value, dutyCycle: [10, 25, 50, 100].includes(value.dutyCycle) ? value.dutyCycle : 100, allowCpuFallback: value.allowCpuFallback !== false, pauseWhenHidden: value.pauseWhenHidden === true }]))
+    .map(([id, value]) => [id, { ...value, dutyCycle: [10, 25, 50, 100].includes(value.dutyCycle) ? value.dutyCycle : 100, allowCpuFallback: value.allowCpuFallback !== false, pauseWhenHidden: value.pauseWhenHidden === true, allowInference: value.allowInference === true }]))
 }
 export function getContributionSettings(id: string) { return allContributionSettings()[id] }
 export function saveContributionSettings(id: string, value: ContributionSettings) {
@@ -58,7 +58,7 @@ export function subscribeContributionSettings(changed: (id: string, value: Contr
     if (typeof item.clusterId !== 'string' || typeof item.enabled !== 'boolean') return
     const normalized: ContributionSettings = { clusterId: item.clusterId, enabled: item.enabled,
       dutyCycle: [10, 25, 50, 100].includes(item.dutyCycle ?? 0) ? item.dutyCycle! : 100,
-      allowCpuFallback: item.allowCpuFallback !== false, pauseWhenHidden: item.pauseWhenHidden === true }
+      allowCpuFallback: item.allowCpuFallback !== false, pauseWhenHidden: item.pauseWhenHidden === true, allowInference: item.allowInference === true }
     // Replace this tab's stale session override without writing/broadcasting back.
     sessionStorage.setItem(SETTINGS, JSON.stringify({ ...read<ContributionSettings>(sessionStorage, SETTINGS), [id]: normalized }))
     changed(id, normalized)
