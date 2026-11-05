@@ -96,9 +96,13 @@ HTTP routes, all scoped to `/api/applications/:application_id`:
 | `GET/POST /keys`, `DELETE /keys/:key_id` | application owner account session only |
 
 Developer requests use `Authorization: Bearer mak_…`, never a token in a URL.
-Job/inference routes allow cross-origin Bearer requests without credential cookies;
-account-session headers are not allowed by their CORS preflight. CORS is not
-authorization. Browser UI uses its existing short-lived account session.
+The coordinator allows cross-origin Bearer requests without credential cookies.
+Its own preflight excludes account-session headers, but the Hugging Face edge
+proxy may answer preflights itself and reflect additional requested headers. Do
+not treat CORS or an origin allowlist as authorization: every request still needs
+an explicit valid credential and application permission. Mesh does not use
+ambient credential cookies; the browser UI sends its short-lived account session
+explicitly from sessionStorage, which other origins cannot read.
 
 POST supports `Idempotency-Key` (1–64 alphanumeric, hyphen or underscore). Reuse
 the same key and payload when retrying an ambiguous submission; a different
