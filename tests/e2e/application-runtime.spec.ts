@@ -1,7 +1,9 @@
 import { randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { test, expect, type Browser } from '@playwright/test'
 import type { ApplicationJob } from '../../src/application-types'
 const origin = 'http://127.0.0.1:5173'
+const manifest = JSON.parse(readFileSync(new URL('../../mesh.json', import.meta.url), 'utf8'))
 let session: string
 async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
   const response = await fetch(`${origin}${path}`, { method, headers: { 'X-Mesh-Identity': session, ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) })
@@ -45,6 +47,57 @@ async function extraContributor(browser: Browser, clusterId: string, inference: 
   await expect(page.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
   return { context, page, nodeId: node.node.id }
 }
+
+test('an uploaded workflow persists, runs on a contributor, and can be replaced by a pinned GitHub import', async ({ browser }) => {
+  const f = await fixture(browser)
+  try {
+    const { page } = f
+    const panel = page.getByRole('region', { name: 'Application deployment' })
+    await panel.getByLabel('Upload mesh.json').setInputFiles({
+      name: 'mesh.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(manifest)),
+    })
+    await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
+    await panel.getByRole('button', { name: 'Save deployment', exact: true }).click()
+    await expect(panel.getByText(manifest.name, { exact: true })).toBeVisible()
+    const saved = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
+    await page.reload()
+    await page.getByRole('button', { name: 'Browser runtime · owner', exact: true }).click()
+    await expect(panel.getByText(manifest.name, { exact: true })).toBeVisible()
+    await panel.getByRole('button', { name: 'Run deployment', exact: true }).click()
+    const output = page.getByTestId('application-job')
+    await expect(output.getByTestId('application-job-status')).toHaveText(['completed', 'completed'], { timeout: 60_000 })
+    const jobs = await api<ApplicationJob[]>(`/api/applications/${f.app.id}/jobs`)
+    expect(jobs).toHaveLength(2)
+    expect(jobs.find(job => job.deployment?.name === 'add')?.output?.values).toEqual([4, 6])
+    expect(jobs.find(job => job.deployment?.name === 'multiply')?.output?.values).toEqual([19, 22, 43, 50])
+    expect(jobs.every(job => job.deployment?.revision_id === saved.id)).toBe(true)
+
+    const sha = 'a'.repeat(40)
+    const repository = 'mesh-test/workflow'
+    const imported = { ...manifest, name: 'GitHub workflow' }
+    await page.route(`https://api.github.com/repos/${repository}/commits?*`, async route => {
+      expect(new URL(route.request().url()).searchParams.get('sha')).toBe('main')
+      expect(route.request().headers().authorization).toBeUndefined()
+      await route.fulfill({ json: [{ sha }], headers: { 'access-control-allow-origin': '*' } })
+    })
+    await page.route(`https://raw.githubusercontent.com/${repository}/${sha}/mesh.json`, async route => {
+      expect(route.request().headers()['x-mesh-identity']).toBeUndefined()
+      await route.fulfill({ json: imported, headers: { 'access-control-allow-origin': '*' } })
+    })
+    await panel.getByText('Replace deployment', { exact: true }).click()
+    await panel.getByLabel('Public GitHub repository').fill(`https://github.com/${repository}`)
+    await panel.getByLabel('Branch or commit').fill('main')
+    await panel.getByRole('button', { name: 'Preview GitHub workflow', exact: true }).click()
+    await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
+    await expect(panel.getByText(sha, { exact: true })).toBeVisible()
+    await panel.getByRole('button', { name: 'Replace deployment', exact: true }).click()
+    await expect(panel.getByText(imported.name, { exact: true })).toBeVisible()
+    const replacement = await api<{ id: string; source: unknown }>(`/api/applications/${f.app.id}/deployment`)
+    expect(replacement.id).not.toBe(saved.id)
+    expect(replacement.source).toEqual({ kind: 'github', repository, commit: sha })
+    await expect(output.getByTestId('application-job-status')).toHaveText(['completed', 'completed'])
+  } finally { await f.close() }
+})
 
 test('queued browser matrix jobs commit once after a lost response and scoped SDK reads results', async ({ browser }) => {
   const f = await fixture(browser)

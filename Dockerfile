@@ -2,7 +2,7 @@ FROM node:22-alpine AS frontend
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --no-audit --no-fund
-COPY index.html tsconfig.json tsconfig.app.json vite.config.ts ./
+COPY index.html tsconfig.json tsconfig.app.json vite.config.ts mesh.json ./
 COPY src ./src
 COPY scripts ./scripts
 COPY public ./public

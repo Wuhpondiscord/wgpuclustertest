@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
+import { ApplicationDeployment } from './ApplicationDeployment'
 import type { ApplicationInput, ApplicationJob } from './application-types'
 
 type AppKey = { id: string; label: string; expires_at: number; read_only: boolean }
@@ -64,6 +65,10 @@ const job = await mesh.embeddings(['Your text here']);
 const result = await mesh.wait(job);
 console.log(result.output);`
   return <section className="application-runtime" aria-label="Browser application runtime">
+    <ApplicationDeployment appId={appId} role={role} onQueued={queued => {
+      const ids = new Set(queued.map(job => job.id))
+      setJobs(current => [...queued, ...current.filter(job => !ids.has(job.id))])
+    }}/>
     <h3>Browser jobs</h3>
     <p>Run bounded numerical operations and text embeddings on connected browser workers. Workers must belong to this cluster and have owner or operator access to this application. Enable contribution on their device; opt into ML downloads for embeddings.</p>
     <p>Inputs and results are private to app members and approved workers. Worker devices can inspect their tasks; use trusted operators for sensitive data. This runtime executes jobs, rather than hosting an always-on web server.</p>
@@ -76,7 +81,7 @@ console.log(result.output);`
     </form>}
     <div className="application-job-list" aria-label="Application jobs">
       {!jobs.length && <p>No jobs yet. Jobs wait until an approved contributor is connected.</p>}
-      {jobs.map(job => <article className="runtime-job" key={job.id} data-testid="application-job"><strong>{job.input.operation}</strong> · <span data-testid="application-job-status">{job.status}</span><div><code>{job.id}</code></div><p>{job.verification.split('_').join(' ')} · {job.replicas_received}/{job.replicas_required} results received</p>
+      {jobs.map(job => <article className="runtime-job" key={job.id} data-testid="application-job"><strong>{job.deployment?.name ?? job.input.operation}</strong> · <span data-testid="application-job-status">{job.status}</span><div><code>{job.id}</code></div><p>{job.verification.split('_').join(' ')} · {job.replicas_received}/{job.replicas_required} results received</p>
         {job.error && <p role="alert">{job.error}</p>}
         {job.output && <><pre data-testid="application-job-output">{JSON.stringify({ shape: job.output.shape, values: job.output.values.slice(0, 16) }, null, 2)}{job.output.values.length > 16 ? '\n(first 16 values)' : ''}</pre><button className="manage-button small" onClick={() => { const url = URL.createObjectURL(new Blob([JSON.stringify(job.output)], { type: 'application/json' })); const a = document.createElement('a'); a.href = url; a.download = `mesh-${job.id}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000) }}>Download result JSON</button></>}
         {job.result_received_elapsed_ms !== null && <p>Queue → result receipt: {job.result_received_elapsed_ms} ms · {job.workers.map(w => `${w.backend}: ${Math.round(w.compute_ms)} ms compute, ${Math.round(w.load_ms)} ms load`).join('; ')}</p>}

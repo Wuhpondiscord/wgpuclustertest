@@ -12,4 +12,5 @@ export type ApplicationJob = {
   output: ApplicationOutput | null; error: string | null; status_url: string;
   workers: Array<{ node_id: string; attempt_id: number; coordinator_epoch: number; generation: number; backend: string; compute_ms: number; load_ms: number }>;
   queue_wait_ms: number | null; result_received_elapsed_ms: number | null;
+  deployment?: { name: string; revision_id: string };
 }

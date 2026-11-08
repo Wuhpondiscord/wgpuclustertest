@@ -3,6 +3,241 @@ use axum::{body::Body, http::Request};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+fn workflow(expected: Value) -> Value {
+    json!({
+        "expected_revision_id": expected,
+        "source": {"kind":"upload"},
+        "manifest": {
+            "version":1,
+            "name":"Smoke workflow",
+            "jobs":[{"name":"first","input":numeric()},{"name":"second","input":numeric()}]
+        }
+    })
+}
+
+#[tokio::test]
+async fn workflow_runs_atomically_and_replays_the_pinned_revision() {
+    let f = Fixture::new().await;
+    let base = format!("/api/applications/{}", f.app);
+    let path = format!("{base}/deployment");
+    let run = format!("{path}/run");
+    let (status, first) = call(
+        &f.router,
+        "POST",
+        &path,
+        &f.session,
+        workflow(Value::Null),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &path,
+        &f.session,
+        workflow(Value::Null),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let bad = json!({"manifest":{"version":1,"name":"Invalid","jobs":[{"name":"script","input":{"operation":"javascript","script":"anything"}}]},"source":{"kind":"upload"},"expected_revision_id":first["id"]});
+    assert_eq!(
+        call(&f.router, "POST", &path, &f.session, bad, None)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(&f.router, "GET", &path, &f.session, Value::Null, None)
+            .await
+            .1["id"],
+        first["id"]
+    );
+
+    for _ in 0..(MAX_JOBS - 1) {
+        f.submit(numeric()).await;
+    }
+    let input = json!({"revision_id": first["id"]});
+    let persisted_before = std::fs::read(&*f.state.data_file).unwrap();
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &run,
+            &f.session,
+            input.clone(),
+            Some("run-a")
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        std::fs::read(&*f.state.data_file).unwrap(),
+        persisted_before
+    );
+    let jobs = f.state.store.lock().unwrap().application_jobs.len();
+    assert_eq!(jobs, MAX_JOBS - 1);
+    let id = f
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .application_jobs
+        .keys()
+        .next()
+        .copied()
+        .unwrap();
+    assert_eq!(
+        call(
+            &f.router,
+            "DELETE",
+            &format!("{base}/jobs/{id}"),
+            &f.session,
+            Value::Null,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+
+    let (status, accepted) = call(
+        &f.router,
+        "POST",
+        &run,
+        &f.session,
+        input.clone(),
+        Some("run-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert_eq!(accepted.as_array().unwrap().len(), 2);
+    assert_eq!(accepted[0]["deployment"]["name"], "first");
+    assert_eq!(accepted[1]["deployment"]["revision_id"], first["id"]);
+    assert_eq!(
+        f.state.store.lock().unwrap().application_jobs.len(),
+        MAX_JOBS
+    );
+    let (status, replacement) = call(
+        &f.router,
+        "POST",
+        &path,
+        &f.session,
+        workflow(first["id"].clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{replacement}");
+    assert_ne!(replacement["id"], first["id"]);
+    let (status, repeated) = call(
+        &f.router,
+        "POST",
+        &run,
+        &f.session,
+        input.clone(),
+        Some("run-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(repeated[0]["id"], accepted[0]["id"]);
+    assert_eq!(repeated[1]["id"], accepted[1]["id"]);
+    assert_eq!(
+        call(&f.router, "POST", &run, &f.session, input, Some("run-b"))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let removed = format!("{path}/{}", first["id"].as_str().unwrap());
+    assert_eq!(
+        call(&f.router, "DELETE", &removed, &f.session, Value::Null, None)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn deployments_use_app_permissions_and_are_removed_with_the_app() {
+    let f = Fixture::new().await;
+    let base = format!("/api/applications/{}", f.app);
+    let path = format!("{base}/deployment");
+    let run = format!("{path}/run");
+    let (_, release) = call(
+        &f.router,
+        "POST",
+        &path,
+        &f.session,
+        workflow(Value::Null),
+        None,
+    )
+    .await;
+    assert_eq!(
+        call(&f.router, "GET", &path, &"b".repeat(64), Value::Null, None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    for read_only in [true, false] {
+        let (_, issued) = call(
+            &f.router,
+            "POST",
+            &format!("{base}/keys"),
+            &f.session,
+            json!({"label":"workflow","read_only":read_only}),
+            None,
+        )
+        .await;
+        let key = issued["key"].as_str().unwrap();
+        assert_eq!(
+            call(&f.router, "GET", &path, key, Value::Null, None)
+                .await
+                .1["id"],
+            release["id"]
+        );
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &path,
+                key,
+                workflow(release["id"].clone()),
+                None
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, _) = call(
+            &f.router,
+            "POST",
+            &run,
+            key,
+            json!({"revision_id":release["id"]}),
+            Some("key-run"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            if read_only {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::ACCEPTED
+            }
+        );
+    }
+    assert_eq!(
+        call(&f.router, "DELETE", &base, &f.session, Value::Null, None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let store = f.state.store.lock().unwrap();
+    assert!(store.application_deployments.is_empty());
+    assert!(store.application_jobs.is_empty());
+}
+
 async fn call(
     router: &Router,
     method: &str,
