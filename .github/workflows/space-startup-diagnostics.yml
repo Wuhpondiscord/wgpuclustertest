@@ -86,3 +86,25 @@ jobs:
                   print(kind, "log stream idle")
               print(kind, json.dumps({"log_lines": lines, "markers": counts}, sort_keys=True))
           PY
+
+  docker-startup:
+    name: Run the published Dockerfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start the final image with disposable state
+        run: |
+          docker build -t mesh-space-startup .
+          docker run --rm --entrypoint ldd mesh-space-startup /usr/local/bin/mesh-coordinator
+          docker run --detach --name mesh-space-startup --publish 127.0.0.1::7860 \
+            -e MESH_REQUIRE_GITHUB_STORAGE=0 \
+            -e MESH_STATE_ENCRYPTION_KEY="$(printf '%064d' 1)" \
+            -e MESH_AUTH_ENCRYPTION_KEY="$(printf '%064d' 2)" mesh-space-startup
+          trap 'docker logs mesh-space-startup; docker rm -f mesh-space-startup >/dev/null' EXIT
+          address="$(docker port mesh-space-startup 7860/tcp)"
+          curl --fail --silent --show-error --retry 15 --retry-delay 1 --retry-connrefused \
+            --dump-header /tmp/mesh-health-headers "http://$address/health"
+          grep -qi '^x-mesh-state-format: mesh-state-aes256gcm-v1' /tmp/mesh-health-headers
