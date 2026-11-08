@@ -28,6 +28,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   const create = page.getByRole('button', { name: 'New cluster', exact: true })
   await create.click(); await page.getByTestId('app-dialog-input').fill('private application pool'); await page.getByTestId('app-dialog-submit').click()
   await page.getByLabel('Application name', { exact: true }).fill('Private image worker')
+  await expect(page.getByLabel('Application slug', { exact: true })).toHaveValue('private-image-worker')
   await page.getByLabel('Application slug', { exact: true }).fill('image-worker')
   await page.getByRole('button', { name: 'Create private application', exact: true }).click()
   await expect(page.locator('.application-detail > a')).toHaveAttribute('href', `/${username}/image-worker`)

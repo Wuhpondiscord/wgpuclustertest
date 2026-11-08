@@ -7,6 +7,7 @@ use axum::{
     body::to_bytes,
     extract::{Path, Request, State},
     http::{header, HeaderMap, Method, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -102,6 +103,21 @@ struct ReceiptSummary {
     load_ms: f64,
     fallback_reason: Option<String>,
     received_at_ms: u64,
+}
+impl From<&Receipt> for ReceiptSummary {
+    fn from(receipt: &Receipt) -> Self {
+        Self {
+            node_id: receipt.worker,
+            attempt_id: receipt.attempt_id,
+            coordinator_epoch: receipt.epoch,
+            generation: receipt.generation,
+            backend: receipt.runtime.backend.clone(),
+            compute_ms: receipt.runtime.compute_ms,
+            load_ms: receipt.runtime.load_ms,
+            fallback_reason: receipt.runtime.fallback_reason.clone(),
+            received_at_ms: receipt.received_at_ms,
+        }
+    }
 }
 fn hidden() -> ApiError {
     ApiError(
@@ -264,21 +280,7 @@ fn summary(job: &Job, store: &Store) -> Summary {
         },
         error: job.failed.clone(),
         status_url: format!("/api/applications/{}/jobs/{}", job.app_id, job.id),
-        workers: job
-            .receipts
-            .iter()
-            .map(|receipt| ReceiptSummary {
-                node_id: receipt.worker,
-                attempt_id: receipt.attempt_id,
-                coordinator_epoch: receipt.epoch,
-                generation: receipt.generation,
-                backend: receipt.runtime.backend.clone(),
-                compute_ms: receipt.runtime.compute_ms,
-                load_ms: receipt.runtime.load_ms,
-                fallback_reason: receipt.runtime.fallback_reason.clone(),
-                received_at_ms: receipt.received_at_ms,
-            })
-            .collect(),
+        workers: job.receipts.iter().map(ReceiptSummary::from).collect(),
         queue_wait_ms: job
             .receipts
             .iter()
@@ -296,6 +298,11 @@ fn summary(job: &Job, store: &Store) -> Summary {
     }
 }
 pub fn prune(store: &mut Store) {
+    store.invites.retain(|_, invite| {
+        invite
+            .application_id
+            .is_none_or(|id| store.applications.contains_key(&id))
+    });
     store
         .application_deployments
         .retain(|app, _| store.applications.contains_key(app));
@@ -331,13 +338,8 @@ pub fn revoke_ineligible_leases(store: &mut Store) {
                         .and_then(|id| store.nodes.get(&id))
                         .is_some_and(|node| {
                             !node.paused
-                                && security::application_access(
-                                    store,
-                                    job.app_id,
-                                    &node.owner_id,
-                                    true,
-                                )
-                                .is_ok()
+                                && application_worker_access(store, job.app_id, &node.owner_id)
+                                    .is_ok()
                         });
                     (!permitted).then_some(lease)
                 })
@@ -390,6 +392,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/application-work/:job/renew", post(renew))
         .route("/api/application-work/:job/release", post(release))
         .route("/api/application-work/:job/commit", post(commit))
+        .route("/api/application-work/:job/receipt", post(receipt))
 }
 pub async fn list(
     State(state): State<AppState>,
@@ -808,7 +811,7 @@ pub async fn claim(
                 .applications
                 .get(&job.app_id)
                 .is_some_and(|app| app.cluster_id == cluster)
-                && security::application_access(&store, job.app_id, &user, true).is_ok()
+                && application_worker_access(&store, job.app_id, &user).is_ok()
                 && matches!(
                     status(job, &store),
                     "queued" | "running" | "awaiting_verification"
@@ -879,6 +882,21 @@ pub async fn claim(
 pub struct LeaseInput {
     lease: recovery::TaskLease,
 }
+fn application_worker_access(store: &Store, app: Uuid, user: &str) -> ApiResult<()> {
+    if security::application_access(store, app, user, true).is_ok() {
+        return Ok(());
+    }
+    let application = store.applications.get(&app).ok_or_else(hidden)?;
+    crate::require_member(store, application.cluster_id, user).map_err(|_| hidden())?;
+    if store.invites.values().any(|invite| {
+        invite.application_id == Some(app)
+            && invite.expires_at > now()
+            && invite.contributors.contains(user)
+    }) {
+        return Ok(());
+    }
+    Err(hidden())
+}
 fn worker_access(
     store: &Store,
     job_id: Uuid,
@@ -887,7 +905,7 @@ fn worker_access(
     active: bool,
 ) -> ApiResult<(Uuid, usize)> {
     let job = store.application_jobs.get(&job_id).ok_or_else(hidden)?;
-    security::application_access(store, job.app_id, user, true)?;
+    application_worker_access(store, job.app_id, user)?;
     let worker = Uuid::parse_str(&lease.worker_id).map_err(|_| fenced())?;
     let node = owned_node(store, worker, user, active)?;
     if node.cluster_id
@@ -903,6 +921,43 @@ fn worker_access(
         .find(|slot| task(job_id, *slot) == lease.task_id)
         .ok_or_else(fenced)?;
     Ok((worker, slot))
+}
+#[derive(Serialize)]
+pub struct WorkerAcknowledgement {
+    status: &'static str,
+    workers: [ReceiptSummary; 1],
+}
+
+fn receipt_for_lease<'a>(
+    job: &'a Job,
+    worker: Uuid,
+    slot: usize,
+    lease: &recovery::TaskLease,
+) -> Option<&'a Receipt> {
+    job.receipts.iter().find(|receipt| {
+        receipt.slot == slot
+            && receipt.worker == worker
+            && receipt.epoch == lease.coordinator_epoch
+            && receipt.generation == lease.generation
+            && receipt.attempt_id == lease.attempt_id
+    })
+}
+
+pub async fn receipt(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<LeaseInput>,
+) -> ApiResult<Json<WorkerAcknowledgement>> {
+    let user = identity(&headers)?;
+    let store = state.store.lock().map_err(|_| unavailable())?;
+    let (worker, slot) = worker_access(&store, id, &user, &input.lease, false)?;
+    let job = &store.application_jobs[&id];
+    let accepted = receipt_for_lease(job, worker, slot, &input.lease).ok_or_else(hidden)?;
+    Ok(Json(WorkerAcknowledgement {
+        status: status(job, &store),
+        workers: [ReceiptSummary::from(accepted)],
+    }))
 }
 pub async fn renew(
     State(state): State<AppState>,
@@ -995,12 +1050,12 @@ pub async fn commit(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     request: Request,
-) -> ApiResult<Json<Summary>> {
+) -> ApiResult<Response> {
     let user = identity(&headers)?;
     {
         let store = state.store.lock().map_err(|_| unavailable())?;
         let job = store.application_jobs.get(&id).ok_or_else(hidden)?;
-        security::application_access(&store, job.app_id, &user, true)?;
+        application_worker_access(&store, job.app_id, &user)?;
     }
     let bytes = to_bytes(request.into_body(), MAX_COMMIT_BYTES)
         .await
@@ -1017,7 +1072,6 @@ pub async fn commit(
     mutate_store(&state, |store| {
         let (worker, slot) = worker_access(store, id, &user, &input.lease, false)?;
         let job = store.application_jobs.get(&id).ok_or_else(hidden)?;
-        job.input.validate_output(&input.output).map_err(invalid)?;
         if let Some(accepted) = job.receipts.iter().find(|receipt| receipt.slot == slot) {
             return if accepted.worker == worker
                 && accepted.digest == result_digest
@@ -1049,6 +1103,7 @@ pub async fn commit(
             .commit_result(&input.lease, at, &result_digest)
             .map_err(|_| fenced())?;
         let job = store.application_jobs.get_mut(&id).ok_or_else(hidden)?;
+        job.input.validate_output(&input.output).map_err(invalid)?;
         if let Some(previous) = job.receipts.first() {
             if !job.input.agrees(&previous.output, &input.output) {
                 job.failed = Some(
@@ -1074,11 +1129,21 @@ pub async fn commit(
     .await?;
     let store = state.store.lock().map_err(|_| unavailable())?;
     let job = store.application_jobs.get(&id).ok_or_else(hidden)?;
-    let result = summary(job, &store);
+    let (worker, slot) = worker_access(&store, id, &user, &input.lease, false)?;
+    let result = if security::application_access(&store, job.app_id, &user, true).is_ok() {
+        Json(summary(job, &store)).into_response()
+    } else {
+        let accepted = receipt_for_lease(job, worker, slot, &input.lease).ok_or_else(fenced)?;
+        Json(WorkerAcknowledgement {
+            status: status(job, &store),
+            workers: [ReceiptSummary::from(accepted)],
+        })
+        .into_response()
+    };
     let cluster = store.applications[&job.app_id].cluster_id;
     drop(store);
     crate::notify_work_available(&state, cluster);
-    Ok(Json(result))
+    Ok(result)
 }
 pub async fn runtime_info(
     State(state): State<AppState>,

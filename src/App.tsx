@@ -13,8 +13,8 @@ import { reconstruct2Plus1, sha256Hex, type EncodedShard } from './sharding'
 
 type Cluster = { id: string; name: string; role: 'owner' | 'member'; members: number; nodes: number; online_nodes: number }
 type Member = { id: string; role: 'owner' | 'member' }
-type ActiveInvite = { token: string; expires_at: number }
-type InvitePreview = { cluster_id: string; cluster_name: string; expires_at: number }
+type ActiveInvite = { token: string; expires_at: number; project_name?: string | null }
+type InvitePreview = { cluster_id: string; cluster_name: string; expires_at: number; project_name?: string | null }
 type NodeCreated = { node: Node; token: string }
 type BrowserNodeConnection = { clusterId: string; paused: boolean; hasLock: boolean; lockPending: boolean; releaseLock: (() => void) | null; url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean; peerMesh: PeerMeshNode | null; custody: HolderCustody | null; repairRunning: string | null }
 type UiDialog =
@@ -48,7 +48,11 @@ function App() {
   const [jobs, setJobs] = useState<ComputeJob[]>([])
   const [invite, setInvite] = useState<InvitePreview | null>(null)
   const [joinToken, setJoinToken] = useState(new URLSearchParams(window.location.search).get('invite') ?? '')
-  const [nodeCredentials, setNodeCredentials] = useState<{ name: string; url: string; key: string } | null>(null)
+  const [joining, setJoining] = useState(false)
+  const [shareLink, setShareLink] = useState('')
+  const shareLinkInput = useRef<HTMLInputElement>(null)
+  const startingBrowsers = useRef(new Set<string>())
+  const [nodeCredentials, setNodeCredentials] = useState<{ name: string; key: string } | null>(null)
   const [dialog, setDialog] = useState<UiDialog | null>(null)
   const [dialogValue, setDialogValue] = useState('')
   const sockets = useRef(new Map<string, BrowserNodeConnection>())
@@ -66,6 +70,7 @@ function App() {
   const [notice, setNotice] = useState('')
   const active = clusters.find(c => c.id === activeId) ?? clusters[0]
   useEffect(() => { activeSelection.current = activeId }, [activeId])
+  useEffect(() => { if (shareLink) shareLinkInput.current?.focus() }, [shareLink])
 
   async function refreshClusters(preferId?: string) {
     if (preferId) activeSelection.current = preferId
@@ -209,20 +214,36 @@ function App() {
   }
   async function makeInvite() {
     if (!active) return
-    await run(async () => {
-      const data = await api<{ token: string }>(`/api/clusters/${active.id}/invites`, { method: 'POST' })
-      const url = `${location.origin}/?invite=${data.token}`
-      await navigator.clipboard.writeText(url)
-      await refreshClusters(active.id)
-      setNotice('Seven day invite link copied')
-    })
+    await run(() => shareInvite(`/api/clusters/${active.id}/invites`, active.id))
   }
-  async function join(token = joinToken) {
-    await run(async () => {
-      const joined = await api<Cluster>('/api/invites/join', { method: 'POST', body: JSON.stringify({ token }) })
-      setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname)
-      await refreshClusters(joined.id); setNotice(`Joined “${joined.name}”`)
-    })
+  async function shareInvite(path: string, clusterId: string) {
+    const data = await api<{ token: string }>(path, { method: 'POST' })
+    const url = `${location.origin}/?invite=${data.token}`
+    setShareLink(url)
+    try {
+      await navigator.clipboard.writeText(url)
+      setNotice('Invite link copied')
+    } catch {
+      setNotice('Select and copy the invite link below')
+    }
+    await refreshClusters(clusterId).catch(() => undefined)
+  }
+  async function join(contribute = false) {
+    if (joining) return
+    setJoining(true)
+    try {
+      await run(async () => {
+        const joined = await api<Cluster>('/api/invites/join', { method: 'POST', body: JSON.stringify({ token: joinToken }) })
+        setInvite(null)
+        setJoinToken('')
+        history.replaceState({}, '', location.pathname)
+        await refreshClusters(joined.id)
+        setNotice(`Joined “${joined.name}”`)
+        if (contribute) await startThisBrowser(joined.id)
+      })
+    } finally {
+      setJoining(false)
+    }
   }
   function openInviteDialog() {
     openInputDialog({ title: 'Join by invite', description: 'Paste a cluster invite URL or its token to preview and join.', label: 'Invite URL or token', placeholder: 'https://…?invite=…', value: joinToken, submitLabel: 'Preview invite', onSubmit: value => {
@@ -235,14 +256,42 @@ function App() {
   async function createNode() {
     if (!active) return
     openInputDialog({ title: 'Add a node', description: 'Register this browser or machine with the selected cluster.', label: 'Node name', placeholder: 'Office GPU', value: '', submitLabel: 'Add node', onSubmit: name => { void run(async () => {
-      const created = await api<NodeCreated>(`/api/clusters/${active.id}/nodes`, { method: 'POST', body: JSON.stringify({ name }) })
-      setNodeToken(created.node.id, created.token)
-      const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const url = `${wsProto}//${location.host}/api/nodes/connect?token=${created.token}`
-      setNodeCredentials({ name, url: `${wsProto}//${location.host}/api/nodes/connect`, key: created.token })
-      connectBrowserNode(created.node, url)
+      const created = await registerBrowserNode(active.id, name)
+      setNodeCredentials({ name, key: created.token })
       await refreshClusters(active.id)
     }) } })
+  }
+  async function registerBrowserNode(clusterId: string, name: string) {
+    const created = await api<NodeCreated>(`/api/clusters/${clusterId}/nodes`, { method: 'POST', body: JSON.stringify({ name }) })
+    setNodeToken(created.node.id, created.token)
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    connectBrowserNode(created.node, `${protocol}//${location.host}/api/nodes/connect?token=${created.token}`)
+    return created
+  }
+  async function startThisBrowser(clusterId: string) {
+    if (startingBrowsers.current.has(clusterId)) return
+    startingBrowsers.current.add(clusterId)
+    try {
+      const tokens = getNodeTokens()
+      const registered = await api<Node[]>(`/api/clusters/${clusterId}/nodes`)
+      const eligible = registered.filter(node => tokens[node.id] && !node.paused)
+      let node = eligible.find(node => settingsFor(node).enabled) ?? eligible[0]
+      if (!node) {
+        node = (await registerBrowserNode(clusterId, 'Browser contributor')).node
+        updateContribution(node, { enabled: true, dutyCycle: 50 })
+      } else {
+        if (!sockets.current.has(node.id)) {
+          const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+          connectBrowserNode(node, `${protocol}//${location.host}/api/nodes/connect?token=${tokens[node.id]}`)
+        }
+        updateContribution(node, { enabled: true })
+      }
+      startRunner(node)
+      setNotice('Compute is enabled for this browser. Keep this tab open to contribute.')
+      await refreshClusters(clusterId).catch(() => undefined)
+    } finally {
+      startingBrowsers.current.delete(clusterId)
+    }
   }
   function connectBrowserNode(node: Node, url: string) {
     const id = node.id
@@ -533,7 +582,7 @@ function App() {
   }
   async function revokeInvite(inv: ActiveInvite) {
     if (!active) return
-    openConfirmDialog({ title: 'Revoke invite?', description: 'Anyone who has this link will no longer be able to join the cluster.', confirmLabel: 'Revoke invite', onConfirm: () => { void run(async () => { await api(`/api/clusters/${active.id}/invites/${inv.token}`, { method: 'DELETE' }); await refreshClusters(active.id); setNotice('Invite revoked') }) } })
+    openConfirmDialog({ title: 'Revoke invite?', description: inv.project_name ? 'This link will stop granting access to project jobs, including for guests who already joined through it.' : 'This link will stop accepting new cluster members.', confirmLabel: 'Revoke invite', onConfirm: () => { void run(async () => { await api(`/api/clusters/${active.id}/invites/${inv.token}`, { method: 'DELETE' }); setShareLink(''); await refreshClusters(active.id); setNotice('Invite revoked') }) } })
   }
   async function renameCluster() {
     if (!active || active.role !== 'owner') return
@@ -559,20 +608,57 @@ function App() {
   }
 
   const accountPath = location.pathname.split('/').filter(Boolean).length === 2
-  if (accountPath) return <div className="manage-app"><header className="manage-top"><a className="manage-brand" href="/">mesh.</a></header><main className="manage-main"><AccountApplications changed={() => void refreshClusters().catch(() => undefined)}/></main></div>
+  const localTokens = getNodeTokens()
+  const activeContributors = nodes.filter(node => node.cluster_id === active?.id && localTokens[node.id] && contributions[node.id]?.enabled)
+  const accountActions = {
+    changed: () => void refreshClusters(activeSelection.current).catch(() => undefined),
+    startBrowser: startThisBrowser,
+    shareCompute: (app: string, cluster: string) => shareInvite(`/api/applications/${app}/contributor-invites`, cluster),
+  }
+  const sharedInvite = shareLink && <section className="resource-card share-link" aria-label="Share invite link">
+    <h3>Share this link</h3>
+    <p>Friends can open it in their browser and choose Join and contribute. The link expires after seven days.</p>
+    <label>Invite link<input ref={shareLinkInput} readOnly value={shareLink} onFocus={event => event.currentTarget.select()}/></label>
+    <div className="heading-buttons">
+      <button className="manage-button" type="button" onClick={() => void run(() => copy(shareLink))}>Copy invite link</button>
+      <button className="manage-button" type="button" onClick={() => setShareLink('')}>Close link</button>
+    </div>
+  </section>
+  if (accountPath) return <div className="manage-app"><header className="manage-top"><a className="manage-brand" href="/">mesh.</a></header><main className="manage-main">
+    {sharedInvite}
+    {error && <p role="alert" className="feedback error">{error}</p>}
+    {notice && <p role="status" className="feedback success">{notice}</p>}
+    <AccountApplications {...accountActions}/>
+  </main></div>
   return <div className="manage-app">
     <header className="manage-top"><a className="manage-brand" href="/"><span className="brand-glyph"><Boxes size={18}/></span>mesh<span className="brand-period">.</span></a><div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button></header>
     <main className="manage-main">
-      <AccountApplications clusterId={active?.id} changed={() => void refreshClusters(activeSelection.current).catch(() => undefined)}/>
-      {invite && <div className="invite-banner"><div><b>Invitation to {invite.cluster_name}</b><span>Join this cluster with your current Mesh identity.</span></div><button className="manage-button primary" onClick={() => void join(joinToken)}>Join cluster <ArrowRight size={15}/></button><button className="dismiss-button" onClick={() => { setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname) }} aria-label="Dismiss"><X size={17}/></button></div>}
+      {invite && <section className="resource-card join-card" aria-label="Cluster invitation">
+        <h2>Invitation to {invite.cluster_name}</h2>
+        {invite.project_name && <p>You’re invited to contribute to <strong>{invite.project_name}</strong>. Your browser receives the inputs for jobs it takes. Project compute access lasts until the link expires or the owner revokes it.</p>}
+        <p>Join and contribute to share this browser’s compute while this tab is open. You can stop at any time.</p>
+        <div className="heading-buttons">
+          <button className="manage-button primary" disabled={joining} onClick={() => void join(true)}>Join and contribute <ArrowRight size={15}/></button>
+          <button className="manage-button" disabled={joining} onClick={() => void join()}>Join cluster</button>
+          <button className="dismiss-button" disabled={joining} onClick={() => { setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname) }} aria-label="Dismiss invitation"><X size={17}/></button>
+        </div>
+      </section>}
+      {sharedInvite}
+      <AccountApplications clusterId={active?.id} {...accountActions}/>
       <div className="manage-heading"><div><div className="overline">COMPUTE NETWORK</div><h1>Clusters</h1><p>Manage cluster membership, invitations, and connected nodes.</p></div><div className="heading-buttons"><button className="manage-button" onClick={openInviteDialog}><Link2 size={15}/>Join by invite</button><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>New cluster</button></div></div>
       {error && <div className="feedback error">{error}</div>}{notice && <div className="feedback success"><Check size={14}/>{notice}</div>}
       {busy ? <div className="empty-state">Connecting to coordinator…</div> : <div className="manage-layout">
         <aside className="cluster-rail"><div className="rail-title">YOUR CLUSTERS <span>{clusters.length}</span></div>{clusters.map(c=><button key={c.id} className={`rail-cluster ${active?.id===c.id?'active':''}`} onClick={()=>void run(()=>refreshClusters(c.id))}><span className="rail-icon">{c.name.slice(0,2).toUpperCase()}</span><span className="rail-label"><b>{c.name}</b><small>{c.role} · {c.members} members</small></span><span className={`rail-state ${c.online_nodes?'online':''}`}/></button>)}{!clusters.length&&<p className="rail-empty">No clusters yet.</p>}<button className="rail-create" onClick={() => void createCluster()}><Plus size={14}/>Create cluster</button><div className="identity-note"><Shield size={14}/><span>Save your account key and authenticator recovery codes. Anonymous identities remain tied to this browser.</span></div></aside>
         <section className="cluster-content">{!active ? <div className="empty-state"><div className="empty-symbol"><Boxes size={22}/></div><h2>Start your first cluster</h2><p>Create a pool, then invite members and register their nodes.</p><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>Create cluster</button></div> : <>
+          <div className="resource-card browser-quick-start">
+            <div><h3>Share compute from this browser</h3><p>{activeContributors.length ? 'Compute is enabled. Keep this tab open to contribute.' : 'Connect this tab as a node to contribute.'}</p></div>
+            {activeContributors.length > 0
+              ? <button className="manage-button" type="button" onClick={() => activeContributors.forEach(node => stopContributor(node.id))}>Stop this browser</button>
+              : <button className="manage-button primary" type="button" onClick={() => void run(() => startThisBrowser(active.id))}>Start this browser</button>}
+          </div>
           <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2><span className="summary-sub">{active.members} members · {active.nodes} registered nodes</span></div></div><div className="summary-actions">{active.role==='owner'?<><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button" onClick={() => void renameCluster()}><Settings size={15}/>Rename</button><button className="manage-button danger" onClick={() => void deleteCluster()}><Trash2 size={15}/>Delete cluster</button></>:<button className="manage-button" onClick={() => void leaveCluster()}><LogOut size={15}/>Leave cluster</button>}</div></div>
-          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused&&node.holder_ready).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">No nodes registered. Add a node to get its secure connection URL.</div>:<div className="node-list">{nodes.map(n=><div className="node-entry" key={n.id}><div className="node-row"><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.paused?'Paused':n.online?(n.holder_ready?'Connected · storage verified':'Connected · refresh to enable storage verification'):'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>{getNodeTokens()[n.id]&&<ContributorControls settings={contributions[n.id]??settingsFor(n)} state={runnerStates[n.id]} remembered={isRemembered(n.id)} onToggle={()=>toggleContribution(n)} onChange={patch=>{updateContribution(n,patch)}} onRemember={remember=>{rememberNode(n.id,remember);setCredentialRevision(value=>value+1)}}/>}</div>)}</div>}</article>
-            <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.token.slice(0,10)}…</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
+          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused&&node.holder_ready).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">Start this browser or add a named node.</div>:<div className="node-list">{nodes.map(n=><div className="node-entry" key={n.id}><div className="node-row"><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.paused?'Paused':n.online?(n.holder_ready?'Connected · storage verified':'Connected · refresh to enable storage verification'):'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>{getNodeTokens()[n.id]&&<ContributorControls settings={contributions[n.id]??settingsFor(n)} state={runnerStates[n.id]} remembered={isRemembered(n.id)} onToggle={()=>toggleContribution(n)} onChange={patch=>{updateContribution(n,patch)}} onRemember={remember=>{rememberNode(n.id,remember);setCredentialRevision(value=>value+1)}}/>}</div>)}</div>}</article>
+            <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.project_name ? inv.project_name + ' contributor' : 'Cluster invite'}</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div>
           <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Cluster demo jobs</h3><p>Shared cluster diagnostics: two nodes use full copies; three prefer 2+1 shards. Private application runtimes are separate. Contributing nodes automatically reclaim interrupted batches.</p></div><div className="heading-buttons"><button className="manage-button small" onClick={() => void createComputeJob('cpu-hash')}>Create CPU demo</button><button className="manage-button small primary" onClick={() => void createComputeJob('vector-add')}>Create WebGPU job</button></div></div>{jobs.length===0?<div className="table-empty">Create a bounded CPU or WebGPU vector-add workload to exercise leases and recoverable checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);const online=nodes.filter(node=>node.online&&!node.paused&&node.holder_ready).length;return <div className="job-row" key={job.id}><div className="job-title"><b>{job.workload==='vector-add'?'Vector addition (WebGPU with CPU fallback)':'Deterministic CPU hash'}</b><small>{job.total_units.toLocaleString()} elements · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}{job.checkpoints.length?` · ${job.checkpoints.length} recoverable checkpoint(s)`:''}</small>{job.checkpoints.length>0&&<><small className="checkpoint-durability">{checkpointHealth(job)}</small><small className="execution-diagnostics">{checkpointDiagnostics(job.checkpoints[job.checkpoints.length-1])}</small></>}<div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><div className="heading-buttons">{active.role==='owner'&&<button aria-label="Delete job" title="Delete job" className="icon-button" onClick={()=>openConfirmDialog({title: 'Delete job?', description: 'Remove this job and its checkpoint metadata? Browser artifact bytes are retained until local storage is cleared.', confirmLabel: 'Delete job', onConfirm: ()=>{void run(async()=>{await api(`/api/jobs/${job.id}`,{method:'DELETE'});await refreshClusters(activeSelection.current)})}})}><Trash2 size={16}/></button>}{job.checkpoints.some(checkpoint=>checkpoint.shards.length>0)&&<button className="manage-button small" onClick={()=>void restoreLatestCheckpoint(job)}>Test restore</button>}<button className="manage-button small" disabled={done||online<2||runningJobIds.includes(job.id)} onClick={() => void runComputeJob(job)}>{done?'Complete':runningJobIds.includes(job.id)?'Running…':'Run on this node'}</button></div></div>})}</div>}</article>
           <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages leases and manifests; artifact bytes move peer to peer.</b><span>Large batches are split into two data shards plus XOR parity and written to three distinct nodes. Any two verified shards can reconstruct a checkpoint; use “Test restore” to request shards, reconstruct the latest checkpoint, and verify its full-artifact digest. This prototype does not yet attest to trusted computation or issue rewards.</span></div></div>
         </>}</section>

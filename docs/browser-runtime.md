@@ -7,20 +7,25 @@ private management pages, not DNS subdomains or always-on HTTP application serve
 
 ## Try it
 
-1. Create/activate a named account, create a cluster and a private application.
-2. Register a browser node and select **Contribute compute**. Keep the tab open.
-3. Open the application, choose **Matrix multiply**, and queue the example. The
-   result is `[19, 22, 43, 50]`, shape `[2, 2]`.
-4. For embeddings, enable **ML inference** on each contributor. First use downloads
-   approximately 90 MB of model weights plus ONNX runtime assets. Downloads are
-   opt-in; old remembered nodes default to ML disabled.
-5. Choose the embedding template. Default `verification: "replicated"` needs two
-   distinct approved node IDs. For one-device testing use `"single"`; the result
-   is explicitly labeled `single_worker_unverified`.
+1. Activate a named account, create a cluster and open a private application.
+2. Select **Contribute from this browser**, or select **Share contributor link**
+   and send it to a friend. Your friend opens the link, clicks **Join and
+   contribute**, and keeps the tab open. Guests can join without an account.
+3. Click **Run quick test**. Once a browser returns the verified answer, the
+   test displays `[5,7,9]`. Use the job form to try other inputs.
+4. For embeddings, choose **Text embeddings (ML)** and enter one text per line.
+   On each worker, enable **ML inference** to allow the first job to download
+   about 90 MB of model weights plus ONNX runtime assets. Default verification
+   needs two workers. **One node for testing (unverified)** works with one.
 
-Other users must first join the cluster, then receive an application **operator**
-grant by username. Cluster members (including its owner) have no implicit app
-access. A viewer can read app inputs/results, but cannot submit or execute work.
+A project contributor link can be created by the owner of both the app and its
+cluster. It grants cluster membership and permission to execute assigned work
+for that app. Workers receive the inputs they need to process, so share links
+with people you trust. Links expire after seven days and can be revoked under
+**Active invites**, which also removes the link's project compute access.
+Cluster membership remains until separately removed. A regular cluster invite
+does not grant private app compute access. App management still uses named
+account roles, including operator access to submit jobs.
 
 ## Deploy a workflow from a file or repository
 

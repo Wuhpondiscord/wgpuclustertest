@@ -607,7 +607,8 @@ button { -webkit-tap-highlight-color: transparent; }
 .account-applications { margin-bottom: 24px; min-width: 0; }
 .application-content { padding: 20px; }
 .application-links { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
-.application-form { display: grid; gap: 12px; margin: 16px 0; }
+.application-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 16px 0; }
+.application-form .heading-buttons { flex-wrap: wrap; }
 .application-form label { display: grid; gap: 6px; font-size: 13px; }
 .application-form input, .application-form select { width: 100%; box-sizing: border-box; min-width: 0; padding: 10px; border: 1px solid #cbd5e1; border-radius: 7px; background: white; color: #172033; }
 .account-secret { display: block; overflow-wrap: anywhere; user-select: all; padding: 14px; background: #eef2f6; font-family: monospace; margin: 12px 0; }
@@ -615,9 +616,15 @@ button { -webkit-tap-highlight-color: transparent; }
 @media(max-width: 600px) { .account-applications .card-heading { flex-direction: column; align-items: flex-start; } .application-content { padding: 14px; } }
 
 .application-runtime { margin-top: 1.5rem; border-top: 1px solid #344054; padding-top: 1rem; }
-.application-runtime textarea { width: 100%; min-width: 0; padding: .75rem; font: 13px/1.5 monospace; color: inherit; background: #101828; border: 1px solid #475467; border-radius: 8px; }
-.application-runtime pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: .75rem; background: #101828; border-radius: 8px; font-size: 12px; }
+.application-runtime textarea { width: 100%; box-sizing: border-box; min-width: 0; padding: .75rem; font: inherit; line-height: 1.5; color: var(--mesh-ink); background: white; border: 1px solid #cbd5e1; border-radius: 8px; }
+.application-runtime pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: .75rem; color: var(--mesh-ink); background: var(--mesh-wash); border-radius: 8px; font-size: 12px; }
 .application-runtime details { margin: 1rem 0; }
 .application-runtime summary { cursor: pointer; font-weight: 600; }
+.join-card, .share-link { margin-bottom: 16px; }
+.join-card h2, .browser-quick-start h3, .share-link h3 { margin-top: 0; }
+.join-card .heading-buttons, .share-link .heading-buttons, .browser-quick-start { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.browser-quick-start { justify-content: space-between; }
+.share-link label { display: grid; gap: 6px; margin-bottom: 10px; }
+.share-link input { min-width: 0; width: 100%; box-sizing: border-box; padding: 8px; }
 .runtime-job { margin: .75rem 0; padding: .75rem; border: 1px solid #344054; border-radius: 8px; }
 .runtime-job code { overflow-wrap: anywhere; font-size: 12px; }

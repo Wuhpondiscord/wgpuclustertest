@@ -69,6 +69,10 @@ struct Cluster {
 struct Invite {
     cluster_id: Uuid,
     expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    application_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    contributors: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -363,6 +367,7 @@ struct InvitePreview {
     cluster_id: Uuid,
     cluster_name: String,
     expires_at: u64,
+    project_name: Option<String>,
 }
 #[derive(Serialize)]
 struct MemberSummary {
@@ -373,6 +378,7 @@ struct MemberSummary {
 struct InviteSummary {
     token: String,
     expires_at: u64,
+    project_name: Option<String>,
 }
 #[derive(Serialize)]
 struct InviteCreated {
@@ -1678,12 +1684,64 @@ async fn create_invite(
             Invite {
                 cluster_id: id,
                 expires_at,
+                application_id: None,
+                contributors: Default::default(),
             },
         );
         Ok(InviteCreated { token, expires_at })
     })
     .await?;
     Ok((StatusCode::CREATED, Json(result)))
+}
+async fn create_contributor_invite(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<InviteCreated>)> {
+    let user = identity(&headers)?;
+    let token = security::new_key()?;
+    let expires_at = now() + INVITE_TTL_SECS;
+    mutate_store(&state, |store| {
+        let app = store.applications.get(&id).ok_or(ApiError(
+            StatusCode::NOT_FOUND,
+            "Application not found".into(),
+        ))?;
+        security::application_access(store, id, &user, true)?;
+        require_owner(store, app.cluster_id, &user)?;
+        if app.owner_id != user {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "Only the application owner can invite contributors".into(),
+            ));
+        }
+        if store
+            .invites
+            .values()
+            .filter(|invite| invite.application_id == Some(id) && invite.expires_at > now())
+            .count()
+            >= 8
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "Revoke an existing contributor link before creating another".into(),
+            ));
+        }
+        store.invites.insert(
+            secret_hash(&token),
+            Invite {
+                cluster_id: app.cluster_id,
+                expires_at,
+                application_id: Some(id),
+                contributors: Default::default(),
+            },
+        );
+        Ok(())
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(InviteCreated { token, expires_at }),
+    ))
 }
 async fn list_invites(
     State(state): State<AppState>,
@@ -1705,6 +1763,10 @@ async fn list_invites(
         .map(|(token, invite)| InviteSummary {
             token: token.clone(),
             expires_at: invite.expires_at,
+            project_name: invite
+                .application_id
+                .and_then(|app| store.applications.get(&app))
+                .map(|app| app.name.clone()),
         })
         .collect();
     Ok(Json(invites))
@@ -1762,6 +1824,10 @@ async fn preview_invite(
         cluster_id: cluster.id,
         cluster_name: cluster.name.clone(),
         expires_at: invite.expires_at,
+        project_name: invite
+            .application_id
+            .and_then(|app| store.applications.get(&app))
+            .map(|app| app.name.clone()),
     }))
 }
 async fn join_invite(
@@ -1779,15 +1845,30 @@ async fn join_invite(
         ));
     }
     let result = mutate_store(&state, move |store| {
+        let invite_key = secret_hash(&input.token);
         let invite = store
             .invites
-            .get(&secret_hash(&input.token))
+            .get_mut(&invite_key)
             .filter(|i| i.expires_at > now())
-            .cloned()
             .ok_or(ApiError(
                 StatusCode::NOT_FOUND,
                 "Invite is invalid or expired".into(),
             ))?;
+        if let Some(app) = invite.application_id {
+            if !store.applications.contains_key(&app) {
+                return Err(ApiError(
+                    StatusCode::NOT_FOUND,
+                    "Project invite is no longer available".into(),
+                ));
+            }
+            if invite.contributors.len() >= 16 && !invite.contributors.contains(&user) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "This contributor link has reached its guest limit".into(),
+                ));
+            }
+            invite.contributors.insert(user.clone());
+        }
         let cluster = store
             .clusters
             .get_mut(&invite.cluster_id)
@@ -1819,6 +1900,13 @@ async fn leave_cluster(
             .expect("checked above")
             .members
             .remove(&user);
+        for invite in store
+            .invites
+            .values_mut()
+            .filter(|invite| invite.cluster_id == id)
+        {
+            invite.contributors.remove(&user);
+        }
         for application in store
             .applications
             .values_mut()
@@ -1891,6 +1979,13 @@ async fn remove_member(
             ));
         }
         cluster.members.remove(&target);
+        for invite in store
+            .invites
+            .values_mut()
+            .filter(|invite| invite.cluster_id == id)
+        {
+            invite.contributors.remove(&target);
+        }
         for application in store
             .applications
             .values_mut()
@@ -2759,6 +2854,10 @@ fn app(state: AppState) -> Router {
         .route("/api/clusters/:id/nodes", get(list_nodes).post(create_node))
         .route("/api/invites/:token", get(preview_invite))
         .route("/api/invites/join", post(join_invite))
+        .route(
+            "/api/applications/:id/contributor-invites",
+            post(create_contributor_invite),
+        )
         .route("/api/nodes/:id/pause", post(pause_node))
         .route("/api/nodes/:id/resume", post(resume_node))
         .route("/api/nodes/:id", axum::routing::delete(delete_node))
