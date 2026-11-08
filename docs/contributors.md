@@ -37,6 +37,8 @@ New observations include the previous attempt's end reason: `disconnect`, `expir
 
 Execution mode, fallback reason, and compute/validation/encoding/transfer durations are **self-reported**. Compute duration includes input preparation and GPU submission/readback; CPU validation is reported separately. These fields are bounded metadata and are not proof of honest computation, useful throughput or contribution credits.
 
+Cluster vector jobs reuse GPU buffers within a contributor and read back one contiguous result per batch. Checkpoint diagnostics include readback time within compute and whether the batch reused buffers. Readback time measures browser-visible mapping and the copy to CPU-owned bytes. Checkpoint encoding uses native Base64 when the browser provides it, with the same portable little-endian format on older browsers. The encoding and peer transfer timings show where the rest of the checkpoint time went.
+
 ## Automated coverage and remaining limits
 
 The browser suite covers participation beyond the old one-minute idle cap, automatic takeover after a compute-browser close, transient and ambiguous commits, remembered-device restoration, bounded receiver-busy retries, GPU-loss fallback, immediate lease cancellation, and a late result rejected after suspended renewal timers. Existing lease, receipt, sharding and repair scenarios remain in the suite. Rust tests cover queue overflow, exact-attempt release authorization, telemetry bounds and attempt observations.

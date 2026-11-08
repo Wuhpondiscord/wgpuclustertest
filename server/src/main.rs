@@ -190,6 +190,10 @@ struct ExecutionReport {
     validation_ms: f64,
     encoding_ms: f64,
     transfer_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu_readback_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu_buffers_reused: Option<bool>,
 }
 impl ExecutionReport {
     fn valid(&self) -> bool {
@@ -206,8 +210,14 @@ impl ExecutionReport {
                 self.encoding_ms,
                 self.transfer_ms,
             ]
-            .iter()
-            .all(|ms| ms.is_finite() && *ms >= 0.0 && *ms <= 86_400_000.0)
+            .into_iter()
+            .chain(self.gpu_readback_ms)
+            .all(|ms| (0.0..=86_400_000.0).contains(&ms))
+            && match (self.gpu_readback_ms, self.gpu_buffers_reused) {
+                (None, None) => true,
+                (Some(_), Some(_)) => self.execution_mode == "webgpu",
+                _ => false,
+            }
     }
 }
 
@@ -3121,6 +3131,8 @@ mod tests {
             validation_ms: 2.0,
             encoding_ms: 3.0,
             transfer_ms: 4.0,
+            gpu_readback_ms: None,
+            gpu_buffers_reused: None,
         };
         assert!(report.valid());
         report.compute_ms = f64::NAN;
@@ -3128,9 +3140,17 @@ mod tests {
         report.compute_ms = -1.0;
         assert!(!report.valid());
         report.compute_ms = 1.0;
+        report.gpu_readback_ms = Some(f64::NAN);
+        report.gpu_buffers_reused = Some(true);
+        assert!(!report.valid());
+        report.gpu_readback_ms = Some(0.5);
+        assert!(report.valid());
         report.execution_mode = "trusted-gpu".into();
         assert!(!report.valid());
         report.execution_mode = "cpu-fallback".into();
+        assert!(!report.valid());
+        report.gpu_readback_ms = None;
+        report.gpu_buffers_reused = None;
         report.fallback_reason = Some("x".repeat(513));
         assert!(!report.valid());
     }

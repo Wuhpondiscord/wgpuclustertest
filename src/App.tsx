@@ -30,8 +30,9 @@ function checkpointHealth(job: ComputeJob) {
 
 function checkpointDiagnostics(checkpoint: ComputeCheckpoint) {
   const execution = checkpoint.execution
+  const capture = execution?.gpu_readback_ms === undefined ? '' : `, readback ${execution.gpu_readback_ms.toFixed(1)} ms (within compute, ${execution.gpu_buffers_reused ? 'reused buffers' : 'fresh buffers'})`
   const attempt = checkpoint.attempt
-  const timings = execution ? `${execution.execution_mode} · self-reported: compute ${execution.compute_ms.toFixed(1)} ms, CPU validation ${execution.validation_ms.toFixed(1)} ms, encoding ${execution.encoding_ms.toFixed(1)} ms, transfer ${execution.transfer_ms.toFixed(1)} ms${execution.fallback_reason ? ` · ${execution.fallback_reason}` : ''}` : 'Execution timings unavailable for this older checkpoint'
+  const timings = execution ? `${execution.execution_mode} · self-reported: compute ${execution.compute_ms.toFixed(1)} ms${capture}, CPU validation ${execution.validation_ms.toFixed(1)} ms, encoding ${execution.encoding_ms.toFixed(1)} ms, transfer ${execution.transfer_ms.toFixed(1)} ms${execution.fallback_reason ? ` · ${execution.fallback_reason}` : ''}` : 'Execution timings unavailable for this older checkpoint'
   const reason = attempt?.previous_attempt_reason
   const end = attempt?.previous_attempt_ended_at_ms
   const failure = reason === 'disconnect' || reason === 'expiry'

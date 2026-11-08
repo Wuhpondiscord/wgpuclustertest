@@ -139,13 +139,24 @@ test('maximum vector batches replan after holder ACK then finish with two device
       await route.continue()
     })
     await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
-    const current = await waitFor(() => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{ bytes: number; shards: Array<{ bytes: number }> }> }>>(
+    const current = await waitFor(() => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{
+      batch_index: number; bytes: number; shards: Array<{ bytes: number }>
+      execution: { execution_mode: string; gpu_readback_ms?: number; gpu_buffers_reused?: boolean }
+    }> }>>(
       identities[0], `/api/clusters/${clusterId}/jobs`), jobs => jobs.some(item => item.id === job.id && item.completed_batches === 3), 'all maximum-sized vector batches after holder loss', 120_000)
     const completed = current.find(item => item.id === job.id)!
     expect(interrupted).toBe(true)
     for (const checkpoint of completed.checkpoints) {
       expect(checkpoint.bytes).toBeLessThan(3 * 1024 * 1024)
       expect(checkpoint.shards.map(shard => shard.bytes)).toEqual([checkpoint.bytes, checkpoint.bytes])
+      if (process.env.MESH_TEST_GPU === '1') {
+        expect(checkpoint.execution.execution_mode).toBe('webgpu')
+        expect(checkpoint.execution.gpu_buffers_reused).toBe(checkpoint.batch_index !== 0)
+      }
+      if (checkpoint.execution.execution_mode === 'webgpu') {
+        expect(checkpoint.execution.gpu_readback_ms).toBeGreaterThanOrEqual(0)
+        expect(typeof checkpoint.execution.gpu_buffers_reused).toBe('boolean')
+      }
     }
     await expect(peers[0].page.locator('.feedback.error')).toHaveCount(0)
     await peers[0].page.getByRole('button', { name: 'Test restore' }).click()

@@ -213,9 +213,12 @@ export class ComputeRunner {
         started = performance.now()
         if (this.gpu) {
           try {
-            vector = await this.gpu.run(claim.start, claim.end)
+            vector = await this.gpu.run(claim.start, claim.end, signal)
             report.validation_ms = this.gpu.validationMs
+            report.gpu_readback_ms = this.gpu.readbackMs
+            report.gpu_buffers_reused = this.gpu.reusedBuffers
           } catch (error) {
+            signal.throwIfAborted()
             this.gpu.close(); this.gpu = null; this.gpuRetryAt = performance.now() + 30_000
             this.gpuReason = gpuFailure(error, 'WebGPU batch failed')
             // An invalid numerical result is never silently accepted by switching
