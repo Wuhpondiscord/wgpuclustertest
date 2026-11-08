@@ -79,18 +79,28 @@ test('an image batch uses invited browsers and recovers a disconnected MobileNet
       await expect(page.getByRole('button', { name: 'Start ML worker' })).toBeVisible()
     }
     const [leaving, remaining] = pages
-    // Drop the request before the coordinator sees it, then close the browser
-    // while its lease is still active. The worker cannot send a release.
-    await leaving.route('**/image-work/*/commit', route => route.abort())
-    await leaving.getByRole('button', { name: 'Start ML worker' }).click()
-    const committing = leaving.waitForRequest('**/image-work/*/commit', { timeout: 45_000 })
     await f.page.getByRole('button', { name: 'Try sample image' }).click()
-    await committing
+    await expect(f.page.getByText('Queued 1 image', { exact: true })).toBeVisible()
+    // Hold a real lease from the browser and close the page without a release.
+    // Claim directly so inference timing and request interception cannot race the close.
+    const abandoned = await leaving.evaluate(async ({ app, url }) => {
+      const token = new URLSearchParams(new URL(url).hash.slice(1)).get('ml-invite')!
+      const response = await fetch(`/api/applications/${app}/image-work/claim`, {
+        method: 'POST', headers: {
+          'Content-Type': 'application/json',
+          'X-Mesh-ML-Invite': token,
+          'X-Mesh-ML-Browser': crypto.randomUUID(),
+        }, body: JSON.stringify({ worker_id: crypto.randomUUID() }),
+      })
+      if (!response.ok) throw new Error(`Could not claim the test image (${response.status})`)
+      const work = await response.json() as { run_id: string; index: number } | null
+      return work && { id: work.run_id, index: work.index }
+    }, { app: f.app.id, url })
+    expect(abandoned?.index).toBe(0)
     await guests[0].close()
     await remaining.getByRole('button', { name: 'Start ML worker' }).click()
     await expect(f.page.getByTestId('image-batch-progress')).toContainText('1/1 classified', { timeout: 65_000 })
-    const [recovered] = await api<Array<{ id: string }>>(`/api/applications/${f.app.id}/image-batches`)
-    const retry = await api<{ results: Array<{ attempts: number; predictions: Array<{ class_id: number }> }> }>(`/api/applications/${f.app.id}/image-batches/${recovered.id}?results=true`)
+    const retry = await api<{ results: Array<{ attempts: number; predictions: Array<{ class_id: number }> }> }>(`/api/applications/${f.app.id}/image-batches/${abandoned!.id}?results=true`)
     expect(retry.results[0].attempts).toBe(2)
     expect(retry.results[0].predictions[0].class_id).toBe(292)
   } finally {
