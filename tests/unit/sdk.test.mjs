@@ -19,6 +19,13 @@ test('SDK scopes credentials, serializes typed arrays and preserves explicit ide
   await mesh.embeddings(['hello'])
   assert.equal(calls[1].url.endsWith('/inference'), true)
   assert.deepEqual(JSON.parse(calls[1].init.body), { model: 'minilm-l6-v2', input: ['hello'], verification: 'replicated' })
+  await mesh.getDeployment()
+  assert.equal(calls[2].url.endsWith('/deployment'), true)
+  assert.equal(calls[2].init.method, 'GET')
+  await mesh.runDeployment(jobId, { idempotencyKey: 'stable-workflow' })
+  assert.equal(calls[3].url.endsWith('/deployment/run'), true)
+  assert.deepEqual(JSON.parse(calls[3].init.body), { revision_id: jobId })
+  assert.equal(calls[3].init.headers['Idempotency-Key'], 'stable-workflow')
 })
 test('SDK polls asynchronous jobs, propagates failures and cancellation', async () => {
   let reads = 0

@@ -24,6 +24,14 @@ export class MeshClient {
     return response.json()
   }
   submit(input, options = {}) { return this.request('/jobs', { ...options, body: input, idempotencyKey: options.idempotencyKey ?? crypto.randomUUID() }) }
+  getDeployment({ signal } = {}) { return this.request('/deployment', { signal }) }
+  runDeployment(revisionId, options = {}) {
+    return this.request('/deployment/run', {
+      ...options,
+      body: { revision_id: revisionId },
+      idempotencyKey: options.idempotencyKey ?? crypto.randomUUID(),
+    })
+  }
   getJob(id, { signal } = {}) {
     if (!/^[a-f0-9-]{36}$/i.test(id)) throw new Error('Invalid job ID')
     return this.request(`/jobs/${id}`, { signal })

@@ -22,6 +22,29 @@ Other users must first join the cluster, then receive an application **operator*
 grant by username. Cluster members (including its owner) have no implicit app
 access. A viewer can read app inputs/results, but cannot submit or execute work.
 
+## Deploy a workflow from a file or repository
+
+Open your private application and find **Deploy workflow**. Download the
+[example mesh.json](../mesh.json) and upload it, or paste the HTTPS URL of a
+public GitHub repository containing `mesh.json` at its root. Select a branch
+or a full commit SHA, or leave the ref blank for the default branch. The browser
+resolves the ref to a commit before fetching the manifest. Preview the file and
+select **Save deployment**, then **Run deployment**. The example produces
+`[4, 6]` and `[19, 22, 43, 50]` as separate job results.
+
+For private GitHub repositories, upload `mesh.json` from a checkout. The import
+uses unauthenticated GitHub requests and preserves the repository and commit
+reported by the browser. Run inputs are stored with the private deployment, so
+a later commit or repository outage has no effect on saved workflows.
+
+The version 1 manifest is limited to 32 KiB and one to eight independent jobs.
+Each job has a unique `name` and an `input` shaped like a normal job request.
+The application owner saves or replaces the active revision. Owners and
+operators can run it. Every job in a run is queued together and retains its
+source revision. Replacing or removing a deployment affects future runs.
+For custom JavaScript, keep your program in a local or hosted project and call
+the Mesh SDK for operations on the cluster.
+
 ## Supported operations and bounds
 
 | Operation | Input | Limit | Verification |
@@ -93,6 +116,10 @@ HTTP routes, all scoped to `/api/applications/:application_id`:
 | `DELETE /jobs/:job_id` | owner/operator account session only; removes data and leases |
 | `POST /inference` | `{model:"minilm-l6-v2", input:["text"], verification:"replicated"}` → **202**, same queue |
 | `GET /runtime` | supported operations/model/bounds, retained completion measurements |
+| `GET /deployment` | active workflow revision or `null` |
+| `POST /deployment` | owner session with `manifest`, `source` and `expected_revision_id` (`null` on first save) |
+| `DELETE /deployment/:revision` | owner session removes the active revision |
+| `POST /deployment/run` | `{revision_id: "..."}` queues the entire batch and returns its job summaries |
 | `GET/POST /keys`, `DELETE /keys/:key_id` | application owner account session only |
 
 Developer requests use `Authorization: Bearer mak_…`, never a token in a URL.
@@ -110,6 +137,12 @@ payload with that key returns 409. The SDK generates one per submission. Calling
 a submission method again without retaining its key is a new job. It does not
 silently retry submissions. Idempotency only lasts while the job is retained;
 deletion permits reuse.
+
+Use `const deployment = await mesh.getDeployment()` to read the saved revision
+and `await mesh.runDeployment(deployment.id)` to queue it with a submit-capable
+key. Pass an explicit `idempotencyKey` in the options when a run must be retried
+across client restarts. A replay returns the jobs from that run that are still
+retained, even if a newer deployment has become active.
 
 States: `queued`, `running`, `awaiting_verification`, `completed`, `failed`,
 `expired`. Jobs expire if unfinished after 30 minutes. Three reported execution

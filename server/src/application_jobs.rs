@@ -19,6 +19,11 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+#[path = "application_deployments.rs"]
+mod deployments;
+pub use deployments::Deployment;
+use deployments::{DeploymentTask, RunDeployment};
+
 const MAX_JOBS: usize = 16;
 const MAX_GLOBAL_JOBS: usize = 128;
 const JOB_TTL_MS: u64 = 30 * 60 * 1000;
@@ -49,6 +54,8 @@ pub struct Job {
     cancelled: bool,
     failed: Option<String>,
     failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deployment: Option<DeploymentTask>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 struct Receipt {
@@ -81,6 +88,8 @@ pub struct Summary {
     workers: Vec<ReceiptSummary>,
     queue_wait_ms: Option<u64>,
     result_received_elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deployment: Option<DeploymentTask>,
 }
 #[derive(Serialize)]
 struct ReceiptSummary {
@@ -283,9 +292,13 @@ fn summary(job: &Job, store: &Store) -> Summary {
         } else {
             None
         },
+        deployment: job.deployment.clone(),
     }
 }
 pub fn prune(store: &mut Store) {
+    store
+        .application_deployments
+        .retain(|app, _| store.applications.contains_key(app));
     let removed: Vec<_> = store
         .application_jobs
         .values()
@@ -352,7 +365,19 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/applications/:id/inference", post(inference))
         .route("/api/applications/:id/runtime", get(runtime_info))
+        .route(
+            "/api/applications/:id/deployment",
+            get(deployments::get).post(deployments::deploy),
+        )
+        .route(
+            "/api/applications/:id/deployment/run",
+            post(deployments::run),
+        )
         .layer(cors)
+        .route(
+            "/api/applications/:id/deployment/:revision",
+            axum::routing::delete(deployments::remove),
+        )
         .route(
             "/api/applications/:id/keys",
             get(list_keys).post(create_key),
@@ -404,9 +429,29 @@ async fn enqueue(
     headers: &HeaderMap,
     input: Input,
 ) -> ApiResult<(StatusCode, Json<Summary>)> {
+    let mut jobs = enqueue_jobs(state, app, headers, Submission::Direct(input)).await?;
+    Ok((StatusCode::ACCEPTED, Json(jobs.remove(0))))
+}
+
+enum Submission {
+    Direct(Input),
+    Deployment(RunDeployment),
+}
+
+async fn enqueue_jobs(
+    state: &AppState,
+    app: Uuid,
+    headers: &HeaderMap,
+    submission: Submission,
+) -> ApiResult<Vec<Summary>> {
     let who = actor(state, headers, app, Permission::Submit)?;
-    input.validate().map_err(invalid)?;
-    let request_digest = digest(&input)?;
+    let request_digest = match &submission {
+        Submission::Direct(input) => {
+            input.validate().map_err(invalid)?;
+            digest(input)?
+        }
+        Submission::Deployment(run) => digest(&("deployment", run))?,
+    };
     let idempotency = headers
         .get("idempotency-key")
         .map(|value| {
@@ -427,34 +472,45 @@ async fn enqueue(
             "Idempotency key must contain at most 64 letters, digits, hyphens or underscores",
         ));
     }
-    let id = Uuid::new_v4();
     let at = now_ms();
     let actor_name = who.name();
-    let job_id = mutate_store(state, |store| {
+    let job_ids = mutate_store(state, |store| {
         who.authorize(store, app, Permission::Submit)?;
         if let Some(key) = idempotency.as_ref() {
-            if let Some(existing) = store.application_jobs.values().find(|job| {
-                job.app_id == app
-                    && job.actor == actor_name
-                    && job.idempotency.as_ref() == Some(key)
-            }) {
-                return if existing.request_digest == request_digest {
-                    Ok(existing.id)
-                } else {
-                    Err(ApiError(
+            let existing: Vec<_> = store
+                .application_jobs
+                .values()
+                .filter(|job| {
+                    job.app_id == app
+                        && job.actor == actor_name
+                        && job.idempotency.as_ref() == Some(key)
+                })
+                .collect();
+            if !existing.is_empty() {
+                if existing
+                    .iter()
+                    .any(|job| job.request_digest != request_digest)
+                {
+                    return Err(ApiError(
                         StatusCode::CONFLICT,
                         "Idempotency key already belongs to a different request".into(),
-                    ))
-                };
+                    ));
+                }
+                return Ok(existing.into_iter().map(|job| job.id).collect());
             }
         }
-        if store.application_jobs.len() >= MAX_GLOBAL_JOBS
+        let planned = match &submission {
+            Submission::Direct(input) => vec![(input.clone(), None)],
+            Submission::Deployment(run) => run.plan(store, app)?,
+        };
+        if store.application_jobs.len() + planned.len() > MAX_GLOBAL_JOBS
             || store
                 .application_jobs
                 .values()
                 .filter(|job| job.app_id == app)
                 .count()
-                >= MAX_JOBS
+                + planned.len()
+                > MAX_JOBS
         {
             return Err(ApiError(
                 StatusCode::CONFLICT,
@@ -462,38 +518,58 @@ async fn enqueue(
                     .into(),
             ));
         }
-        for slot in 0..input.replicas() {
-            store
-                .recovery
-                .add_task(task(id, slot))
-                .map_err(|_| fenced())?;
-        }
-        store.application_jobs.insert(
-            id,
-            Job {
+        let mut ids = Vec::with_capacity(planned.len());
+        for (input, deployment) in planned {
+            let id = Uuid::new_v4();
+            for slot in 0..input.replicas() {
+                store
+                    .recovery
+                    .add_task(task(id, slot))
+                    .map_err(|_| fenced())?;
+            }
+            store.application_jobs.insert(
                 id,
-                app_id: app,
-                input: input.clone(),
-                created_at_ms: at,
-                actor: actor_name.clone(),
-                idempotency: idempotency.clone(),
-                request_digest: request_digest.clone(),
-                receipts: Vec::new(),
-                cancelled: false,
-                failed: None,
-                failures: 0,
-            },
-        );
-        Ok(id)
+                Job {
+                    id,
+                    app_id: app,
+                    input,
+                    created_at_ms: at,
+                    actor: actor_name.clone(),
+                    idempotency: idempotency.clone(),
+                    request_digest: request_digest.clone(),
+                    receipts: Vec::new(),
+                    cancelled: false,
+                    failed: None,
+                    failures: 0,
+                    deployment,
+                },
+            );
+            ids.push(id);
+        }
+        Ok(ids)
     })
     .await?;
     let store = state.store.lock().map_err(|_| unavailable())?;
-    let job = store.application_jobs.get(&job_id).ok_or_else(hidden)?;
-    let result = summary(job, &store);
+    let mut result = job_ids
+        .iter()
+        .map(|id| {
+            store
+                .application_jobs
+                .get(id)
+                .map(|job| summary(job, &store))
+                .ok_or_else(hidden)
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    result.sort_by(|a, b| {
+        a.deployment
+            .as_ref()
+            .map(|job| &job.name)
+            .cmp(&b.deployment.as_ref().map(|job| &job.name))
+    });
     let cluster = store.applications.get(&app).ok_or_else(hidden)?.cluster_id;
     drop(store);
     crate::notify_work_available(state, cluster);
-    Ok((StatusCode::ACCEPTED, Json(result)))
+    Ok(result)
 }
 pub async fn submit(
     State(state): State<AppState>,
@@ -551,7 +627,7 @@ pub async fn delete_job(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn key_owner(store: &Store, app: Uuid, user: &str) -> ApiResult<()> {
+fn require_application_owner(store: &Store, app: Uuid, user: &str) -> ApiResult<()> {
     security::application_access(store, app, user, true)?;
     if store
         .applications
@@ -560,7 +636,7 @@ fn key_owner(store: &Store, app: Uuid, user: &str) -> ApiResult<()> {
     {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
-            "Only the application owner can manage API keys".into(),
+            "Only the application owner can manage this resource".into(),
         ));
     }
     Ok(())
@@ -605,7 +681,7 @@ pub async fn create_key(
     let hash = secret_hash(&raw);
     let id = Uuid::new_v4();
     let key = mutate_store(&state, |store| {
-        key_owner(store, app, &user)?;
+        require_application_owner(store, app, &user)?;
         if store
             .application_keys
             .values()
@@ -642,7 +718,7 @@ pub async fn list_keys(
 ) -> ApiResult<Json<Vec<KeySummary>>> {
     let user = identity(&headers)?;
     let store = state.store.lock().map_err(|_| unavailable())?;
-    key_owner(&store, app, &user)?;
+    require_application_owner(&store, app, &user)?;
     Ok(Json(
         store
             .application_keys
@@ -659,7 +735,7 @@ pub async fn revoke_key(
 ) -> ApiResult<StatusCode> {
     let user = identity(&headers)?;
     mutate_store(&state, |store| {
-        key_owner(store, app, &user)?;
+        require_application_owner(store, app, &user)?;
         if store
             .application_keys
             .get(&id)

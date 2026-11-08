@@ -92,6 +92,8 @@ struct Store {
     #[serde(default)]
     application_keys: HashMap<Uuid, application_jobs::AppKey>,
     #[serde(default)]
+    application_deployments: HashMap<Uuid, application_jobs::Deployment>,
+    #[serde(default)]
     applications: HashMap<Uuid, security::Application>,
     #[serde(default)]
     revoked_credentials: std::collections::HashSet<String>,
