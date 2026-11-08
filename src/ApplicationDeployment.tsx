@@ -153,9 +153,17 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
     {error && <p role="alert" className="feedback error">{error}</p>}
     {message && <p role="status">{message}</p>}
     {loaded && !active && <p>No workflow deployed.</p>}
+    {role === 'owner' && <div className="application-form">
+      <button className="manage-button" type="button" disabled={busy || !loaded} onClick={() => {
+        setError('')
+        setMessage('')
+        setCandidate({ manifest: template, source: { kind: 'upload' } })
+      }}>Load sample workflow</button>
+      <p>One contributing node is enough to run the sample. Expect <code>[4, 6]</code> from vector addition and <code>[19, 22, 43, 50]</code> from matrix multiplication.</p>
+    </div>}
     {active && <article className="runtime-job">
       <strong>{active.manifest.name}</strong>
-      <p>{active.manifest.jobs.length} jobs · {active.source.kind === 'github' ? `${active.source.repository} @ ${active.source.commit.slice(0, 12)}` : 'Uploaded file'}</p>
+      <p>{active.manifest.jobs.length} jobs · {active.source.kind === 'github' ? `${active.source.repository} @ ${active.source.commit.slice(0, 12)}` : 'Local manifest'}</p>
       <ul>{active.manifest.jobs.map(job => <li key={job.name}>{job.name} · {job.input.operation}</li>)}</ul>
       <a download="mesh.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(active.manifest, null, 2))}`}>Download deployed manifest</a>
       {role !== 'viewer' && <button className="manage-button primary" type="button" disabled={busy} onClick={() => void perform(() => run(active))}>Run deployment</button>}

@@ -48,14 +48,12 @@ async function extraContributor(browser: Browser, clusterId: string, inference: 
   return { context, page, nodeId: node.node.id }
 }
 
-test('an uploaded workflow persists, runs on a contributor, and can be replaced by a pinned GitHub import', async ({ browser }) => {
+test('the built-in sample runs on a contributor and can be replaced by an upload or pinned GitHub import', async ({ browser }) => {
   const f = await fixture(browser)
   try {
     const { page } = f
     const panel = page.getByRole('region', { name: 'Application deployment' })
-    await panel.getByLabel('Upload mesh.json').setInputFiles({
-      name: 'mesh.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(manifest)),
-    })
+    await panel.getByRole('button', { name: 'Load sample workflow', exact: true }).click()
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
     await panel.getByRole('button', { name: 'Save deployment', exact: true }).click()
     await expect(panel.getByText(manifest.name, { exact: true })).toBeVisible()
@@ -71,6 +69,15 @@ test('an uploaded workflow persists, runs on a contributor, and can be replaced 
     expect(jobs.find(job => job.deployment?.name === 'add')?.output?.values).toEqual([4, 6])
     expect(jobs.find(job => job.deployment?.name === 'multiply')?.output?.values).toEqual([19, 22, 43, 50])
     expect(jobs.every(job => job.deployment?.revision_id === saved.id)).toBe(true)
+
+    const uploaded = { ...manifest, name: 'Uploaded workflow' }
+    await panel.getByText('Replace deployment', { exact: true }).click()
+    await panel.getByLabel('Upload mesh.json').setInputFiles({
+      name: 'mesh.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(uploaded)),
+    })
+    await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
+    await panel.getByRole('button', { name: 'Replace deployment', exact: true }).click()
+    await expect(panel.getByText(uploaded.name, { exact: true })).toBeVisible()
 
     const sha = 'a'.repeat(40)
     const repository = 'mesh-test/workflow'
