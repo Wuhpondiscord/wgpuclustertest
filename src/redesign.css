@@ -607,7 +607,8 @@ button { -webkit-tap-highlight-color: transparent; }
 .account-applications { margin-bottom: 24px; min-width: 0; }
 .application-content { padding: 20px; }
 .application-links { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
-.application-form { display: grid; gap: 12px; margin: 16px 0; }
+.application-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 16px 0; }
+.application-form .heading-buttons { flex-wrap: wrap; }
 .application-form label { display: grid; gap: 6px; font-size: 13px; }
 .application-form input, .application-form select { width: 100%; box-sizing: border-box; min-width: 0; padding: 10px; border: 1px solid #cbd5e1; border-radius: 7px; background: white; color: #172033; }
 .account-secret { display: block; overflow-wrap: anywhere; user-select: all; padding: 14px; background: #eef2f6; font-family: monospace; margin: 12px 0; }
@@ -621,7 +622,7 @@ button { -webkit-tap-highlight-color: transparent; }
 .application-runtime summary { cursor: pointer; font-weight: 600; }
 .join-card, .share-link { margin-bottom: 16px; }
 .join-card h2, .browser-quick-start h3, .share-link h3 { margin-top: 0; }
-.join-card .heading-buttons, .browser-quick-start { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.join-card .heading-buttons, .share-link .heading-buttons, .browser-quick-start { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .browser-quick-start { justify-content: space-between; }
 .share-link label { display: grid; gap: 6px; margin-bottom: 10px; }
 .share-link input { min-width: 0; width: 100%; box-sizing: border-box; padding: 8px; }
