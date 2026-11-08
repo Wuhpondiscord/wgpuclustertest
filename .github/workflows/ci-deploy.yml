@@ -99,7 +99,19 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: mesh-cluster:ci
+      - name: Boot the final image and verify encrypted health
+        run: |
+          docker run --detach --name mesh-ci-smoke --publish 127.0.0.1::7860 \
+            -e MESH_REQUIRE_GITHUB_STORAGE=0 \
+            -e MESH_STATE_ENCRYPTION_KEY="$(printf '%064d' 1)" \
+            -e MESH_AUTH_ENCRYPTION_KEY="$(printf '%064d' 2)" mesh-cluster:ci
+          trap 'docker logs mesh-ci-smoke; docker rm -f mesh-ci-smoke >/dev/null' EXIT
+          address="$(docker port mesh-ci-smoke 7860/tcp)"
+          curl --fail --silent --show-error --retry 15 --retry-delay 1 --retry-connrefused \
+            --dump-header /tmp/mesh-health-headers "http://$address/health"
+          grep -qi '^x-mesh-state-format: mesh-state-aes256gcm-v1' /tmp/mesh-health-headers
 
   deploy:
     name: Deploy Hugging Face Docker Space
@@ -173,7 +185,7 @@ jobs:
               repo_id=repo_id,
               repo_type="space",
               commit_message=f"Deploy GitHub {os.environ['GITHUB_SHA'][:7]}",
-              ignore_patterns=[".git/**", ".github/**", "node_modules/**", "server/target/**", "target/**", "work/**", "outputs/**", "mesh-recovery-identity.txt", "**/mesh-recovery-identity.txt", "recovered-space-keys*.json", "**/recovered-space-keys*.json", "*.age", "**/*.age"],
+              ignore_patterns=[".git/**", ".github/**", "tests/**", "node_modules/**", "server/target/**", "target/**", "work/**", "outputs/**", "mesh-recovery-identity.txt", "**/mesh-recovery-identity.txt", "recovered-space-keys*.json", "**/recovered-space-keys*.json", "*.age", "**/*.age"],
           )
           # Wait for this code generation, not the old container's plain /health.
           # No bearer credentials are sent to this public health endpoint.
@@ -181,25 +193,49 @@ jobs:
           health_url = f"https://{space_host}/health"
           def wait_for_encrypted_state():
               until = time.monotonic() + 600
+              last = None
               while time.monotonic() < until:
                   try:
-                      with urlopen(health_url, timeout=10) as response:
-                          ready = response.headers.get("x-mesh-state-format") == "mesh-state-aes256gcm-v1"
                       runtime = api.get_space_runtime(repo_id=repo_id)
-                      if ready and runtime.stage == "RUNNING" and runtime.raw.get("sha") == uploaded.oid:
-                          return
+                      last = runtime
+                      if runtime.stage == "RUNNING" and runtime.raw.get("sha") == uploaded.oid:
+                          with urlopen(health_url, timeout=10) as response:
+                              if response.headers.get("x-mesh-state-format") == "mesh-state-aes256gcm-v1":
+                                  return True, last
                   except Exception:
                       pass
                   time.sleep(5)
-              raise SystemExit("Space did not become healthy with encrypted state; inspect container logs")
-          wait_for_encrypted_state()
+              return False, last
+
+          def stalled_on_previous_revision(runtime):
+              return (
+                  runtime is not None
+                  and runtime.stage == "RUNNING_APP_STARTING"
+                  and runtime.raw.get("sha") not in (None, uploaded.oid)
+                  and runtime.raw.get("hardware", {}).get("requested") == "cpu-basic"
+              )
+
+          def require_ready(ready, runtime):
+              if not ready:
+                  stage = runtime.stage if runtime else "unknown"
+                  revision = runtime.raw.get("sha") if runtime else None
+                  raise SystemExit(f"Space did not become healthy with encrypted state (stage {stage}, active revision {revision}, expected {uploaded.oid}); inspect container logs")
+
+          ready, runtime = wait_for_encrypted_state()
+          if not ready and stalled_on_previous_revision(runtime) and api.space_info(repo_id=repo_id).sha == uploaded.oid:
+              runtime = api.get_space_runtime(repo_id=repo_id)
+              if stalled_on_previous_revision(runtime):
+                  print("Space is still starting with the previous revision. Restarting once.")
+                  api.restart_space(repo_id=repo_id)
+              ready, runtime = wait_for_encrypted_state()
+          require_ready(ready, runtime)
           if "MESH_STATE_PLAINTEXT_MIGRATION_UNTIL" in api.get_space_secrets(repo_id=repo_id):
               api.delete_space_secret(repo_id=repo_id, key="MESH_STATE_PLAINTEXT_MIGRATION_UNTIL")
               print("Removed legacy import permission after encrypted-state readiness")
               # Configuration changes restart the Space. A brief delay avoids reading
               # the retiring container before checking the replacement.
               time.sleep(10)
-              wait_for_encrypted_state()
+              require_ready(*wait_for_encrypted_state())
           if recovery_recipient:
               with urlopen(f"https://{space_host}/api/operator/key-backup", timeout=15) as response:
                   if response.headers.get("x-mesh-recovery-recipient") != recovery_recipient:
