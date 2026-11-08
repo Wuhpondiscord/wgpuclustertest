@@ -28,7 +28,6 @@ const LEASE: Duration = Duration::from_secs(45);
 const RETENTION: Duration = Duration::from_secs(30 * 60);
 const LONG_POLL: Duration = Duration::from_secs(12);
 const MAX_ATTEMPTS: u32 = 5;
-const WARM_TAIL: usize = 8;
 const INVITE_HEADER: &str = "x-mesh-ml-invite";
 
 pub struct Runtime {
@@ -212,31 +211,18 @@ impl Queue {
         self.wait.insert((app, warm), Arc::downgrade(&created));
         created
     }
-    fn wake(&self, app: Uuid) {
-        let ready = self.ready_count(app);
-        if ready == 0 {
-            return;
+    fn wake(&self, app: Uuid, mut ready: usize) {
+        // Each publication supplies a wake budget. Warm waiters get first pick
+        // without waking more browsers than the number of newly ready images.
+        for warm in [true, false] {
+            if let Some(waiters) = self.wait.get(&(app, warm)).and_then(Weak::upgrade) {
+                let count = ready.min(Arc::strong_count(&waiters) - 1);
+                for _ in 0..count {
+                    waiters.notify_one();
+                }
+                ready -= count;
+            }
         }
-        let warm = self.wait.get(&(app, true)).and_then(Weak::upgrade);
-        if let Some(waiter) = &warm {
-            waiter.notify_one();
-        }
-        if let Some(waiter) = self
-            .wait
-            .get(&(app, false))
-            .filter(|_| ready > WARM_TAIL || warm.is_none())
-            .and_then(Weak::upgrade)
-        {
-            waiter.notify_one();
-        }
-    }
-    fn ready_count(&self, app: Uuid) -> usize {
-        self.apps
-            .get(&app)
-            .into_iter()
-            .flatten()
-            .map(|id| self.runs[id].ready.len())
-            .sum()
     }
     fn remove(&mut self, id: Uuid) {
         if let Some(run) = self.runs.remove(&id) {
@@ -258,9 +244,8 @@ impl Queue {
         }
         self.apps.retain(|_, ids| !ids.is_empty());
         self.wait.retain(|_, waiter| waiter.strong_count() != 0);
-        let mut woken = HashSet::new();
+        let mut woken = HashMap::<Uuid, usize>::new();
         for run in self.runs.values_mut() {
-            let mut requeued = false;
             for index in 0..run.items.len() {
                 if run.items[index]
                     .lease
@@ -268,15 +253,14 @@ impl Queue {
                     .is_some_and(|lease| lease.expires <= at)
                 {
                     self.buffered -= run.requeue(index);
-                    requeued = true;
+                    if !run.items[index].failed {
+                        *woken.entry(run.app).or_default() += 1;
+                    }
                 }
             }
-            if requeued && !run.ready.is_empty() {
-                woken.insert(run.app);
-            }
         }
-        for app in woken {
-            self.wake(app);
+        for (app, count) in woken {
+            self.wake(app, count);
         }
     }
     fn insert(&mut self, app: Uuid, images: Vec<String>, at: Instant) -> ApiResult<Uuid> {
@@ -296,12 +280,13 @@ impl Queue {
             ));
         }
         self.buffered += run.bytes;
+        let count = run.ready.len();
         self.runs.insert(id, run);
         self.apps.entry(app).or_default().push_back(id);
-        self.wake(app);
+        self.wake(app, count);
         Ok(id)
     }
-    fn claim(&mut self, app: Uuid, worker: &Worker, warm: bool, at: Instant) -> Option<Work> {
+    fn claim(&mut self, app: Uuid, worker: &Worker, at: Instant) -> Option<Work> {
         let ids = self.apps.get(&app)?;
         let runs = &self.runs;
         let live = |id: &&Uuid| runs[*id].expires > at;
@@ -309,32 +294,12 @@ impl Queue {
             .iter()
             .filter(live)
             .find(|id| runs[*id].active.contains_key(worker));
-        let id = match resume {
-            Some(id) => id,
-            None => {
-                if !warm
-                    && self.ready_count(app) <= WARM_TAIL
-                    && self
-                        .wait
-                        .get(&(app, true))
-                        .is_some_and(|waiter| waiter.strong_count() != 0)
-                {
-                    return None;
-                }
-                ids.iter()
-                    .filter(live)
-                    .find(|id| !runs[*id].ready.is_empty())?
-            }
-        };
-        let run = self.runs.get_mut(id)?;
-        let work = run.claim(worker, at)?;
-        if ids
-            .iter()
-            .any(|id| self.runs[id].expires > at && !self.runs[id].ready.is_empty())
-        {
-            self.wake(app);
-        }
-        Some(work)
+        let id = resume.or_else(|| {
+            ids.iter()
+                .filter(live)
+                .find(|id| !runs[*id].ready.is_empty())
+        })?;
+        self.runs.get_mut(id)?.claim(worker, at)
     }
     fn run(&self, app: Uuid, id: Uuid, at: Instant) -> ApiResult<&Run> {
         self.runs
@@ -620,45 +585,46 @@ struct Work {
     lease: Uuid,
     image_rgb96: String,
 }
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ClaimReply {
+    Work(Work),
+    Ready { ready: bool },
+}
 async fn claim(
     State(state): State<AppState>,
     Path(app): Path<Uuid>,
     headers: HeaderMap,
     Json(input): Json<Claim>,
-) -> ApiResult<Json<Option<Work>>> {
-    let claim_once = || {
+) -> ApiResult<Json<Option<ClaimReply>>> {
+    let (_permit, waiting) = {
         let store = state.store.lock().map_err(|_| unavailable())?;
         let worker = worker(&store, &headers, app, input.worker_id)?;
         let mut queue = state.image_batches.queue()?;
-        let notify = queue.notifier(app, input.warm);
-        Ok::<_, ApiError>((
-            queue.claim(app, &worker, input.warm, Instant::now()),
-            notify,
-        ))
+        if let Some(work) = queue.claim(app, &worker, Instant::now()) {
+            return Ok(Json(Some(ClaimReply::Work(work))));
+        }
+        let permit = state
+            .image_batches
+            .waiters
+            .try_acquire()
+            .map_err(|_| unavailable())?;
+        let mut waiting = Box::pin(queue.notifier(app, input.warm).notified_owned());
+        // Register before releasing the queue lock so publication can't miss us.
+        waiting.as_mut().enable();
+        (permit, waiting)
     };
-    let (work, notify) = claim_once()?;
-    if work.is_some() {
-        return Ok(Json(work));
-    }
-    let _waiter = state
-        .image_batches
-        .waiters
-        .try_acquire()
-        .map_err(|_| unavailable())?;
-    if tokio::time::timeout(LONG_POLL, notify.notified())
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(LONG_POLL, waiting).await.is_err() {
         return Ok(Json(None));
     }
-    match claim_once() {
-        Ok((work, _)) => Ok(Json(work)),
-        Err(error) => {
-            // A revoked waiting worker must not consume the only wake-up.
-            state.image_batches.queue()?.wake(app);
-            Err(error)
-        }
+    let store = state.store.lock().map_err(|_| unavailable())?;
+    if let Err(error) = worker(&store, &headers, app, input.worker_id) {
+        state.image_batches.queue()?.wake(app, 1);
+        return Err(error);
     }
+    // A proxy can keep an idle request alive after its tab closes. Only a new
+    // request can take work after this wake, so an abandoned poll takes no lease.
+    Ok(Json(Some(ClaimReply::Ready { ready: true })))
 }
 #[derive(Deserialize)]
 struct Attempt {
@@ -705,7 +671,9 @@ async fn release(
     run.checked_lease(&input, &worker, at)?;
     let released = run.requeue(input.index);
     queue.buffered -= released;
-    queue.wake(app);
+    if released == 0 {
+        queue.wake(app, 1);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn commit(
@@ -796,19 +764,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefers_a_warm_waiter_for_the_small_tail() {
+    fn wakes_a_warm_waiter_first_when_only_one_image_is_ready() {
+        use futures_util::FutureExt;
         let mut queue = Queue::default();
         let app = Uuid::new_v4();
         let at = Instant::now();
-        let warm_waiter = queue.notifier(app, true);
-        let worker = Worker {
-            id: Uuid::new_v4(),
-            principal: "test".into(),
-        };
+        let mut warm_waiter = Box::pin(queue.notifier(app, true).notified_owned());
+        let mut cold_waiter = Box::pin(queue.notifier(app, false).notified_owned());
+        warm_waiter.as_mut().enable();
+        cold_waiter.as_mut().enable();
         queue.insert(app, vec!["input".into()], at).unwrap();
-        assert!(queue.claim(app, &worker, false, at).is_none());
-        assert!(queue.claim(app, &worker, true, at).is_some());
-        drop(warm_waiter);
+        assert!(warm_waiter.now_or_never().is_some());
+        assert!(cold_waiter.now_or_never().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -832,11 +799,7 @@ mod tests {
                     id: Uuid::new_v4(),
                     principal: "test".into(),
                 };
-                let work = queue
-                    .lock()
-                    .unwrap()
-                    .claim(app, &worker, false, at)
-                    .unwrap();
+                let work = queue.lock().unwrap().claim(app, &worker, at).unwrap();
                 (worker, work)
             });
         }
@@ -867,18 +830,15 @@ mod tests {
         let mut queue = queue.lock().unwrap();
         let (worker, first) = assignments;
         let (other_app, wrong_id) = (Uuid::new_v4(), Uuid::new_v4());
-        assert!(queue.claim(other_app, &worker, false, at).is_none());
-        assert_eq!(
-            queue.claim(app, &worker, false, at).unwrap().lease,
-            first.lease
-        );
+        assert!(queue.claim(other_app, &worker, at).is_none());
+        assert_eq!(queue.claim(app, &worker, at).unwrap().lease, first.lease);
         let resumed = at + LEASE;
         queue.sweep(resumed);
         let takeover = Worker {
             id: wrong_id,
             principal: "test".into(),
         };
-        let second = queue.claim(app, &takeover, false, resumed).unwrap();
+        let second = queue.claim(app, &takeover, resumed).unwrap();
         let run = queue.run_mut(app, run_id, resumed).unwrap();
         assert_eq!(second.index, first.index);
         assert_ne!(first.lease, second.lease);

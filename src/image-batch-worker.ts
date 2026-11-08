@@ -3,6 +3,7 @@ import { fetchImageModel, imageSize, modelRepository, modelRevision } from './im
 
 type Start = { app: string; worker: string; identity?: string; invite?: string; browserKey: string }
 type Work = { run_id: string; index: number; lease: string; image_rgb96: string }
+type Claim = Work | { ready: true } | null
 type Backend = 'webgpu' | 'wasm'
 const scope = globalThis as unknown as {
   onmessage: ((event: MessageEvent<Start | 'stop'>) => void) | null
@@ -98,9 +99,9 @@ async function run(config: Start, signal: AbortSignal) {
   let claimErrors = 0
   while (!signal.aborted) {
     report(`Waiting for images · ${completed} completed`)
-    let work: Work | null
+    let work: Claim
     try {
-      work = await post<Work | null>('/claim', { worker_id: config.worker, warm: Boolean(runtime) }, AbortSignal.any([signal, AbortSignal.timeout(20_000)]))
+      work = await post<Claim>('/claim', { worker_id: config.worker, warm: Boolean(runtime) }, AbortSignal.any([signal, AbortSignal.timeout(20_000)]))
       claimErrors = 0
     } catch (error) {
       signal.throwIfAborted()
@@ -109,6 +110,7 @@ async function run(config: Start, signal: AbortSignal) {
       continue
     }
     if (!work) { await wait(Math.random() * 800, signal); continue }
+    if ('ready' in work) continue
     const path = `/${work.run_id}`
     const attempt = { worker_id: config.worker, index: work.index, lease: work.lease }
     const task = new AbortController()

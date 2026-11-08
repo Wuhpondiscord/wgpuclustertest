@@ -476,6 +476,15 @@ async fn ml_link_is_work_only_and_image_results_do_not_write_the_state_file() {
         StatusCode::NOT_FOUND
     );
     let snapshot = std::fs::read(f.state.data_file.as_ref()).unwrap();
+    let work = format!("{app}/image-work");
+    let idle = guest_call(
+        "POST",
+        format!("{work}/claim"),
+        json!({"worker_id":Uuid::new_v4()}),
+        browser_key,
+    );
+    tokio::pin!(idle);
+    assert!(futures_util::poll!(&mut idle).is_pending());
     let image = "A".repeat(96 * 96 * 4);
     let (status, run) = call(
         &f.router,
@@ -487,7 +496,7 @@ async fn ml_link_is_work_only_and_image_results_do_not_write_the_state_file() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{run}");
-    let work = format!("{app}/image-work");
+    assert_eq!(idle.await, (StatusCode::OK, json!({"ready":true})));
     let claim = || {
         guest_call(
             "POST",

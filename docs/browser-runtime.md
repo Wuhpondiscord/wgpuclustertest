@@ -42,9 +42,9 @@ and configuration hashes, and keep a warm model session between jobs.
 The UI shows progress, worker IDs, and the reported WebGPU or WASM backend.
 Download the ordered predictions as JSON before they expire.
 
-Each image has its own fenced lease. Workers long-poll for one assignment
-at a time. The coordinator wakes individual waiters and gives warm workers
-preference when eight or fewer images remain. If a browser goes away, its
+Each image has its own fenced lease. Idle browsers long-poll for a readiness
+signal, then request one assignment. The coordinator wakes up to one waiting
+browser per newly available image, prioritizing warm workers. If a browser goes away, its
 lease expires after up to 45 seconds, and the next sweep makes the image
 available to another worker. Predictions are reported by one worker per
 image. The coordinator validates their shape and range.
