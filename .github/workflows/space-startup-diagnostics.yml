@@ -1,4 +1,4 @@
-name: Diagnose Mesh Space startup
+name: Recover the stalled Mesh Space
 
 on:
   push:
@@ -7,104 +7,61 @@ on:
 permissions: {}
 
 jobs:
-  diagnostics:
-    name: Read Space startup diagnostics
+  restart:
+    if: github.event.head_commit.message == 'Restart the stalled Space once'
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 9
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - name: Classify startup logs without publishing raw lines
+      - name: Restart the stalled free-tier Space and verify the uploaded revision
         run: |
           python3 - <<'PY'
-          import collections
           import json
           import os
-          import re
           import time
           import urllib.error
           import urllib.request
 
-          base = "https://huggingface.co/api/spaces/wuhp/webgputest"
+          hub = "https://huggingface.co/api/spaces/wuhp/webgputest"
+          app = "https://wuhp-webgputest.hf.space"
+          target = "c4c0b03e47f7403a0023e100e81cbc90ce9d915e"
+          old = "e72a56b66a074f6478274988e65af88f93e86ef5"
           token = os.environ["HF_TOKEN"]
           if not token:
               raise SystemExit("HF_TOKEN is unavailable")
-          def request(path):
-              return urllib.request.urlopen(urllib.request.Request(
-                  base + path, headers={"Authorization": "Bearer " + token}
-              ), timeout=8)
-
-          for label, path in [("runtime", "/runtime"), ("source", "")]:
-              with request(path) as response:
-                  value = json.load(response)
-              runtime = value.get("runtime", value)
-              print(label, json.dumps({k: runtime.get(k) for k in ("stage", "sha", "hardware", "replicas")}))
-          markers = {
-              "startup_panic": r"panicked at",
-              "missing_github_configuration": r"requires? github|github storage is required|gh_token.*required",
-              "github_state_load": r"github cluster storage is configured but could not be loaded",
-              "state_encryption_configuration": r"state encryption configuration invalid",
-              "state_authentication": r"could not authenticate|authentication failed|invalid authentication tag",
-              "state_decode": r"invalid type:|missing field|duplicate field|expected value|could not decode|could not parse|invalid.*snapshot",
-              "state_migration": r"could not encrypt legacy state",
-              "recovery_configuration": r"invalid operator recovery configuration",
-              "github_http_401": r"github[^\n]*\b401\b",
-              "github_http_403": r"github[^\n]*\b403\b",
-              "github_http_404": r"github[^\n]*\b404\b",
-              "github_http_429": r"github[^\n]*\b429\b",
-              "github_http_5xx": r"github[^\n]*\b5[0-9]{2}\b",
-              "tls": r"certificate verify|unknownissuer|invalid peer certificate|tls.*error",
-              "network_timeout": r"timed out|timeout",
-              "bind_error": r"bind coordinator|address already in use",
-              "server_ready": r"mesh coordinator listening",
-              "out_of_memory": r"out of memory|oomkilled|sigkill|exit code:? 137|signal:? 9",
-              "loader_error": r"error while loading shared libraries|glibc_.*not found|exec format error|illegal instruction",
-              "build_started": r"starting build|building image|compiling mesh-coordinator",
-              "build_completed": r"finished .*release|pushing image|exporting to image|build complete",
-              "build_failure": r"failed to solve|error: could not compile|error: failed to download|failed to build|no space left",
-          }
-          for kind in ("build", "run"):
-              counts = collections.Counter()
-              lines = 0
-              end = time.monotonic() + 12
+          def hub_json(path="", method="GET"):
+              req = urllib.request.Request(hub + path, method=method, headers={"Authorization": "Bearer " + token})
+              with urllib.request.urlopen(req, timeout=15) as response:
+                  return json.load(response)
+          source = hub_json()
+          runtime = hub_json("/runtime")
+          if source.get("sha") != target:
+              raise SystemExit("The Space repository moved during diagnosis")
+          if runtime.get("sha") != target or runtime.get("stage") != "RUNNING":
+              hardware = runtime.get("hardware", {})
+              if (runtime.get("sha"), runtime.get("stage")) != (old, "RUNNING_APP_STARTING") or hardware.get("requested") != "cpu-basic":
+                  raise SystemExit("The Space state changed during diagnosis. Inspect its latest runtime before restarting.")
+              started = hub_json("/restart", method="POST")
+              print("Normal restart accepted", started.get("stage"), flush=True)
+          deadline = time.monotonic() + 420
+          last = None
+          while time.monotonic() < deadline:
               try:
-                  with request(f"/logs/{kind}?tail=120") as response:
-                      while lines < 250 and time.monotonic() < end:
-                          raw = response.readline(16384)
-                          if not raw:
+                  runtime = hub_json("/runtime")
+                  seen = (runtime.get("stage"), runtime.get("sha"))
+                  if seen != last:
+                      print("Runtime", *seen, flush=True)
+                      last = seen
+                  if seen == ("RUNNING", target):
+                      health = urllib.request.Request(app + "/health", headers={"Cache-Control": "no-cache"})
+                      with urllib.request.urlopen(health, timeout=10) as response:
+                          if response.headers.get("x-mesh-state-format") == "mesh-state-aes256gcm-v1":
+                              print("Uploaded revision is healthy with encrypted state")
                               break
-                          line = raw.decode(errors="replace").strip()
-                          if not line.startswith("data:"):
-                              continue
-                          lines += 1
-                          for key, pattern in markers.items():
-                              if re.search(pattern, line, re.IGNORECASE):
-                                  counts[key] += 1
-              except urllib.error.HTTPError as error:
-                  print(kind, "HTTP", error.code)
-              except (TimeoutError, OSError):
-                  print(kind, "log stream idle")
-              print(kind, json.dumps({"log_lines": lines, "markers": counts}, sort_keys=True))
+              except (TimeoutError, urllib.error.URLError):
+                  pass
+              time.sleep(8)
+          else:
+              raise SystemExit("Space did not switch to the uploaded revision after the normal restart")
           PY
-
-  docker-startup:
-    name: Run the published Dockerfile
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build and start the final image with disposable state
-        run: |
-          docker build -t mesh-space-startup .
-          docker run --rm --entrypoint ldd mesh-space-startup /usr/local/bin/mesh-coordinator
-          docker run --detach --name mesh-space-startup --publish 127.0.0.1::7860 \
-            -e MESH_REQUIRE_GITHUB_STORAGE=0 \
-            -e MESH_STATE_ENCRYPTION_KEY="$(printf '%064d' 1)" \
-            -e MESH_AUTH_ENCRYPTION_KEY="$(printf '%064d' 2)" mesh-space-startup
-          trap 'docker logs mesh-space-startup; docker rm -f mesh-space-startup >/dev/null' EXIT
-          address="$(docker port mesh-space-startup 7860/tcp)"
-          curl --fail --silent --show-error --retry 15 --retry-delay 1 --retry-connrefused \
-            --dump-header /tmp/mesh-health-headers "http://$address/health"
-          grep -qi '^x-mesh-state-format: mesh-state-aes256gcm-v1' /tmp/mesh-health-headers
