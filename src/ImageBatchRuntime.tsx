@@ -58,7 +58,7 @@ function ImageContributor({ app, invite }: { app: string; invite?: string }) {
     <strong>Contribute to image classification</strong>
     <p>This browser downloads about 15 MB of model weights plus the runtime on its first job. It uses WebGPU when available and can fall back to the CPU. Keep this tab open to contribute.</p>
     <button type="button" className={enabled ? 'manage-button' : 'manage-button primary'} disabled={stopping} onClick={() => enabled ? stop() : void start()}>{enabled ? 'Stop ML worker' : 'Start ML worker'}</button>
-    <p role="status">{message}</p>
+    <p role="status">{message}{enabled && ` · Worker ${device.id.slice(0, 8)}`}</p>
   </section>
 }
 
