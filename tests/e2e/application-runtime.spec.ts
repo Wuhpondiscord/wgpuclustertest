@@ -48,6 +48,28 @@ async function extraContributor(browser: Browser, clusterId: string, inference: 
   return { context, page, nodeId: node.node.id }
 }
 
+test('a guest joins from one link and passes the quick test without an account', async ({ browser }) => {
+  const f = await fixture(browser)
+  const guest = await browser.newContext()
+  try {
+    await f.page.getByRole('button', { name: 'Stop contributing', exact: true }).click()
+    await f.page.getByRole('button', { name: 'Share contributor link' }).click()
+    const link = f.page.getByLabel('Invite link', { exact: true })
+    await expect(link).toBeVisible()
+    const page = await guest.newPage()
+    await page.goto(await link.inputValue())
+    await expect(page.getByText('You’re invited to contribute to', { exact: false })).toBeVisible()
+    await page.getByRole('button', { name: 'Join and contribute' }).click()
+    await expect(page.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
+    expect(await page.evaluate(() => sessionStorage.getItem('mesh.account-session'))).toBeNull()
+    await f.page.getByRole('button', { name: 'Run quick test' }).click()
+    await expect(f.page.getByText('Test passed. The verified result is [5,7,9].', { exact: true })).toBeVisible()
+  } finally {
+    await guest.close()
+    await f.close()
+  }
+})
+
 test('the built-in sample runs on a contributor and can be replaced by an upload or pinned GitHub import', async ({ browser }) => {
   const f = await fixture(browser)
   try {
@@ -141,9 +163,12 @@ test('real pinned MiniLM embeddings execute only after model-download opt-in', a
   test.setTimeout(300_000)
   const f = await fixture(browser)
   try {
-    const job = await api<ApplicationJob>(`/api/applications/${f.app.id}/inference`, 'POST', {
-      model: 'minilm-l6-v2', verification: 'single', input: ['A cat sits on a mat.', 'A kitten rests on a rug.', 'The stock exchange closed lower today.'],
-    })
+    await f.page.getByLabel('Operation template').selectOption('embedding')
+    await f.page.getByLabel('Text to embed').fill('A cat sits on a mat.\nA kitten rests on a rug.\nThe stock exchange closed lower today.')
+    await f.page.getByLabel('Result verification').selectOption('single')
+    await f.page.getByRole('button', { name: 'Queue application job' }).click()
+    await expect(f.page.getByTestId('application-job-status')).toHaveText('queued')
+    const [job] = await api<ApplicationJob[]>(`/api/applications/${f.app.id}/jobs`)
     await new Promise(resolve => setTimeout(resolve, 2500))
     expect((await api<ApplicationJob>(job.status_url)).status).toBe('queued')
     await f.page.getByLabel('ML inference (downloads a ~90 MB model plus runtime)', { exact: true }).check()

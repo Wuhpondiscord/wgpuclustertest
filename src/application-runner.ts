@@ -11,12 +11,13 @@ export class ApplicationRunner {
     const lease = maintainLease(work.job_id, work.lease, claimedAt, parent, `/api/application-work/${work.job_id}/renew`)
     let accepted = false
     let failure: unknown
-    const matches = (job: ApplicationJob) => job.workers.some(receipt => receipt.node_id === work.lease.worker_id && receipt.attempt_id === work.lease.attempt_id && receipt.coordinator_epoch === work.lease.coordinator_epoch && receipt.generation === work.lease.generation)
+    type Acknowledgement = Pick<ApplicationJob, 'status' | 'workers'>
+    const matches = (job: Acknowledgement) => job.workers.some(receipt => receipt.node_id === work.lease.worker_id && receipt.attempt_id === work.lease.attempt_id && receipt.coordinator_epoch === work.lease.coordinator_epoch && receipt.generation === work.lease.generation)
     try {
       const result = await this.executor.run(work.input, allowCpu, lease.signal, work.timeout_ms, progress)
       for (let attempt = 0; ; attempt++) {
         try {
-          const job = await api<ApplicationJob>(`/api/application-work/${work.job_id}/commit`, {
+          const job = await api<Acknowledgement>(`/api/application-work/${work.job_id}/commit`, {
             method: 'POST', body: JSON.stringify({ lease: lease.current(), ...result }),
             signal: AbortSignal.any([lease.signal, AbortSignal.timeout(12_000)]),
           })
@@ -26,7 +27,11 @@ export class ApplicationRunner {
         } catch (error) {
           // A timed-out commit can already be durable. Reconcile provenance before
           // considering it a failure, even if its lease has since expired.
-          const observed = await api<ApplicationJob>(`/api/applications/${work.application_id}/jobs/${work.job_id}`, { signal: AbortSignal.any([parent, AbortSignal.timeout(5_000)]) }).catch(() => null)
+          const observed = await api<Acknowledgement>(`/api/application-work/${work.job_id}/receipt`, {
+            method: 'POST',
+            body: JSON.stringify({ lease: work.lease }),
+            signal: AbortSignal.any([parent, AbortSignal.timeout(5_000)]),
+          }).catch(() => null)
           if (observed && matches(observed)) { accepted = true; return { ...result.runtime, status: observed.status } }
           if (attempt >= 2 || !isTransient(error)) throw error
           await delay(500 * 2 ** attempt, lease.signal)

@@ -413,6 +413,218 @@ fn unit(index: usize) -> Value {
 }
 
 #[tokio::test]
+async fn project_link_grants_assigned_work_only_and_revocation_fences_the_worker() {
+    let f = Fixture::new().await;
+    let guest = "b".repeat(64);
+    let app_path = format!("/api/applications/{}", f.app);
+    let cluster_path = format!("/api/clusters/{}", f.cluster);
+    let (status, invite) = call(
+        &f.router,
+        "POST",
+        &format!("{app_path}/contributor-invites"),
+        &f.session,
+        Value::Null,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{invite}");
+    let token = invite["token"].as_str().unwrap();
+    let (status, preview) = call(
+        &f.router,
+        "GET",
+        &format!("/api/invites/{token}"),
+        "",
+        Value::Null,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview["project_name"], "runtime");
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            "/api/invites/join",
+            &guest,
+            json!({"token":token}),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, node) = call(
+        &f.router,
+        "POST",
+        &format!("{cluster_path}/nodes"),
+        &guest,
+        json!({"name":"guest browser"}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let node = node["node"]["id"].as_str().unwrap();
+    f.state
+        .store
+        .lock()
+        .unwrap()
+        .nodes
+        .get_mut(&Uuid::parse_str(node).unwrap())
+        .unwrap()
+        .online = true;
+    for path in [
+        app_path.clone(),
+        format!("{app_path}/jobs"),
+        format!("{app_path}/deployment"),
+    ] {
+        assert_eq!(
+            call(&f.router, "GET", &path, &guest, Value::Null, None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("{app_path}/jobs"),
+            &guest,
+            numeric(),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (_, other) = call(
+        &f.router,
+        "POST",
+        &format!("{cluster_path}/applications"),
+        &f.session,
+        json!({"name":"other","slug":"other"}),
+        None,
+    )
+    .await;
+    let other_jobs = format!("/api/applications/{}/jobs", other["id"].as_str().unwrap());
+    assert_eq!(
+        call(&f.router, "POST", &other_jobs, &f.session, numeric(), None)
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    let claim_path = format!("{cluster_path}/application-work/claim");
+    let claim = || {
+        call(
+            &f.router,
+            "POST",
+            &claim_path,
+            &guest,
+            json!({"node_id":node,"inference":false}),
+            None,
+        )
+    };
+    assert!(claim().await.1.is_null());
+    let job = f.submit(numeric()).await;
+    let (status, work) = claim().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(work["job_id"], job["id"]);
+    assert_eq!(work["input"]["a"], json!([1., 2., 3.]));
+    let work_path = format!("/api/application-work/{}", job["id"].as_str().unwrap());
+    let (status, committed) = call(&f.router, "POST", &format!("{work_path}/commit"), &guest, json!({"lease":work["lease"],"output":{"values":[5.,7.,9.],"shape":[3]},"runtime":{"backend":"cpu","compute_ms":1.,"load_ms":0.}}), None).await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(committed["status"], "completed");
+    assert!(committed["output"].is_null());
+    assert!(committed["input"].is_null());
+    assert!(committed["deployment"].is_null());
+    let receipt_path = format!("{work_path}/receipt");
+    let (status, receipt) = call(
+        &f.router,
+        "POST",
+        &receipt_path,
+        &guest,
+        json!({"lease":work["lease"]}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["workers"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["workers"][0]["node_id"], node);
+    let mut wrong_lease = work["lease"].clone();
+    wrong_lease["attempt_id"] = json!(0);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &receipt_path,
+            &guest,
+            json!({"lease":wrong_lease}),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let next = f.submit(numeric()).await;
+    let (_, work) = claim().await;
+    assert_eq!(work["job_id"], next["id"]);
+    let revoke_path = format!("{cluster_path}/invites/{}", crate::secret_hash(token));
+    assert_eq!(
+        call(
+            &f.router,
+            "DELETE",
+            &revoke_path,
+            &f.session,
+            Value::Null,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let renew = format!(
+        "/api/application-work/{}/renew",
+        next["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &renew,
+            &guest,
+            json!({"lease":work["lease"]}),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(claim().await.1.is_null());
+    let task = work["lease"]["task_id"].as_str().unwrap();
+    assert!(f
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .recovery
+        .active_lease(task, crate::now_ms())
+        .is_none());
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("{cluster_path}/nodes"),
+            &guest,
+            Value::Null,
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn cluster_members_and_viewers_cannot_work_and_revoked_operators_are_fenced() {
     let f = Fixture::new().await;
     let raw = "b".repeat(64);

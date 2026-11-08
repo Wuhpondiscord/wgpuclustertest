@@ -835,6 +835,7 @@ pub struct AppSummary {
     role: AppRole,
     members: Vec<AppMember>,
     runtime_status: &'static str,
+    can_share_compute: bool,
 }
 #[derive(Serialize)]
 struct AppMember {
@@ -871,6 +872,11 @@ fn app_summary(app: &Application, store: &Store, user: &str) -> ApiResult<AppSum
             })
             .collect(),
         runtime_status: "browser_jobs",
+        can_share_compute: role == AppRole::Owner
+            && store
+                .clusters
+                .get(&app.cluster_id)
+                .is_some_and(|cluster| cluster.owner_id == user),
     })
 }
 #[derive(Deserialize)]

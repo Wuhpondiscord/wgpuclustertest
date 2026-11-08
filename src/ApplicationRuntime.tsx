@@ -1,19 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import { ApplicationDeployment } from './ApplicationDeployment'
-import type { ApplicationInput, ApplicationJob } from './application-types'
+import { ApplicationJobForm, quickTestInput } from './ApplicationJobForm'
+import type { ApplicationJob } from './application-types'
 
 type AppKey = { id: string; label: string; expires_at: number; read_only: boolean }
-const samples: Record<ApplicationInput['operation'], ApplicationInput> = {
-  vector_add: { operation: 'vector_add', a: [1, 2, 3], b: [4, 5, 6] },
-  matmul: { operation: 'matmul', a: [1, 2, 3, 4], b: [5, 6, 7, 8], rows: 2, inner: 2, cols: 2 },
-  embedding: { operation: 'embedding', model: 'minilm-l6-v2', texts: ['A cat sits on the mat.', 'A kitten rests on a rug.'], verification: 'replicated' },
-}
 export function ApplicationRuntime({ appId, role }: { appId: string; role: 'owner' | 'operator' | 'viewer' }) {
   const base = `/api/applications/${appId}`
   const [jobs, setJobs] = useState<ApplicationJob[]>([])
   const [keys, setKeys] = useState<AppKey[]>([])
-  const [input, setInput] = useState(JSON.stringify(samples.vector_add, null, 2))
+  const [quickTestId, setQuickTestId] = useState<string>()
   const [label, setLabel] = useState('Developer SDK')
   const [readOnly, setReadOnly] = useState(false)
   const [issued, setIssued] = useState<string | null>(null)
@@ -56,6 +52,17 @@ export function ApplicationRuntime({ appId, role }: { appId: string; role: 'owne
     setBusy(true); setError('')
     try { await action(); await refresh() } catch (e) { setError(e instanceof Error ? e.message : 'Application request failed') } finally { setBusy(false) }
   }
+  async function queue(input: unknown) {
+    const job = await api<ApplicationJob>(`${base}/jobs`, {
+      method: 'POST',
+      headers: { 'Idempotency-Key': crypto.randomUUID() },
+      body: JSON.stringify(input),
+    })
+    setJobs(current => [job, ...current.filter(existing => existing.id !== job.id)])
+    return job
+  }
+  const quickTest = jobs.find(job => job.id === quickTestId)
+  const quickTestPending = quickTest && ['queued', 'running', 'awaiting_verification'].includes(quickTest.status)
   const example = `import { MeshClient } from '${location.origin}/sdk/mesh-client.mjs';
 const mesh = new MeshClient({
   endpoint: '${location.origin}', applicationId: '${appId}',
@@ -65,20 +72,27 @@ const job = await mesh.embeddings(['Your text here']);
 const result = await mesh.wait(job);
 console.log(result.output);`
   return <section className="application-runtime" aria-label="Browser application runtime">
+    <h3>Browser jobs</h3>
+    <p>Run numerical operations and text embeddings on connected browsers. App owners, operators and guests who accepted a contributor link can run assigned work. Choose trusted contributors for sensitive inputs.</p>
+    {error && <p role="alert" className="feedback error">{error}</p>}
+    {role !== 'viewer' && <>
+      <div className="runtime-job">
+        <strong>Check that a worker can run jobs</strong>
+        <p>The quick test adds two small vectors and checks the answer. Start a browser contributor first or share a contributor link.</p>
+        <button className="manage-button" type="button" disabled={busy || quickTestPending} onClick={() => void run(async () => {
+          setQuickTestId((await queue(quickTestInput)).id)
+        })}>Run quick test</button>
+        {quickTest && <p role="status">{quickTest.status === 'completed'
+          ? `Test passed. The verified result is ${JSON.stringify(quickTest.output?.values)}.`
+          : quickTest.status === 'queued' ? 'Test queued. Waiting for a connected contributor.'
+          : `Quick test is ${quickTest.status}.`}</p>}
+      </div>
+      <ApplicationJobForm busy={busy} onSubmit={readInput => void run(async () => { await queue(readInput()) })}/>
+    </>}
     <ApplicationDeployment appId={appId} role={role} onQueued={queued => {
       const ids = new Set(queued.map(job => job.id))
       setJobs(current => [...queued, ...current.filter(job => !ids.has(job.id))])
     }}/>
-    <h3>Browser jobs</h3>
-    <p>Run bounded numerical operations and text embeddings on connected browser workers. Workers must belong to this cluster and have owner or operator access to this application. Enable contribution on their device; opt into ML downloads for embeddings.</p>
-    <p>Inputs and results are private to app members and approved workers. Worker devices can inspect their tasks; use trusted operators for sensitive data. This runtime executes jobs, rather than hosting an always-on web server.</p>
-    {error && <p role="alert" className="feedback error">{error}</p>}
-    {role !== 'viewer' && <form className="application-form" onSubmit={event => { event.preventDefault(); void run(async () => { const value: unknown = JSON.parse(input); await api(`${base}/jobs`, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify(value) }) }) }}>
-      <label>Operation template<select onChange={event => setInput(JSON.stringify(samples[event.target.value as ApplicationInput['operation']], null, 2))} defaultValue="vector_add"><option value="vector_add">Vector add</option><option value="matmul">Matrix multiply</option><option value="embedding">Text embeddings (ML)</option></select></label>
-      <label>Job input JSON<textarea aria-label="Job input JSON" rows={12} maxLength={65536} value={input} onChange={event => setInput(event.target.value)}/></label>
-      <p>Embeddings default to two distinct nodes agreeing. For one-device testing set <code>"verification": "single"</code>; that mode is unverified. Agreement is not a proof of honest computation.</p>
-      <button className="manage-button primary" disabled={busy}>Queue application job</button>
-    </form>}
     <div className="application-job-list" aria-label="Application jobs">
       {!jobs.length && <p>No jobs yet. Jobs wait until an approved contributor is connected.</p>}
       {jobs.map(job => <article className="runtime-job" key={job.id} data-testid="application-job"><strong>{job.deployment?.name ?? job.input.operation}</strong> · <span data-testid="application-job-status">{job.status}</span><div><code>{job.id}</code></div><p>{job.verification.split('_').join(' ')} · {job.replicas_received}/{job.replicas_required} results received</p>
