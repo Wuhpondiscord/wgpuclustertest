@@ -27,6 +27,36 @@ Cluster membership remains until separately removed. A regular cluster invite
 does not grant private app compute access. App management still uses named
 account roles, including operator access to submit jobs.
 
+## Browser image batches
+
+Open a private app and expand **Image classification (ML)**. Start this browser
+or create an **ML contributor link** and share it with trusted friends. They can
+start a worker from the link without creating an account or registering a
+WebRTC node. The ML link grants access to assigned images for this project.
+It expires after seven days and can be revoked under **Active invites**.
+
+Try a sample image or a 32-image batch, or upload up to 1,024 images. The
+submitting browser crops and resizes each image to 96 × 96 pixels. Workers
+automatically fetch the pinned MobileNetV4 model on first use, verify the model
+and configuration hashes, and keep a warm model session between jobs.
+The UI shows progress, worker IDs, and the reported WebGPU or WASM backend.
+Download the ordered predictions as JSON before they expire.
+
+Each image has its own fenced lease. Idle browsers long-poll for a readiness
+signal, then request one assignment. The coordinator wakes up to one waiting
+browser per newly available image, prioritizing warm workers. If a browser goes away, its
+lease expires after up to 45 seconds, and the next sweep makes the image
+available to another worker. Predictions are reported by one worker per
+image. The coordinator validates their shape and range.
+
+The image path has no WebRTC peer mesh. Model files go directly from Hugging
+Face to the workers. The Space holds inputs and results in memory, with a
+1,024-image limit per batch, a 72 MiB pending-image budget, and up to 4,096
+waiting requests across all apps. Batch data expires 30 minutes after submission
+and is lost when the Space restarts. GitHub stores only the usual project and
+invite metadata. These are coordinator limits. Capacity through the live
+Hugging Face proxy and throughput with real devices still need measurement.
+
 ## Deploy a workflow from a file or repository
 
 Open your private application and find **Deploy workflow**. Download the

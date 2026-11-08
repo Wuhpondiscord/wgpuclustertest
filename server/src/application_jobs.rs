@@ -882,7 +882,7 @@ pub async fn claim(
 pub struct LeaseInput {
     lease: recovery::TaskLease,
 }
-fn application_worker_access(store: &Store, app: Uuid, user: &str) -> ApiResult<()> {
+pub(crate) fn application_worker_access(store: &Store, app: Uuid, user: &str) -> ApiResult<()> {
     if security::application_access(store, app, user, true).is_ok() {
         return Ok(());
     }

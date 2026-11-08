@@ -1,4 +1,5 @@
 import { ApplicationRuntime } from './ApplicationRuntime'
+import { ImageBatchRuntime } from './ImageBatchRuntime'
 import { useEffect, useState, type FormEvent } from 'react'
 import { api, setIdentity } from './api'
 
@@ -118,6 +119,7 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
           {selected.can_share_compute && <p>Share this link with people you trust to see the inputs for jobs they receive. Manage project links under Active invites on the cluster dashboard.</p>}
           {appRoute && <a href="/">Open cluster dashboard and node controls</a>}
         </div>}
+        <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
         <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role}/>
         {selected.role === 'owner' && <details><summary>Manage application access</summary><form className="application-form" onSubmit={event => { event.preventDefault(); void run(async () => { setSelected(await api<Application>(`/api/applications/${selected.id}/members`, { method: 'POST', body: JSON.stringify({ username: member, role }) })); setMember(''); await refresh() }) }}><label>Member username<input required value={member} onChange={event => setMember(event.target.value)}/></label><label>Application role<select value={role} onChange={event => setRole(event.target.value as 'viewer' | 'operator')}><option value="viewer">Viewer</option><option value="operator">Operator</option></select></label><button className="manage-button" disabled={busy}>Grant application access</button></form>
           {selected.members.filter(m => m.role !== 'owner').map(m => <button key={m.username} className="manage-button small" disabled={busy} onClick={() => void run(async () => { await api(`/api/applications/${selected.id}/members/${encodeURIComponent(m.username)}`, { method: 'DELETE' }); setSelected(await api<Application>(`/api/applications/${selected.id}`)); await refresh() })}>Revoke {m.username}</button>)}

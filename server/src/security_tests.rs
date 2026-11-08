@@ -22,6 +22,7 @@ fn test_state() -> AppState {
         github_file_sha: Arc::new(Mutex::new(None)),
         node_connections: Arc::new(Mutex::new(HashMap::new())),
         durability: Arc::new(Mutex::new(runtime)),
+        image_batches: Arc::new(crate::image_batches::Runtime::default()),
     }
 }
 async fn call(
