@@ -48,6 +48,57 @@ async function extraContributor(browser: Browser, clusterId: string, inference: 
   return { context, page, nodeId: node.node.id }
 }
 
+test('an image batch uses invited browsers and recovers a disconnected MobileNet worker', async ({ browser }) => {
+  test.setTimeout(180_000)
+  const f = await fixture(browser)
+  const guests = [await browser.newContext(), await browser.newContext()]
+  const pages = await Promise.all(guests.map(context => context.newPage()))
+  try {
+    await f.page.getByText('Image classification (ML)', { exact: true }).click()
+    await f.page.getByRole('button', { name: 'Share ML contributor link' }).click()
+    const link = f.page.getByLabel('ML contributor link', { exact: true })
+    await expect(link).toBeVisible()
+    const url = await link.inputValue()
+    for (const page of pages) {
+      await page.goto(url)
+      await expect(page.getByRole('heading', { name: 'Contribute to Browser runtime' })).toBeVisible()
+      await page.getByRole('button', { name: 'Start ML worker' }).click()
+      await expect(page.getByText('Waiting for images', { exact: false })).toBeVisible()
+      expect(await page.evaluate(() => [localStorage.getItem('mesh.identity'), sessionStorage.getItem('mesh.node-tokens')])).toEqual([null, null])
+    }
+    await f.page.getByRole('button', { name: 'Try 32-image batch' }).click()
+    await expect(f.page.getByTestId('image-batch-progress')).toContainText('32/32 classified', { timeout: 140_000 })
+    await expect(f.page.getByTestId('image-batch-progress')).toContainText('2 contributing browsers')
+    const [run] = await api<Array<{ id: string }>>(`/api/applications/${f.app.id}/image-batches`)
+    const data = await api<{ results: Array<{ index: number; predictions: Array<{ class_id: number }> }> }>(`/api/applications/${f.app.id}/image-batches/${run.id}?results=true`)
+    expect(data.results.map(row => row.index)).toEqual(Array.from({ length: 32 }, (_, index) => index))
+    expect(data.results.every(row => row.predictions[0].class_id === 292)).toBe(true)
+
+    for (const page of pages) {
+      await page.getByRole('button', { name: 'Stop ML worker' }).click()
+      await expect(page.getByRole('button', { name: 'Start ML worker' })).toBeVisible()
+    }
+    const [leaving, remaining] = pages
+    // Drop the request before the coordinator sees it, then close the browser
+    // while its lease is still active. The worker cannot send a release.
+    await leaving.route('**/image-work/*/commit', route => route.abort())
+    await leaving.getByRole('button', { name: 'Start ML worker' }).click()
+    const committing = leaving.waitForRequest('**/image-work/*/commit', { timeout: 45_000 })
+    await f.page.getByRole('button', { name: 'Try sample image' }).click()
+    await committing
+    await guests[0].close()
+    await remaining.getByRole('button', { name: 'Start ML worker' }).click()
+    await expect(f.page.getByTestId('image-batch-progress')).toContainText('1/1 classified', { timeout: 65_000 })
+    const [recovered] = await api<Array<{ id: string }>>(`/api/applications/${f.app.id}/image-batches`)
+    const retry = await api<{ results: Array<{ attempts: number; predictions: Array<{ class_id: number }> }> }>(`/api/applications/${f.app.id}/image-batches/${recovered.id}?results=true`)
+    expect(retry.results[0].attempts).toBe(2)
+    expect(retry.results[0].predictions[0].class_id).toBe(292)
+  } finally {
+    await Promise.all(guests.map(guest => guest.close()))
+    await f.close()
+  }
+})
+
 test('a guest joins from one link and passes the quick test without an account', async ({ browser }) => {
   const f = await fixture(browser)
   const guest = await browser.newContext()

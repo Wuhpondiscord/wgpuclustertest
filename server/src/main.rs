@@ -30,6 +30,7 @@ use mesh_coordinator::recovery;
 mod application_jobs;
 mod custody;
 mod delivery;
+mod image_batches;
 mod operator_recovery;
 mod repair;
 mod security;
@@ -71,6 +72,8 @@ struct Invite {
     expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     application_id: Option<Uuid>,
+    #[serde(default)]
+    ml_only: bool,
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     contributors: std::collections::HashSet<String>,
 }
@@ -227,6 +230,7 @@ struct GitHubStorage {
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
+    image_batches: Arc<image_batches::Runtime>,
     // Serializes durable state changes while GitHub/file persistence runs off the async runtime.
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
     data_file: Arc<PathBuf>,
@@ -379,6 +383,7 @@ struct InviteSummary {
     token: String,
     expires_at: u64,
     project_name: Option<String>,
+    ml_only: bool,
 }
 #[derive(Serialize)]
 struct InviteCreated {
@@ -1685,6 +1690,7 @@ async fn create_invite(
                 cluster_id: id,
                 expires_at,
                 application_id: None,
+                ml_only: false,
                 contributors: Default::default(),
             },
         );
@@ -1696,6 +1702,7 @@ async fn create_invite(
 async fn create_contributor_invite(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    axum::extract::Query(options): axum::extract::Query<image_batches::InviteOptions>,
     headers: HeaderMap,
 ) -> ApiResult<(StatusCode, Json<InviteCreated>)> {
     let user = identity(&headers)?;
@@ -1732,6 +1739,7 @@ async fn create_contributor_invite(
                 cluster_id: app.cluster_id,
                 expires_at,
                 application_id: Some(id),
+                ml_only: options.ml_only,
                 contributors: Default::default(),
             },
         );
@@ -1763,6 +1771,7 @@ async fn list_invites(
         .map(|(token, invite)| InviteSummary {
             token: token.clone(),
             expires_at: invite.expires_at,
+            ml_only: invite.ml_only,
             project_name: invite
                 .application_id
                 .and_then(|app| store.applications.get(&app))
@@ -1811,7 +1820,7 @@ async fn preview_invite(
     let invite = store
         .invites
         .get(&secret_hash(&token))
-        .filter(|i| i.expires_at > now())
+        .filter(|i| !i.ml_only && i.expires_at > now())
         .ok_or(ApiError(
             StatusCode::NOT_FOUND,
             "Invite is invalid or expired".into(),
@@ -1849,7 +1858,7 @@ async fn join_invite(
         let invite = store
             .invites
             .get_mut(&invite_key)
-            .filter(|i| i.expires_at > now())
+            .filter(|i| !i.ml_only && i.expires_at > now())
             .ok_or(ApiError(
                 StatusCode::NOT_FOUND,
                 "Invite is invalid or expired".into(),
@@ -2864,6 +2873,7 @@ fn app(state: AppState) -> Router {
         .route("/api/nodes/connect", get(node_socket))
         .route("/api/operator/key-backup", get(operator_recovery::download))
         .merge(application_jobs::routes())
+        .merge(image_batches::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -2951,6 +2961,7 @@ async fn main() {
         github_file_sha: Arc::new(Mutex::new(github_sha)),
         node_connections: Arc::new(Mutex::new(HashMap::new())),
         durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+        image_batches: Arc::new(image_batches::Runtime::default()),
     };
     let recipient = std::env::var("MESH_KEY_RECOVERY_RECIPIENT").ok();
     state.key_backup = operator_recovery::prepare(&state, recipient.as_deref())
@@ -2972,6 +2983,9 @@ async fn main() {
         loop {
             ticks.tick().await;
             repair::dispatch(&repair_state);
+            if let Ok(store) = repair_state.store.lock() {
+                repair_state.image_batches.sweep(&store);
+            }
         }
     });
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -3236,6 +3250,7 @@ mod tests {
                 github_file_sha: Arc::new(Mutex::new(None)),
                 node_connections: Arc::new(Mutex::new(HashMap::new())),
                 durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+                image_batches: Arc::new(image_batches::Runtime::default()),
             }
         }
     }
@@ -3555,6 +3570,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let owner = test_headers("owner-identity-token-01234567890123456789");
         let guest = test_headers("guest-identity-token-01234567890123456789");
@@ -3637,6 +3653,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let owner = test_headers("delete-owner-identity-token-012345678901234567");
         let (_, Json(cluster)) = create_cluster(
@@ -3705,6 +3722,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
 
         assert!(
@@ -3736,6 +3754,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
 
         let result = mutate_store(&state, |store| {
@@ -3772,6 +3791,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let first_id = Uuid::new_v4();
         let second_id = Uuid::new_v4();
@@ -3851,6 +3871,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let old_session = Uuid::new_v4();
         let new_session = Uuid::new_v4();
@@ -3965,6 +3986,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let sender_session = Uuid::new_v4();
         let same_session = Uuid::new_v4();
@@ -4080,6 +4102,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let (current_tx, mut current_rx) = tokio::sync::mpsc::channel(8);
         let (active_tx, mut active_rx) = tokio::sync::mpsc::channel(8);
@@ -4132,6 +4155,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let owner_token = "job-owner-identity-token-012345678901234567890";
         let owner_headers = test_headers(owner_token);
@@ -4343,6 +4367,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let owner = test_headers("shard-owner-identity-token-01234567890123456789");
         let (_, Json(cluster)) = create_cluster(
@@ -4547,6 +4572,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(HashMap::new())),
             durability: Arc::new(Mutex::new(DurabilityRuntime::default())),
+            image_batches: Arc::new(image_batches::Runtime::default()),
         };
         let owner = test_headers("runtime-owner-identity-01234567890123456789012345");
         let (_, Json(cluster)) = create_cluster(

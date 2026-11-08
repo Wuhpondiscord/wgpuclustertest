@@ -403,6 +403,161 @@ impl Fixture {
 fn numeric() -> Value {
     json!({"operation":"vector_add","a":[1.,2.,3.],"b":[4.,5.,6.]})
 }
+
+#[tokio::test]
+async fn ml_link_is_work_only_and_image_results_do_not_write_the_state_file() {
+    let f = Fixture::new().await;
+    let app = format!("/api/applications/{}", f.app);
+    let (status, link) = call(
+        &f.router,
+        "POST",
+        &format!("{app}/contributor-invites?ml_only=true"),
+        &f.session,
+        Value::Null,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = link["token"].as_str().unwrap();
+    let guest_id = Uuid::new_v4();
+    let browser_key = Uuid::new_v4();
+    let guest_call = |method: &'static str, path: String, data: Value, browser: Uuid| {
+        let router = f.router.clone();
+        async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("x-mesh-ml-invite", token)
+                        .header("x-mesh-ml-browser", browser.to_string())
+                        .body(Body::from(data.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    assert_eq!(
+        guest_call("GET", "/api/ml-invite".into(), Value::Null, browser_key)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        guest_call(
+            "GET",
+            format!("{app}/image-batches"),
+            Value::Null,
+            browser_key
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            "/api/invites/join",
+            &"b".repeat(64),
+            json!({"token":token}),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let snapshot = std::fs::read(f.state.data_file.as_ref()).unwrap();
+    let image = "A".repeat(96 * 96 * 4);
+    let (status, run) = call(
+        &f.router,
+        "POST",
+        &format!("{app}/image-batches"),
+        &f.session,
+        json!({"images":[image, image]}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let work = format!("{app}/image-work");
+    let claim = || {
+        guest_call(
+            "POST",
+            format!("{work}/claim"),
+            json!({"worker_id":guest_id}),
+            browser_key,
+        )
+    };
+    let (status, first) = claim().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["run_id"], run["id"]);
+    assert_eq!(first["index"], 0);
+    let id = run["id"].as_str().unwrap();
+    let commit_path = format!("{work}/{id}/commit");
+    let result = json!({"worker_id":guest_id,"lease":first["lease"],"index":first["index"],
+        "predictions":[{"class_id":292,"score":0.6},{"class_id":282,"score":0.2},{"class_id":1,"score":0.1}],
+        "backend":"wasm","load_ms":0,"compute_ms":1});
+    assert_eq!(
+        guest_call("POST", commit_path.clone(), result.clone(), Uuid::new_v4())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            guest_call("POST", commit_path.clone(), result.clone(), browser_key)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let (status, output) = call(
+        &f.router,
+        "GET",
+        &format!("{app}/image-batches/{id}?results=true"),
+        &f.session,
+        Value::Null,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(output["completed"], 1);
+    assert_eq!(output["results"][0]["worker_id"], guest_id.to_string());
+    assert_eq!(snapshot, std::fs::read(f.state.data_file.as_ref()).unwrap());
+    let (status, second) = claim().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["index"], 1);
+    let revoke = format!(
+        "/api/clusters/{}/invites/{}",
+        f.cluster,
+        crate::secret_hash(token)
+    );
+    assert_eq!(
+        call(&f.router, "DELETE", &revoke, &f.session, Value::Null, None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        guest_call(
+            "POST",
+            format!("{work}/{id}/renew"),
+            json!({"worker_id":guest_id,"index":1,"lease":second["lease"]}),
+            browser_key
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+}
 fn embedding() -> Value {
     json!({"operation":"embedding","model":"minilm-l6-v2","texts":["hello"]})
 }

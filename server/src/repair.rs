@@ -458,6 +458,7 @@ mod tests {
             github_file_sha: Arc::new(Mutex::new(None)),
             node_connections: Arc::new(Mutex::new(connections)),
             durability: Arc::new(Mutex::new(runtime)),
+            image_batches: Arc::new(crate::image_batches::Runtime::default()),
         };
         (state, job_id, shards, receivers)
     }
