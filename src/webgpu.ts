@@ -7,6 +7,7 @@ const MAP_READ = 0x0001
 const STORAGE = 0x0080
 const COPY_SRC = 0x0004
 const COPY_DST = 0x0008
+const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1
 
 const VECTOR_ADD_SHADER = `
 @group(0) @binding(0) var<storage, read> left: array<f32>;
@@ -43,17 +44,23 @@ export function runVectorAddCpu(start: number, end: number) {
 
 /** Portable f32 checkpoint representation, bounded to 2.67 MB at 500k values. */
 export function encodeVectorAddOutput(values: Float32Array) {
-  const bytes = new Uint8Array(values.length * 4)
-  const view = new DataView(bytes.buffer)
-  for (let i = 0; i < values.length; i++) view.setFloat32(i * 4, values[i], true)
+  let bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength)
+  if (!LITTLE_ENDIAN) {
+    bytes = new Uint8Array(values.byteLength)
+    const view = new DataView(bytes.buffer)
+    for (let i = 0; i < values.length; i++) view.setFloat32(i * 4, values[i], true)
+  }
+  const encoder = bytes as Uint8Array & { toBase64?: () => string }
+  if (typeof encoder.toBase64 === 'function') {
+    return { encoding: 'f32-le-base64', elements: values.length, data: encoder.toBase64() }
+  }
   let binary = ''
   for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
   return { encoding: 'f32-le-base64', elements: values.length, data: btoa(binary) }
 }
 
 export async function digestVectorAddResult(values: Float32Array) {
-  const bytes = values.slice().buffer
-  const result = await crypto.subtle.digest('SHA-256', bytes)
+  const result = await crypto.subtle.digest('SHA-256', values)
   return Array.from(new Uint8Array(result), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
@@ -73,11 +80,49 @@ export async function createVectorAddExecutor() {
     pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } })
   } catch (error) { device.destroy(); throw error }
 
+  type Buffers = { capacity: number; left: GPUBuffer; right: GPUBuffer; output: GPUBuffer; readback: GPUBuffer }
+  let buffers: Buffers | undefined
+  let binding: { bytes: number; group: GPUBindGroup } | undefined
+  let running = false
   let validationMs = 0
+  let readbackMs = 0
+  let reusedBuffers = false
+
+  function releaseBuffers() {
+    if (!buffers) return
+    const { left, right, output, readback } = buffers
+    buffers = undefined
+    binding = undefined
+    for (const buffer of [left, right, output, readback]) buffer.destroy()
+  }
+
+  function allocate(bytes: number): Buffers {
+    const allocated: GPUBuffer[] = []
+    const create = (usage: GPUBufferUsageFlags) => {
+      const buffer = device.createBuffer({ size: bytes, usage })
+      allocated.push(buffer)
+      return buffer
+    }
+    try {
+      return {
+        capacity: bytes,
+        left: create(STORAGE | COPY_DST), right: create(STORAGE | COPY_DST),
+        output: create(STORAGE | COPY_SRC), readback: create(MAP_READ | COPY_DST),
+      }
+    } catch (error) {
+      for (const buffer of allocated) buffer.destroy()
+      throw error
+    }
+  }
+
   return {
     get validationMs() { return validationMs },
-    async run(start: number, end: number) {
+    get readbackMs() { return readbackMs },
+    get reusedBuffers() { return reusedBuffers },
+    async run(start: number, end: number, signal?: AbortSignal) {
       if (disposed || lost) throw new Error('WebGPU device was lost. Reconnect this node and retry the job.')
+      if (running) throw new Error('A WebGPU vector batch is already in progress.')
+      signal?.throwIfAborted()
       const count = end - start
       if (!Number.isSafeInteger(count) || count <= 0 || count > 500_000) throw new Error('WebGPU batch exceeds the safe 500,000-element limit.')
       const byteLength = count * Float32Array.BYTES_PER_ELEMENT
@@ -85,35 +130,55 @@ export async function createVectorAddExecutor() {
         throw new Error('This GPU cannot fit one batch within its storage-buffer limits.')
       }
 
-      const { left, right } = vectorInputs(start, end)
-
-      const usage = STORAGE | COPY_DST
-      const leftBuffer = device.createBuffer({ size: byteLength, usage })
-      const rightBuffer = device.createBuffer({ size: byteLength, usage })
-      const outputBuffer = device.createBuffer({ size: byteLength, usage: STORAGE | COPY_SRC })
-      const readbackBuffer = device.createBuffer({ size: byteLength, usage: MAP_READ | COPY_DST })
+      running = true
       try {
+        reusedBuffers = buffers !== undefined && buffers.capacity >= byteLength
+        if (!buffers || buffers.capacity < byteLength) {
+          releaseBuffers()
+          buffers = allocate(byteLength)
+        }
+        const { left: leftBuffer, right: rightBuffer, output, readback } = buffers
+        const { left, right } = vectorInputs(start, end)
         device.queue.writeBuffer(leftBuffer, 0, left)
         device.queue.writeBuffer(rightBuffer, 0, right)
-        const bindGroup = device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: leftBuffer } },
-            { binding: 1, resource: { buffer: rightBuffer } },
-            { binding: 2, resource: { buffer: outputBuffer } },
-          ],
-        })
+        // Bind only the logical range when a short final batch reuses larger buffers.
+        if (binding?.bytes !== byteLength) {
+          binding = { bytes: byteLength, group: device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [leftBuffer, rightBuffer, output].map((buffer, index) => ({
+              binding: index, resource: { buffer, size: byteLength },
+            })),
+          }) }
+        }
         const encoder = device.createCommandEncoder()
         const pass = encoder.beginComputePass()
         pass.setPipeline(pipeline)
-        pass.setBindGroup(0, bindGroup)
+        pass.setBindGroup(0, binding.group)
         pass.dispatchWorkgroups(Math.ceil(count / 64))
         pass.end()
-        encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, byteLength)
+        encoder.copyBufferToBuffer(output, 0, readback, 0, byteLength)
         device.queue.submit([encoder.finish()])
-        await readbackBuffer.mapAsync(MAP_READ)
-        const result = new Float32Array(readbackBuffer.getMappedRange().slice(0))
-        readbackBuffer.unmap()
+
+        const readbackStarted = performance.now()
+        const timeout = AbortSignal.timeout(15_000)
+        const readSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
+        let cancel = () => {}
+        const cancelled = new Promise<never>((_, reject) => {
+          cancel = () => reject(readSignal.reason)
+          if (readSignal.aborted) cancel()
+          else readSignal.addEventListener('abort', cancel, { once: true })
+        })
+        let result: Float32Array
+        try {
+          await Promise.race([readback.mapAsync(MAP_READ, 0, byteLength), cancelled])
+          readSignal.throwIfAborted()
+          // The copy owns its bytes after unmap invalidates the mapped range.
+          result = new Float32Array(readback.getMappedRange(0, byteLength).slice(0))
+          readback.unmap()
+          readbackMs = performance.now() - readbackStarted
+        } finally {
+          readSignal.removeEventListener('abort', cancel)
+        }
 
         const validationStarted = performance.now()
         for (let i = 0; i < count; i++) {
@@ -122,15 +187,20 @@ export async function createVectorAddExecutor() {
         }
         validationMs = performance.now() - validationStarted
         return result
+      } catch (error) {
+        // Destroy a failed or pending map before these buffers can be used again.
+        releaseBuffers()
+        throw error
       } finally {
-        leftBuffer.destroy()
-        rightBuffer.destroy()
-        outputBuffer.destroy()
-        readbackBuffer.destroy()
+        running = false
       }
     },
     close() {
-      if (!disposed) { disposed = true; device.destroy() }
+      if (!disposed) {
+        disposed = true
+        releaseBuffers()
+        device.destroy()
+      }
     },
   }
 }
