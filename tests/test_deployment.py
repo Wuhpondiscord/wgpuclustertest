@@ -18,7 +18,10 @@ SCRIPT = textwrap.dedent(
 
 
 class DeploymentTests(unittest.TestCase):
-    def run_deployment(self, existing, ready=True, recipient=None, current_recipient=None, export_matches=True):
+    def run_deployment(
+        self, existing, ready=True, recipient=None, current_recipient=None, export_matches=True,
+        stalled=False, restart_recovers=True, source_matches=True, hardware="cpu-basic",
+    ):
         events, configured = [], set(existing)
         clock = [0]
 
@@ -52,10 +55,20 @@ class DeploymentTests(unittest.TestCase):
                 return types.SimpleNamespace(oid="uploaded-revision")
 
             def get_space_runtime(self, **_):
-                return types.SimpleNamespace(stage="RUNNING", raw={
+                stage = "RUNNING_APP_STARTING" if stalled and not ready else "RUNNING"
+                return types.SimpleNamespace(stage=stage, raw={
                     "domains": [{"domain": "test-space.hf.space"}],
                     "sha": "uploaded-revision" if ready else "previous-revision",
+                    "hardware": {"requested": hardware},
                 })
+
+            def space_info(self, **_):
+                return types.SimpleNamespace(sha="uploaded-revision" if source_matches else "newer-revision")
+
+            def restart_space(self, **_):
+                nonlocal ready
+                events.append(("restart",))
+                ready = restart_recovers
 
         class FakeResponse:
             headers = {"x-mesh-state-format": "mesh-state-aes256gcm-v1",
@@ -114,6 +127,32 @@ class DeploymentTests(unittest.TestCase):
         events, failure = self.run_deployment({"MESH_AUTH_ENCRYPTION_KEY"}, ready=False)
         self.assertIsInstance(failure, SystemExit)
         self.assertFalse(any(e[0] == "delete" for e in events))
+
+    def test_stalled_free_space_restarts_once_and_checks_the_new_revision(self):
+        events, failure = self.run_deployment(
+            {"MESH_AUTH_ENCRYPTION_KEY", "MESH_STATE_ENCRYPTION_KEY"}, ready=False, stalled=True,
+        )
+        self.assertIsNone(failure)
+        self.assertEqual(events, [("upload",), ("restart",), ("health",)])
+
+    def test_restart_is_bounded_when_space_remains_stalled(self):
+        events, failure = self.run_deployment(
+            {"MESH_AUTH_ENCRYPTION_KEY", "MESH_STATE_ENCRYPTION_KEY"},
+            ready=False, stalled=True, restart_recovers=False,
+        )
+        self.assertIsInstance(failure, SystemExit)
+        self.assertIn("active revision previous-revision", str(failure))
+        self.assertEqual(events, [("upload",), ("restart",)])
+
+    def test_stalled_space_with_newer_source_or_paid_hardware_is_left_alone(self):
+        for options in ({"source_matches": False}, {"hardware": "cpu-upgrade"}):
+            with self.subTest(options=options):
+                events, failure = self.run_deployment(
+                    {"MESH_AUTH_ENCRYPTION_KEY", "MESH_STATE_ENCRYPTION_KEY"},
+                    ready=False, stalled=True, **options,
+                )
+                self.assertIsInstance(failure, SystemExit)
+                self.assertEqual(events, [("upload",)])
 
     def test_retry_can_close_existing_import_without_replacing_keys(self):
         events, failure = self.run_deployment({"MESH_AUTH_ENCRYPTION_KEY", "MESH_STATE_ENCRYPTION_KEY",
