@@ -2,7 +2,7 @@
 import { fetchImageModel, imageSize, modelRepository, modelRevision } from './image-model'
 
 type Start = { app: string; worker: string; identity?: string; invite?: string; browserKey: string }
-type Work = { run_id: string; index: number; lease: string; image_rgb96: string }
+type Work = { run_id: string; index: number; lease: string; image_rgb96: string; features?: boolean }
 type Claim = Work | { ready: true } | null
 type Backend = 'webgpu' | 'wasm'
 const scope = globalThis as unknown as {
@@ -57,7 +57,7 @@ async function load(backend: Backend) {
   return { processor, model, RawImage, backend }
 }
 
-async function classify(runtime: Awaited<ReturnType<typeof load>>, input: string) {
+async function classify(runtime: Awaited<ReturnType<typeof load>>, input: string, features = false) {
   if (input.length !== imageSize * imageSize * 4) throw new Error('Invalid bounded image payload')
   const rgb = Uint8Array.from(atob(input), char => char.charCodeAt(0))
   const image = new runtime.RawImage(rgb, imageSize, imageSize, 3)
@@ -69,8 +69,9 @@ async function classify(runtime: Awaited<ReturnType<typeof load>>, input: string
     const max = Math.max(...logits)
     const probabilities = logits.map(value => Math.exp(value - max))
     const sum = probabilities.reduce((total, value) => total + value, 0)
-    return probabilities.map((score, class_id) => ({ class_id, score: score / sum }))
+    const predictions = probabilities.map((score, class_id) => ({ class_id, score: score / sum }))
       .sort((left, right) => right.score - left.score).slice(0, 3)
+    return { predictions, ...(features ? { features: logits } : {}) }
   } finally {
     output.logits.dispose()
     inputs.pixel_values.dispose()
@@ -101,7 +102,7 @@ async function run(config: Start, signal: AbortSignal) {
     report(`Waiting for images · ${completed} completed`)
     let work: Claim
     try {
-      work = await post<Claim>('/claim', { worker_id: config.worker, warm: Boolean(runtime) }, AbortSignal.any([signal, AbortSignal.timeout(20_000)]))
+      work = await post<Claim>('/claim', { worker_id: config.worker, warm: Boolean(runtime), features: true }, AbortSignal.any([signal, AbortSignal.timeout(20_000)]))
       claimErrors = 0
     } catch (error) {
       signal.throwIfAborted()
@@ -153,15 +154,15 @@ async function run(config: Start, signal: AbortSignal) {
       const computeStarted = performance.now()
       const initialLoad = load_ms
       let predictions
-      try { predictions = await untilAborted(classify(runtime, work.image_rgb96), taskSignal) }
+      try { predictions = await untilAborted(classify(runtime, work.image_rgb96, work.features), taskSignal) }
       catch (error) {
         taskSignal.throwIfAborted()
         if (runtime.backend !== 'webgpu') throw error
         await untilAborted(runtime.model.dispose(), taskSignal)
         runtime = await loadRuntime('wasm')
-        predictions = await untilAborted(classify(runtime, work.image_rgb96), taskSignal)
+        predictions = await untilAborted(classify(runtime, work.image_rgb96, work.features), taskSignal)
       }
-      const result = { ...attempt, predictions, backend: runtime.backend, load_ms,
+      const result = { ...attempt, ...predictions, backend: runtime.backend, load_ms,
         compute_ms: Math.max(0, performance.now() - computeStarted - (load_ms - initialLoad)) }
       for (let retry = 0; ; retry++) {
         try {

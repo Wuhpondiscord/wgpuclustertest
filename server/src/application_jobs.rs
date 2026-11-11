@@ -298,6 +298,9 @@ fn summary(job: &Job, store: &Store) -> Summary {
     }
 }
 pub fn prune(store: &mut Store) {
+    store
+        .vision_models
+        .retain(|app, _| store.applications.contains_key(app));
     store.invites.retain(|_, invite| {
         invite
             .application_id

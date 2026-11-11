@@ -956,6 +956,45 @@ pub async fn create_app(
     .await?;
     Ok(Json(result))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameApplication {
+    name: String,
+    expected_name: String,
+}
+pub async fn rename_app(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<RenameApplication>,
+) -> ApiResult<Json<AppSummary>> {
+    let user = identity(&headers)?;
+    let name = crate::cluster_name(&input.name).ok_or_else(hidden)?;
+    let summary = mutate_store(&state, |store| {
+        application_access(store, id, &user, true)?;
+        let app = store.applications.get_mut(&id).ok_or_else(hidden)?;
+        if app.owner_id != user {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "Only the owner can rename an application".into(),
+            ));
+        }
+        if app.name != input.expected_name {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "Application name changed. Reload before renaming".into(),
+            ));
+        }
+        app.name = name.clone();
+        app_summary(
+            store.applications.get(&id).ok_or_else(hidden)?,
+            store,
+            &user,
+        )
+    })
+    .await?;
+    Ok(Json(summary))
+}
 pub async fn get_app(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

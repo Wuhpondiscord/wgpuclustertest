@@ -35,6 +35,7 @@ mod operator_recovery;
 mod repair;
 mod security;
 mod snapshot;
+mod vision_models;
 
 const IDENTITY_HEADER: &str = "x-mesh-identity";
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -102,6 +103,8 @@ struct Store {
     application_deployments: HashMap<Uuid, application_jobs::Deployment>,
     #[serde(default)]
     applications: HashMap<Uuid, security::Application>,
+    #[serde(default)]
+    vision_models: HashMap<Uuid, vision_models::Deployment>,
     #[serde(default)]
     revoked_credentials: std::collections::HashSet<String>,
     clusters: HashMap<Uuid, Cluster>,
@@ -2837,7 +2840,9 @@ fn app(state: AppState) -> Router {
         )
         .route(
             "/api/applications/:id",
-            get(security::get_app).delete(security::delete_app),
+            get(security::get_app)
+                .patch(security::rename_app)
+                .delete(security::delete_app),
         )
         .route("/api/applications/:id/members", post(security::grant))
         .route(
@@ -2884,6 +2889,7 @@ fn app(state: AppState) -> Router {
         .route("/api/operator/key-backup", get(operator_recovery::download))
         .merge(application_jobs::routes())
         .merge(image_batches::routes())
+        .merge(vision_models::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

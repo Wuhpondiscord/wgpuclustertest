@@ -6,6 +6,7 @@ import { executeRepair, type RepairTask } from './repair'
 import { api, getIdentity, isRevokedAccess } from './api'
 import { ComputeRunner, type RunnerState } from './compute-runner'
 import { ContributorControls } from './ContributorControls'
+import { WorkspaceNav, type Workspace } from './WorkspaceNav'
 import { AccountApplications } from './AccountApplications'
 import { allContributionSettings, forgetNode, getNodeTokens, isRemembered, rememberNode, saveContributionSettings, setNodeToken, subscribeContributionSettings, type ContributionSettings } from './contribution-settings'
 import type { ClusterNode as Node, ComputeCheckpoint, ComputeJob } from './compute-types'
@@ -41,6 +42,12 @@ function checkpointDiagnostics(checkpoint: ComputeCheckpoint) {
 }
 
 function App() {
+  const [workspace, setWorkspace] = useState<Workspace>(location.hash === '#applications' ? 'applications' : 'clusters')
+  useEffect(() => {
+    const update = () => setWorkspace(location.hash === '#applications' ? 'applications' : 'clusters')
+    window.addEventListener('hashchange', update)
+    return () => window.removeEventListener('hashchange', update)
+  }, [])
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [activeId, setActiveId] = useState('')
   const [nodes, setNodes] = useState<Node[]>([])
@@ -625,14 +632,14 @@ function App() {
       <button className="manage-button" type="button" onClick={() => setShareLink('')}>Close link</button>
     </div>
   </section>
-  if (accountPath) return <div className="manage-app"><header className="manage-top"><a className="manage-brand" href="/">mesh.</a></header><main className="manage-main">
+  if (accountPath) return <div className="manage-app"><header className="manage-top"><a className="manage-brand" href="/">mesh.</a><WorkspaceNav current="applications"/></header><main className="manage-main">
     {sharedInvite}
     {error && <p role="alert" className="feedback error">{error}</p>}
     {notice && <p role="status" className="feedback success">{notice}</p>}
     <AccountApplications {...accountActions}/>
   </main></div>
   return <div className="manage-app">
-    <header className="manage-top"><a className="manage-brand" href="/"><span className="brand-glyph"><Boxes size={18}/></span>mesh<span className="brand-period">.</span></a><div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button></header>
+    <header className="manage-top"><a className="manage-brand" href="/"><span className="brand-glyph"><Boxes size={18}/></span>mesh<span className="brand-period">.</span></a><WorkspaceNav current={workspace} onChange={setWorkspace}/><div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button></header>
     <main className="manage-main">
       {invite && <section className="resource-card join-card" aria-label="Cluster invitation">
         <h2>Invitation to {invite.cluster_name}</h2>
@@ -645,7 +652,9 @@ function App() {
         </div>
       </section>}
       {sharedInvite}
-      <AccountApplications clusterId={active?.id} {...accountActions}/>
+      <div hidden={workspace !== 'applications'} className="workspace-intro"><div className="overline">APPLICATION STUDIO</div><h1>Build on your cluster</h1><p>Develop workflows, train vision models, and manage what your contributors run.</p><label>Compute cluster<select value={active?.id ?? ''} onChange={event => void run(() => refreshClusters(event.target.value))}>{clusters.map(cluster => <option key={cluster.id} value={cluster.id}>{cluster.name}</option>)}</select></label>{!clusters.length && <p>Create or join a cluster in <a href="/#clusters">Clusters</a> to get started.</p>}</div>
+      <AccountApplications clusterId={active?.id} workspace={workspace} {...accountActions}/>
+      <div hidden={workspace !== 'clusters'}>
       <div className="manage-heading"><div><div className="overline">COMPUTE NETWORK</div><h1>Clusters</h1><p>Manage cluster membership, invitations, and connected nodes.</p></div><div className="heading-buttons"><button className="manage-button" onClick={openInviteDialog}><Link2 size={15}/>Join by invite</button><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>New cluster</button></div></div>
       {error && <div className="feedback error">{error}</div>}{notice && <div className="feedback success"><Check size={14}/>{notice}</div>}
       {busy ? <div className="empty-state">Connecting to coordinator…</div> : <div className="manage-layout">
@@ -664,7 +673,7 @@ function App() {
           <div className="coordinator-note"><Activity size={16}/><div><b>Coordinator manages leases and manifests; artifact bytes move peer to peer.</b><span>Large batches are split into two data shards plus XOR parity and written to three distinct nodes. Any two verified shards can reconstruct a checkpoint; use “Test restore” to request shards, reconstruct the latest checkpoint, and verify its full-artifact digest. This prototype does not yet attest to trusted computation or issue rewards.</span></div></div>
         </>}</section>
       </div>}
-      <footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
+      </div><footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
     </main>
     {nodeCredentials && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setNodeCredentials(null)}}><section className="credentials-dialog"><button className="dialog-close" onClick={()=>setNodeCredentials(null)} aria-label="Close"><X size={17}/></button><div className="dialog-icon"><Cpu size={19}/></div><div className="overline">NODE REGISTERED</div><h2>{nodeCredentials.name}</h2><p>This tab connects the browser node to the coordinator and its cluster peers. Keep it open while the node is online.</p><div className="credential-value">{nodeCredentials.key}</div><button className="manage-button primary full-width" onClick={()=>void copy(nodeCredentials.key)}><Copy size={15}/>Copy node connection key</button><div className="credential-hint">Save this server-generated key securely. It is a bearer credential for this node. Use Contribute compute on this node to opt into cluster jobs. Remember this device is optional.</div></section></div>}
     {dialog && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setDialog(null)}}><form className="credentials-dialog app-dialog" role="dialog" aria-modal="true" aria-labelledby="app-dialog-title" onSubmit={submitDialog}><button type="button" className="dialog-close" onClick={()=>setDialog(null)} aria-label="Close dialog"><X size={17}/></button><div className="dialog-icon">{dialog.kind==='input'?<Settings size={19}/>:<Shield size={19}/>}</div><div className="overline">{dialog.kind==='input'?'CLUSTER MANAGEMENT':'CONFIRM ACTION'}</div><h2 id="app-dialog-title">{dialog.title}</h2><p>{dialog.description}</p>{(dialog.kind==='input'||dialog.requiredValue)&&<><label className="field-label" htmlFor="app-dialog-value">{dialog.kind==='input'?dialog.label:'Type DELETE to confirm'}</label><input id="app-dialog-value" className="text-input" autoFocus value={dialogValue} onChange={e=>setDialogValue(e.target.value)} placeholder={dialog.kind==='input'?dialog.placeholder:dialog.requiredValue} data-testid="app-dialog-input" /></>}{dialog.kind==='confirm'&&<div className="credential-hint">Review this action before continuing.</div>}<div className="heading-buttons dialog-actions"><button type="button" className="manage-button" onClick={()=>setDialog(null)}>Cancel</button><button type="submit" className={`manage-button primary ${dialog.kind==='confirm'?'danger':''}`} disabled={dialog.kind==='input'?!dialogValue.trim():dialog.requiredValue!==undefined&&dialogValue!==dialog.requiredValue} data-testid="app-dialog-submit">{dialog.kind==='input'?dialog.submitLabel:dialog.confirmLabel}</button></div></form></div>}

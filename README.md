@@ -46,6 +46,10 @@ In another terminal, set `MESH_STATE_ENCRYPTION_KEY` to a private, OS-random 32-
 
 Private applications now support bounded vector-add, matrix multiply and real MiniLM text embeddings on browser workers, with an app-scoped JavaScript SDK and asynchronous inference API. Model downloads are opt-in. See [runtime quickstart, API, limits and trust model](docs/browser-runtime.md).
 
+## Application and vision studio
+
+Use **Clusters** to manage contributors and **Applications** to develop deployed workflows. The application studio includes revision-safe manifest editing and an experimental custom bounding-box detector workflow with browser annotation, distributed feature extraction, held-out evaluation, saved model deployment and prediction. See [vision studio guide and limitations](docs/vision-studio.md).
+
 ## Browser integration tests
 
 Install the Playwright Chromium runtime with `npx playwright install chromium`, then run `npm run test:e2e`. Playwright starts an isolated Rust coordinator and Vite server, creates three browser contexts with separate Mesh identities, and exchanges a real vector-add checkpoint over WebRTC. The recovery scenario pauses one shard node and verifies that the other two shards reconstruct the artifact and match its full SHA-256 digest. The test uses host ICE candidates between same-machine contexts and does not exercise NAT traversal, TURN, or cross-network behavior. GitHub Actions runs this test before allowing a main-branch deployment.
