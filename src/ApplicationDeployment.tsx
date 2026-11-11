@@ -80,6 +80,8 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
   const [active, setActive] = useState<Deployment | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [candidate, setCandidate] = useState<Candidate | null>(null)
+  const [editor, setEditor] = useState<string | null>(null)
+  const [editRevision, setEditRevision] = useState<string | null>(null)
   const [repo, setRepo] = useState('')
   const [ref, setRef] = useState('')
   const [busy, setBusy] = useState(false)
@@ -117,6 +119,7 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
 
   async function previewFile(file: File) {
     setCandidate(null)
+    setEditor(null)
     if (file.size > MANIFEST_LIMIT) throw new Error('Upload a mesh.json file up to 32 KiB')
     const manifest: unknown = JSON.parse(await file.text())
     setCandidate({ manifest, source: { kind: 'upload' } })
@@ -126,10 +129,11 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
     if (!candidate) return
     const deployment = await api<Deployment>(path, {
       method: 'POST',
-      body: JSON.stringify({ ...candidate, expected_revision_id: active?.id ?? null }),
+      body: JSON.stringify({ ...candidate, expected_revision_id: editor !== null ? editRevision : active?.id ?? null }),
     })
     setActive(deployment)
     setCandidate(null)
+    setEditor(null)
     setMessage('Deployment saved. Run it when your workers are ready.')
   }
 
@@ -157,6 +161,7 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
       <button className="manage-button" type="button" disabled={busy || !loaded} onClick={() => {
         setError('')
         setMessage('')
+        setEditor(null)
         setCandidate({ manifest: template, source: { kind: 'upload' } })
       }}>Load sample workflow</button>
       <p>One contributing node is enough to run the sample. Expect <code>[4, 6]</code> from vector addition and <code>[19, 22, 43, 50]</code> from matrix multiplication.</p>
@@ -164,15 +169,26 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
     {active && <article className="runtime-job">
       <strong>{active.manifest.name}</strong>
       <p>{active.manifest.jobs.length} jobs · {active.source.kind === 'github' ? `${active.source.repository} @ ${active.source.commit.slice(0, 12)}` : 'Local manifest'}</p>
+      <p>Revision <code>{active.id.slice(0, 8)}</code> · Saved {new Date(active.deployed_at_ms).toLocaleString()}</p><details><summary>View deployed manifest</summary><pre>{JSON.stringify(active.manifest, null, 2)}</pre></details>
       <ul>{active.manifest.jobs.map(job => <li key={job.name}>{job.name} · {job.input.operation}</li>)}</ul>
       <a download="mesh.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(active.manifest, null, 2))}`}>Download deployed manifest</a>
       {role !== 'viewer' && <button className="manage-button primary" type="button" disabled={busy} onClick={() => void perform(() => run(active))}>Run deployment</button>}
+      {role === 'owner' && <button className="manage-button" disabled={busy} onClick={() => { setEditRevision(active.id); setEditor(JSON.stringify(active.manifest, null, 2)); setCandidate(null) }}>Edit deployed workflow</button>}
       {role === 'owner' && <button className="manage-button danger" type="button" disabled={busy} onClick={() => void perform(async () => {
         await api(`${path}/${active.id}`, { method: 'DELETE' })
         setActive(null)
         setMessage('Deployment removed.')
       })}>Remove deployment</button>}
     </article>}
+    {role === 'owner' && editor !== null && <section className="manifest-editor" aria-label="Workflow editor">
+      <h4>Edit workflow</h4><p>Changes stay in this draft until you preview and save. Running jobs keep their original revision.</p>
+      <label>Workflow JSON<textarea spellCheck={false} value={editor} onChange={event => { setEditor(event.target.value); setCandidate(null) }}/></label>
+      <button className="manage-button primary" disabled={busy} onClick={() => void perform(async () => {
+        if (new TextEncoder().encode(editor).length > MANIFEST_LIMIT) throw new Error('Workflow exceeds 32 KiB')
+        setCandidate({ manifest: JSON.parse(editor), source: { kind: 'upload' } })
+      })}>Preview changes</button>
+      <button className="manage-button" disabled={busy} onClick={() => { setEditor(null); setCandidate(null) }}>Cancel editing</button>
+    </section>}
     {role === 'owner' && <details open={!active || !!candidate}>
       <summary>{active ? 'Replace deployment' : 'Upload or import a workflow'}</summary>
       <div className="application-form">
@@ -187,6 +203,7 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
         event.preventDefault()
         void perform(async () => {
           setCandidate(null)
+          setEditor(null)
           setCandidate(await importFromGithub(repo, ref))
         })
       }}>

@@ -81,6 +81,7 @@ struct Run {
     completed: usize,
     failed: usize,
     bytes: usize,
+    features: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Worker {
@@ -109,6 +110,7 @@ struct ResultRow {
     token: Uuid,
     worker: Worker,
     predictions: Vec<Prediction>,
+    features: Option<Vec<f32>>,
     backend: Backend,
     compute_ms: f64,
     load_ms: f64,
@@ -130,6 +132,7 @@ impl Run {
             expires: at + RETENTION,
             ready,
             bytes,
+            features: false,
             items: images
                 .into_iter()
                 .map(|image| Item {
@@ -169,6 +172,7 @@ impl Run {
             index,
             lease: item.lease.as_ref()?.token,
             image_rgb96: item.image.clone()?,
+            features: self.features,
         })
     }
     fn checked_lease(
@@ -286,10 +290,20 @@ impl Queue {
         self.wake(app, count);
         Ok(id)
     }
+    #[cfg(test)]
     fn claim(&mut self, app: Uuid, worker: &Worker, at: Instant) -> Option<Work> {
+        self.claim_capable(app, worker, at, false)
+    }
+    fn claim_capable(
+        &mut self,
+        app: Uuid,
+        worker: &Worker,
+        at: Instant,
+        features: bool,
+    ) -> Option<Work> {
         let ids = self.apps.get(&app)?;
         let runs = &self.runs;
-        let live = |id: &&Uuid| runs[*id].expires > at;
+        let live = |id: &&Uuid| runs[*id].expires > at && (!runs[*id].features || features);
         let resume = ids
             .iter()
             .filter(live)
@@ -414,9 +428,15 @@ fn parse_images(bytes: &[u8]) -> ApiResult<Vec<String>> {
     }
     Ok(images)
 }
+#[derive(Default, Deserialize)]
+struct FeatureOptions {
+    #[serde(default)]
+    features: bool,
+}
 async fn submit(
     State(state): State<AppState>,
     Path(app): Path<Uuid>,
+    Query(options): Query<FeatureOptions>,
     headers: HeaderMap,
     request: Request,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
@@ -447,10 +467,22 @@ async fn submit(
         .map_err(|_| unavailable())??;
     let store = state.store.lock().map_err(|_| unavailable())?;
     security::application_access(&store, app, &user, true)?;
-    let id = state
-        .image_batches
-        .queue()?
-        .insert(app, images, Instant::now())?;
+    let mut queue = state.image_batches.queue()?;
+    let reserved = if options.features {
+        images.len() * 1000 * 4
+    } else {
+        0
+    };
+    if queue.buffered + images.iter().map(String::len).sum::<usize>() + reserved
+        > MAX_BUFFERED_BYTES
+    {
+        return Err(unavailable());
+    }
+    let id = queue.insert(app, images, Instant::now())?;
+    let run = queue.runs.get_mut(&id).ok_or_else(unavailable)?;
+    run.features = options.features;
+    run.bytes += reserved;
+    queue.buffered += reserved;
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"id":id}))))
 }
 #[derive(Serialize)]
@@ -462,6 +494,7 @@ struct Row {
     compute_ms: f64,
     load_ms: f64,
     predictions: Vec<Prediction>,
+    features: Option<Vec<f32>>,
 }
 #[derive(Serialize)]
 struct Progress {
@@ -544,6 +577,7 @@ async fn details(
                     compute_ms: result.compute_ms,
                     load_ms: result.load_ms,
                     predictions: result.predictions.clone(),
+                    features: result.features.clone(),
                 })
             })
             .collect::<Vec<_>>()
@@ -577,6 +611,8 @@ struct Claim {
     worker_id: Uuid,
     #[serde(default)]
     warm: bool,
+    #[serde(default)]
+    features: bool,
 }
 #[derive(Serialize)]
 struct Work {
@@ -584,6 +620,7 @@ struct Work {
     index: usize,
     lease: Uuid,
     image_rgb96: String,
+    features: bool,
 }
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -601,7 +638,7 @@ async fn claim(
         let store = state.store.lock().map_err(|_| unavailable())?;
         let worker = worker(&store, &headers, app, input.worker_id)?;
         let mut queue = state.image_batches.queue()?;
-        if let Some(work) = queue.claim(app, &worker, Instant::now()) {
+        if let Some(work) = queue.claim_capable(app, &worker, Instant::now(), input.features) {
             return Ok(Json(Some(ClaimReply::Work(work))));
         }
         let permit = state
@@ -637,6 +674,7 @@ struct Commit {
     #[serde(flatten)]
     attempt: Attempt,
     predictions: Vec<Prediction>,
+    features: Option<Vec<f32>>,
     backend: Backend,
     compute_ms: f64,
     load_ms: f64,
@@ -682,7 +720,12 @@ async fn commit(
     headers: HeaderMap,
     Json(input): Json<Commit>,
 ) -> ApiResult<StatusCode> {
-    if input.predictions.len() != 3
+    if input.features.as_ref().is_some_and(|values| {
+        values.len() != 1000
+            || values
+                .iter()
+                .any(|value| !value.is_finite() || value.abs() > 10000.0)
+    }) || input.predictions.len() != 3
         || input
             .predictions
             .iter()
@@ -704,6 +747,9 @@ async fn commit(
     let mut queue = state.image_batches.queue()?;
     let at = Instant::now();
     let run = queue.run_mut(app, id, at)?;
+    if run.features != input.features.is_some() {
+        return Err(invalid());
+    }
     if let Some(result) = run
         .items
         .get(input.attempt.index)
@@ -712,6 +758,7 @@ async fn commit(
         return if result.worker == worker
             && result.token == input.attempt.lease
             && result.predictions == input.predictions
+            && result.features == input.features
         {
             Ok(StatusCode::NO_CONTENT)
         } else {
@@ -727,6 +774,7 @@ async fn commit(
         token: input.attempt.lease,
         worker,
         predictions: input.predictions,
+        features: input.features,
         backend: input.backend,
         compute_ms: input.compute_ms,
         load_ms: input.load_ms,
@@ -762,6 +810,28 @@ pub fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_workers_skip_feature_tasks_and_memory_is_reclaimed() {
+        let mut queue = Queue::default();
+        let app = Uuid::new_v4();
+        let at = Instant::now();
+        let id = queue.insert(app, vec!["input".into()], at).unwrap();
+        queue.runs.get_mut(&id).unwrap().features = true;
+        let worker = Worker {
+            id: Uuid::new_v4(),
+            principal: "test".into(),
+        };
+        assert!(queue.claim(app, &worker, at).is_none());
+        assert!(
+            queue
+                .claim_capable(app, &worker, at, true)
+                .unwrap()
+                .features
+        );
+        queue.remove(id);
+        assert_eq!(queue.buffered, 0);
+    }
 
     #[test]
     fn wakes_a_warm_waiter_first_when_only_one_image_is_ready() {

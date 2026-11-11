@@ -1,6 +1,7 @@
 import { ApplicationRuntime } from './ApplicationRuntime'
+import { VisionStudio } from './VisionStudio'
 import { ImageBatchRuntime } from './ImageBatchRuntime'
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { api, setIdentity } from './api'
 
 type Account = { username: string; activated: boolean; recovery_session?: boolean; two_factor_enabled: boolean; recovery_codes_remaining: number }
@@ -9,7 +10,8 @@ type Setup = { secret: string; challenge: string; uri: string }
 const clearDeviceCredentials = () => {
   for (const key of ['mesh.node-tokens', 'mesh.remembered-node-tokens', 'mesh.contribution-settings']) { sessionStorage.removeItem(key); localStorage.removeItem(key) }
 }
-export function AccountApplications({ clusterId, changed, startBrowser, shareCompute }: {
+export function AccountApplications({ clusterId, changed, startBrowser, shareCompute, workspace = 'applications' }: {
+  workspace?: 'clusters' | 'applications'
   clusterId?: string
   changed: () => void
   startBrowser: (clusterId: string) => Promise<void>
@@ -17,6 +19,8 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
 }) {
   const [account, setAccount] = useState<Account | null>(null)
   const [applications, setApplications] = useState<Application[]>([])
+  const [studioTab, setStudioTab] = useState<'workflows' | 'vision' | 'access'>('workflows')
+  const [editName, setEditName] = useState('')
   const [selected, setSelected] = useState<Application | null>(null)
   const [mode, setMode] = useState<'signup' | 'login' | 'security' | null>(null)
   const [username, setUsername] = useState('')
@@ -36,12 +40,17 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
   const appRoute = route.length === 2 && !['api', 'assets'].includes(route[0])
   const suggestedSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 32).replace(/^-|-$/g, '')
   const appSlug = slug ?? (suggestedSlug && suggestedSlug.length < 3 ? suggestedSlug + '-app' : suggestedSlug)
+  const refreshVersion = useRef(0)
   async function refresh() {
-    const current = await api<Account | null>('/api/account'); setAccount(current)
-    if (clusterId) setApplications(await api<Application[]>(`/api/clusters/${clusterId}/applications`))
-    if (appRoute) setSelected(await api<Application>(`/api/applications/by-name/${encodeURIComponent(route[0])}/${encodeURIComponent(route[1])}`))
+    const generation = ++refreshVersion.current
+    const current = await api<Account | null>('/api/account')
+    const list = clusterId ? await api<Application[]>(`/api/clusters/${clusterId}/applications`) : []
+    const routed = appRoute ? await api<Application>(`/api/applications/by-name/${encodeURIComponent(route[0])}/${encodeURIComponent(route[1])}`) : null
+    if (generation !== refreshVersion.current) return
+    setAccount(current); setApplications(list)
+    setSelected(previous => routed ?? list.find(app => app.id === previous?.id) ?? null)
   }
-  useEffect(() => { let active = true; void refresh().catch(e => { if (active) setError(e.message) }); return () => { active = false } }, [clusterId])
+  useEffect(() => { let active = true; void refresh().catch(e => { if (active) setError(e.message) }); return () => { active = false; refreshVersion.current++ } }, [clusterId])
   useEffect(() => {
     const expired = () => { setAccount(null); setApplications([]); setSelected(null); setNotice('Sign in again to resume this account. Remembered node keys have been kept.') }
     window.addEventListener('mesh-authentication-required', expired)
@@ -107,9 +116,9 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
       {account ? <>{!account.activated && <button className="manage-button small primary" onClick={() => { setUsername(account.username); setMode('signup') }}>Finish account setup</button>}<button className="manage-button small" disabled={!account.activated} onClick={() => { setMode('security'); setKey(''); setCode('') }}>Account security</button><button className="manage-button small" onClick={() => void run(async () => { await api('/api/account/logout', { method: 'POST' }); clearDeviceCredentials(); sessionStorage.removeItem('mesh.account-session'); localStorage.removeItem('mesh.identity'); location.assign('/') })}>Sign out</button></> : <><button className="manage-button small" onClick={() => setMode('login')}>Sign in</button><button className="manage-button small primary" onClick={() => setMode('signup')}>Create account</button></>}
     </div></div>
     {error && <p className="feedback error" role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}
-    {(clusterId || appRoute) && <div className="application-content"><h3>Private applications</h3><p>Use a contributor link to share compute. Grant access by username to share the application dashboard.</p>
-      {clusterId && <div className="application-links">{applications.map(app => <button key={app.id} className="manage-button" onClick={() => { setSelected(app); setDeleteConfirmed(false) }}>{app.name} · {app.role}</button>)}{!applications.length && <p>No applications shared with this account.</p>}</div>}
-      {account?.activated && clusterId && <form className="application-form" onSubmit={event => void create(event)}><label>Application name<input required maxLength={80} value={name} onChange={e => setName(e.target.value)}/></label><label>Application slug<input required pattern="[a-z0-9][a-z0-9-]{1,30}[a-z0-9]" value={appSlug} onChange={e => setSlug(e.target.value)} placeholder="my-app" aria-describedby="application-slug-hint"/></label><p id="application-slug-hint">Suggested from the name. You can edit this part of the project URL.</p><button className="manage-button primary" disabled={busy}>Create private application</button></form>}
+    {(clusterId || appRoute) && <div className="application-content" hidden={workspace !== 'applications'}><h3>Your applications</h3><p>Use a contributor link to share compute. Grant access by username to share the application dashboard.</p>
+      {clusterId && <div className="application-links">{applications.map(app => <button key={app.id} className="manage-button" onClick={() => { setSelected(app); setDeleteConfirmed(false); setStudioTab('workflows') }}>{app.name} · {app.role}</button>)}{!applications.length && <p>No applications shared with this account.</p>}</div>}
+      {account?.activated && clusterId && <details open={!applications.length}><summary>Create an application</summary><form className="application-form" onSubmit={event => void create(event)}><label>Application name<input required maxLength={80} value={name} onChange={e => setName(e.target.value)}/></label><label>Application slug<input required pattern="[a-z0-9][a-z0-9-]{1,30}[a-z0-9]" value={appSlug} onChange={e => setSlug(e.target.value)} placeholder="my-app" aria-describedby="application-slug-hint"/></label><p id="application-slug-hint">Suggested from the name. You can edit this part of the project URL.</p><button className="manage-button primary" disabled={busy}>Create private application</button></form></details>}
       {selected && <article className="application-detail"><h3>{selected.name}</h3><a href={selected.url}>{location.origin}{selected.url}</a><p>Private management page · Browser job runtime</p><p>Application members: {selected.members.map(m => `${m.username} (${m.role})`).join(', ')}</p>
         {selected.role !== 'viewer' && <div className="application-form">
           <div className="heading-buttons">
@@ -117,14 +126,20 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
             {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}>Share contributor link</button>}
           </div>
           {selected.can_share_compute && <p>Share this link with people you trust to see the inputs for jobs they receive. Manage project links under Active invites on the cluster dashboard.</p>}
-          {appRoute && <a href="/">Open cluster dashboard and node controls</a>}
+          {appRoute && <a href="/#clusters">Open cluster dashboard and node controls</a>}
         </div>}
+        <nav className="studio-tabs" aria-label="Application tools">{(['workflows', 'vision', 'access'] as const).map(tab => <button key={tab} className="manage-button" aria-pressed={studioTab === tab} onClick={() => setStudioTab(tab)}>{tab === 'workflows' ? 'Workflows & runs' : tab === 'vision' ? 'Vision studio' : 'Settings & access'}</button>)}</nav>
+        <div hidden={studioTab !== 'vision'}><VisionStudio key={`vision-${selected.id}`} app={selected.id} role={selected.role} canShare={Boolean(selected.can_share_compute)}/></div>
+        <div hidden={studioTab !== 'workflows'}>
         <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
         <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role}/>
+        </div><div hidden={studioTab !== 'access'}>
+        {selected.role === 'owner' && <form className="application-form" onSubmit={event => { event.preventDefault(); void run(async () => { setSelected(await api<Application>(`/api/applications/${selected.id}`, { method: 'PATCH', body: JSON.stringify({ name: editName, expected_name: selected.name }) })); setEditName(''); await refresh() }) }}><label>New application name<input required maxLength={80} value={editName} onChange={event => setEditName(event.target.value)}/></label><button className="manage-button" disabled={busy || !editName.trim()}>Save application name</button><p>The application URL stays the same.</p></form>}
         {selected.role === 'owner' && <details><summary>Manage application access</summary><form className="application-form" onSubmit={event => { event.preventDefault(); void run(async () => { setSelected(await api<Application>(`/api/applications/${selected.id}/members`, { method: 'POST', body: JSON.stringify({ username: member, role }) })); setMember(''); await refresh() }) }}><label>Member username<input required value={member} onChange={event => setMember(event.target.value)}/></label><label>Application role<select value={role} onChange={event => setRole(event.target.value as 'viewer' | 'operator')}><option value="viewer">Viewer</option><option value="operator">Operator</option></select></label><button className="manage-button" disabled={busy}>Grant application access</button></form>
           {selected.members.filter(m => m.role !== 'owner').map(m => <button key={m.username} className="manage-button small" disabled={busy} onClick={() => void run(async () => { await api(`/api/applications/${selected.id}/members/${encodeURIComponent(m.username)}`, { method: 'DELETE' }); setSelected(await api<Application>(`/api/applications/${selected.id}`)); await refresh() })}>Revoke {m.username}</button>)}
           <div><label><input type="checkbox" checked={deleteConfirmed} onChange={event => setDeleteConfirmed(event.target.checked)}/>Confirm deletion of this application record</label><button className="manage-button danger" disabled={busy || !deleteConfirmed} onClick={() => void run(async () => { await api(`/api/applications/${selected.id}`, { method: 'DELETE' }); setSelected(null); setDeleteConfirmed(false); await refresh() })}>Delete application</button></div>
         </details>}
+        </div>
       </article>}
     </div>}
     {mode && <div className="dialog-shade"><section className="credentials-dialog" role="dialog" aria-modal="true" aria-label={mode === 'security' ? 'Account security' : mode === 'signup' ? 'Create account' : 'Sign in'}><button className="dialog-close" aria-label="Close account dialog" disabled={busy} onClick={() => { setMode(null); setKey(''); setCode(''); setSetup(null) }}>×</button>

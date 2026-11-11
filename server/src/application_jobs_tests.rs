@@ -1349,3 +1349,201 @@ async fn a_delayed_failure_counter_cannot_override_a_completed_takeover() {
     assert_eq!(result.output.unwrap().values, vec![5., 7., 9.]);
     assert!(result.error.is_none());
 }
+
+#[tokio::test]
+async fn detector_deployments_are_private_revision_fenced_and_pruned() {
+    use base64::Engine;
+    let f = Fixture::new().await;
+    let path = format!("/api/applications/{}/detector", f.app);
+    let mut bytes = vec![0u8; 4000];
+    bytes[..4].copy_from_slice(&1f32.to_le_bytes());
+    let prototype = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let input = json!({"expected_revision_id":null,"name":"Custom cats","model":{
+        "format":"mesh-region-prototypes-v1","backbone_revision":"3ba07f12712fa58fd6b3d661f9909c9e332c5005",
+        "labels":["__background__","cat"],"prototypes":[prototype,prototype],"counts":[2,3],"threshold":0.65,"margin":0.05
+    }});
+    let (status, saved) = call(&f.router, "POST", &path, &f.session, input.clone(), None).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(
+        call(&f.router, "POST", &path, &f.session, input.clone(), None)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(&f.router, "GET", &path, &"b".repeat(64), Value::Null, None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let appid = Uuid::parse_str(&f.app).unwrap();
+    let owner = f.state.store.lock().unwrap().applications[&appid]
+        .owner_id
+        .clone();
+    f.state
+        .store
+        .lock()
+        .unwrap()
+        .applications
+        .get_mut(&appid)
+        .unwrap()
+        .members
+        .insert(owner.clone(), security::AppRole::Viewer);
+    assert_eq!(
+        call(&f.router, "GET", &path, &f.session, Value::Null, None)
+            .await
+            .1["id"],
+        saved["id"]
+    );
+    assert_eq!(
+        call(&f.router, "POST", &path, &f.session, input, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    f.state
+        .store
+        .lock()
+        .unwrap()
+        .applications
+        .get_mut(&appid)
+        .unwrap()
+        .members
+        .insert(owner, security::AppRole::Owner);
+    let app_path = format!("/api/applications/{}", f.app);
+    let rename = json!({"name":"Renamed app","expected_name":"runtime"});
+    assert_eq!(
+        call(
+            &f.router,
+            "PATCH",
+            &app_path,
+            &f.session,
+            rename.clone(),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&f.router, "PATCH", &app_path, &f.session, rename, None)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "DELETE",
+            &app_path,
+            &f.session,
+            Value::Null,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(f.state.store.lock().unwrap().vision_models.is_empty());
+}
+
+#[tokio::test]
+async fn vision_features_are_bounded_fenced_retryable_and_ephemeral() {
+    let f = Fixture::new().await;
+    let base = format!("/api/applications/{}", f.app);
+    let (status, run) = call(
+        &f.router,
+        "POST",
+        &format!("{base}/image-batches?features=true"),
+        &f.session,
+        json!({"images":["A".repeat(96*96*4)]}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+    let persisted = std::fs::read(&*f.state.data_file).unwrap();
+    let worker = Uuid::new_v4();
+    let (_, work) = call(
+        &f.router,
+        "POST",
+        &format!("{base}/image-work/claim"),
+        &f.session,
+        json!({"worker_id":worker,"features":true}),
+        None,
+    )
+    .await;
+    assert_eq!(work["features"], true);
+    let result_path = format!("{base}/image-work/{}/commit", run["id"].as_str().unwrap());
+    let body = json!({"worker_id":worker,"index":0,"lease":work["lease"],"predictions":[{"class_id":1,"score":0.8},{"class_id":2,"score":0.1},{"class_id":3,"score":0.05}],"features":vec![1.0;1000],"backend":"wasm","compute_ms":1,"load_ms":0});
+    let mut malformed = body.clone();
+    malformed["features"] = json!([1.0]);
+    assert_eq!(
+        call(&f.router, "POST", &result_path, &f.session, malformed, None)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let release = format!("{base}/image-work/{}/release", run["id"].as_str().unwrap());
+    assert_eq!(
+        call(&f.router, "POST", &release, &f.session, body.clone(), None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let next_worker = Uuid::new_v4();
+    let (_, next) = call(
+        &f.router,
+        "POST",
+        &format!("{base}/image-work/claim"),
+        &f.session,
+        json!({"worker_id":next_worker,"features":true}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &result_path,
+            &f.session,
+            body.clone(),
+            None
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let mut valid = body;
+    valid["worker_id"] = json!(next_worker);
+    valid["lease"] = next["lease"].clone();
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &result_path,
+            &f.session,
+            valid.clone(),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&f.router, "POST", &result_path, &f.session, valid, None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let details = format!(
+        "{base}/image-batches/{}?results=true",
+        run["id"].as_str().unwrap()
+    );
+    let (_, result) = call(&f.router, "GET", &details, &f.session, Value::Null, None).await;
+    assert_eq!(
+        result["results"][0]["features"].as_array().unwrap().len(),
+        1000
+    );
+    assert_eq!(result["results"][0]["attempts"], 2);
+    assert_eq!(std::fs::read(&*f.state.data_file).unwrap(), persisted);
+}

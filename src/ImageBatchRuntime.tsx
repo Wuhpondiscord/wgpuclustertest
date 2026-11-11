@@ -10,7 +10,7 @@ type ImageRow = {
 type Details = Progress & { results: ImageRow[] | null }
 const describe = (error: unknown) => error instanceof Error ? error.message : 'Image runtime request failed'
 
-function ImageContributor({ app, invite }: { app: string; invite?: string }) {
+export function ImageContributor({ app, invite, purpose = 'Contribute to image classification' }: { app: string; invite?: string; purpose?: string }) {
   const worker = useRef<Worker | null>(null)
   const [device] = useState(() => ({ id: crypto.randomUUID(), key: crypto.randomUUID() }))
   const stopTimer = useRef(0)
@@ -55,7 +55,7 @@ function ImageContributor({ app, invite }: { app: string; invite?: string }) {
     }
   }
   return <section className="runtime-job" aria-label="Image worker">
-    <strong>Contribute to image classification</strong>
+    <strong>{purpose}</strong>
     <p>This browser downloads about 15 MB of model weights plus the runtime on its first job. It uses WebGPU when available and can fall back to the CPU. Keep this tab open to contribute.</p>
     <button type="button" className={enabled ? 'manage-button' : 'manage-button primary'} disabled={stopping} onClick={() => enabled ? stop() : void start()}>{enabled ? 'Stop ML worker' : 'Start ML worker'}</button>
     <p role="status">{message}{enabled && ` · Worker ${device.id.slice(0, 8)}`}</p>
