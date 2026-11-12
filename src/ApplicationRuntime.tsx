@@ -72,6 +72,10 @@ const job = await mesh.embeddings(['Your text here']);
 const result = await mesh.wait(job);
 console.log(result.output);`
   return <section className="application-runtime" aria-label="Browser application runtime">
+    <ApplicationDeployment appId={appId} role={role} onQueued={queued => {
+      const ids = new Set(queued.map(job => job.id))
+      setJobs(current => [...queued, ...current.filter(job => !ids.has(job.id))])
+    }}/>
     <h3>Browser jobs</h3>
     <p>Run numerical operations and text embeddings on connected browsers. App owners, operators and guests who accepted a contributor link can run assigned work. Choose trusted contributors for sensitive inputs.</p>
     {error && <p role="alert" className="feedback error">{error}</p>}
@@ -89,10 +93,6 @@ console.log(result.output);`
       </div>
       <ApplicationJobForm busy={busy} onSubmit={readInput => void run(async () => { await queue(readInput()) })}/>
     </>}
-    <ApplicationDeployment appId={appId} role={role} onQueued={queued => {
-      const ids = new Set(queued.map(job => job.id))
-      setJobs(current => [...queued, ...current.filter(job => !ids.has(job.id))])
-    }}/>
     <div className="application-job-list" aria-label="Application jobs">
       {!jobs.length && <p>No jobs yet. Jobs wait until an approved contributor is connected.</p>}
       {jobs.map(job => <article className="runtime-job" key={job.id} data-testid="application-job"><strong>{job.deployment?.name ?? job.input.operation}</strong> · <span data-testid="application-job-status">{job.status}</span><div><code>{job.id}</code></div><p>{job.verification.split('_').join(' ')} · {job.replicas_received}/{job.replicas_required} results received</p>

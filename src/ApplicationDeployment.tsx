@@ -151,8 +151,8 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
     setMessage(`Queued ${jobs.length} workflow job${jobs.length === 1 ? '' : 's'}.`)
   }
 
-  return <section aria-label="Application deployment">
-    <h3>Deploy workflow</h3>
+  return <section className="deployment-panel" aria-label="Application deployment">
+    <h3>Workflow deployment</h3>
     <p>A <code>mesh.json</code> manifest defines up to eight independent jobs using vector add, matrix multiply, or text embeddings. Save a deployment, then run it on your approved cluster workers.</p>
     {error && <p role="alert" className="feedback error">{error}</p>}
     {message && <p role="status">{message}</p>}
@@ -167,7 +167,7 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
       <p>One contributing node is enough to run the sample. Expect <code>[4, 6]</code> from vector addition and <code>[19, 22, 43, 50]</code> from matrix multiplication.</p>
     </div>}
     {active && <article className="runtime-job">
-      <strong>{active.manifest.name}</strong>
+      <div className="application-title"><strong>{active.manifest.name}</strong><span className="published-chip">Deployed</span></div>
       <p>{active.manifest.jobs.length} jobs · {active.source.kind === 'github' ? `${active.source.repository} @ ${active.source.commit.slice(0, 12)}` : 'Local manifest'}</p>
       <p>Revision <code>{active.id.slice(0, 8)}</code> · Saved {new Date(active.deployed_at_ms).toLocaleString()}</p><details><summary>View deployed manifest</summary><pre>{JSON.stringify(active.manifest, null, 2)}</pre></details>
       <ul>{active.manifest.jobs.map(job => <li key={job.name}>{job.name} · {job.input.operation}</li>)}</ul>

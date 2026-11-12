@@ -25,4 +25,5 @@ ureq = { version = "2.12", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 tower = { version = "0.5", features = ["util"] }
+image = { version = "0.25.9", default-features = false, features = ["jpeg"] }
 

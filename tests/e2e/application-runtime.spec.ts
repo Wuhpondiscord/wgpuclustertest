@@ -385,6 +385,11 @@ test('vision studio trains a boxed dataset on a real browser worker and reloads 
     await studio.getByRole('button', { name: 'Detect objects on cluster' }).click()
     await expect(studio.getByText('Detection complete using the deployed revision.', { exact: true })).toBeVisible({ timeout: 120_000 })
     await studio.getByRole('button', { name: 'Stop ML worker' }).click()
+    if (process.env.MESH_TEST_PREVIEW) {
+      await page.setViewportSize({ width: 1440, height: 1000 })
+      await page.evaluate(() => window.scrollTo(0, 0))
+      await page.screenshot({ path: 'test-results-ui/vision-studio-desktop.png' })
+    }
     await page.setViewportSize({ width: 390, height: 844 })
     const overflow = await page.evaluate(() => [...document.querySelectorAll('body *')].filter(element => element.getBoundingClientRect().right > innerWidth + 1).map(element => ({ tag: element.tagName, className: element.className, width: element.getBoundingClientRect().width, text: element.textContent?.slice(0, 60) })))
     expect(overflow).toEqual([])

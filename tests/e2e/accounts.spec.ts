@@ -25,6 +25,31 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await saved.getByRole('button', { name: 'I saved these securely' }).click()
   await expect(saved).toHaveCount(0)
   expect(await page.evaluate(() => localStorage.getItem('mesh.identity'))).toBeNull()
+  const profileButton = page.getByRole('button', { name: `Open profile for @${username}` })
+  await expect(profileButton.locator('.profile-avatar')).toHaveText('US')
+  await profileButton.click()
+  const profile = page.getByRole('dialog', { name: 'Your profile' })
+  const png = await page.evaluate(() => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 120
+    canvas.height = 80
+    const context = canvas.getContext('2d')!
+    context.fillStyle = '#1859e8'
+    context.fillRect(0, 0, 120, 80)
+    return canvas.toDataURL('image/png').split(',')[1]
+  })
+  await profile.getByLabel('Choose profile picture').setInputFiles({
+    name: 'profile.png', mimeType: 'image/png', buffer: Buffer.from(png, 'base64'),
+  })
+  await profile.getByRole('button', { name: 'Save profile picture' }).click()
+  await expect(profile.getByRole('status')).toHaveText('Profile picture saved.')
+  await expect(profileButton.locator('img')).toHaveAttribute('src', /^data:image\/jpeg;base64,/)
+  await page.reload()
+  await expect(profileButton.locator('img')).toBeVisible()
+  await profileButton.click()
+  await profile.getByRole('button', { name: 'Restore default picture' }).click()
+  await expect(profileButton.locator('.profile-avatar')).toHaveText('US')
+  await profile.getByRole('button', { name: 'Close profile' }).click()
   const create = page.getByRole('button', { name: 'New cluster', exact: true })
   await create.click(); await page.getByTestId('app-dialog-input').fill('private application pool'); await page.getByTestId('app-dialog-submit').click()
   await page.getByRole('link', { name: 'Applications', exact: true }).click()
@@ -32,7 +57,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await expect(page.getByLabel('Application slug', { exact: true })).toHaveValue('private-image-worker')
   await page.getByLabel('Application slug', { exact: true }).fill('image-worker')
   await page.getByRole('button', { name: 'Create private application', exact: true }).click()
-  await expect(page.locator('.application-detail > a')).toHaveAttribute('href', `/${username}/image-worker`)
+  await expect(page.locator('.application-overview a').first()).toHaveAttribute('href', `/${username}/image-worker`)
   // A stale session must require sign-in, not become a new anonymous principal.
   await page.evaluate(() => sessionStorage.setItem('mesh.account-session', `ms_${'0'.repeat(64)}`))
   await page.getByRole('button', { name: 'Refresh', exact: true }).click()
@@ -42,7 +67,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await resume.getByLabel('Username', { exact: true }).fill(username)
   await resume.getByLabel('Account key', { exact: true }).fill(root)
   await resume.getByRole('button', { name: 'Sign in to account', exact: true }).click()
-  await expect(page.getByRole('button', { name: 'Account security', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: `Open profile for @${username}` }).click()
   await page.getByRole('button', { name: 'Account security', exact: true }).click()
   const security = page.getByRole('dialog', { name: 'Account security', exact: true })
   await security.getByLabel('Current account key', { exact: true }).fill(root)
@@ -57,6 +82,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await recovery.getByRole('button', { name: 'I saved these securely', exact: true }).click()
   await security.getByRole('button', { name: 'Close account dialog', exact: true }).click()
   expect(await page.evaluate(root => [localStorage.getItem('mesh.identity'), sessionStorage.getItem('mesh.account-session')].every(value => value !== root), root)).toBe(true)
+  await page.getByRole('button', { name: `Open profile for @${username}` }).click()
   await page.getByRole('button', { name: 'Sign out', exact: true }).click()
   await page.getByRole('button', { name: 'Sign in', exact: true }).click()
   const login = page.getByRole('dialog', { name: 'Sign in', exact: true })
@@ -66,7 +92,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await expect(login.getByRole('alert')).toContainText('Invalid credentials')
   await login.getByLabel('Authenticator or recovery code', { exact: true }).fill(codes[0])
   await login.getByRole('button', { name: 'Sign in to account', exact: true }).click()
-  await expect(page.getByRole('button', { name: 'Account security', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: `Open profile for @${username}` }).click()
   await page.getByRole('button', { name: 'Account security', exact: true }).click()
   const reset = page.getByRole('dialog', { name: 'Account security', exact: true })
   await expect(reset.getByText('You signed in with a recovery code.', { exact: false })).toBeVisible()
@@ -80,6 +106,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await page.setViewportSize({ width: 390, height: 844 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true)
   await page.screenshot({ path: 'test-results-ui/private-application-mobile.png', fullPage: true })
+  await page.getByRole('button', { name: `Open profile for @${username}` }).click()
   await page.getByRole('button', { name: 'Sign out', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toBeVisible()
   await page.goto(`/${username}/image-worker`)
@@ -134,6 +161,7 @@ test('closing before saving an account key preserves anonymous ownership for reg
     const save = second.getByRole('dialog', { name: 'Save your account key', exact: true })
     await expect(save).toBeVisible(); await save.getByRole('button', { name: 'I saved these securely' }).click()
     await expect(second.getByRole('heading', { name: 'preserved pending ownership', exact: true })).toBeVisible()
+    await second.getByRole('button', { name: `Open profile for @${username}` }).click()
     await expect(second.getByRole('button', { name: 'Account security', exact: true })).toBeEnabled()
   } finally { await first.close(); await reopened?.close() }
 })

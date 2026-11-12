@@ -2823,6 +2823,10 @@ fn app(state: AppState) -> Router {
         .route("/api/accounts", post(security::signup))
         .route("/api/accounts/login", post(security::login))
         .route("/api/account", get(security::me))
+        .route(
+            "/api/account/avatar",
+            axum::routing::put(security::save_avatar).delete(security::remove_avatar),
+        )
         .route("/api/account/logout", post(security::logout))
         .route("/api/account/key", post(security::rotate_key))
         .route("/api/account/key/confirm", post(security::confirm_rotation))
