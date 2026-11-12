@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use data_encoding::BASE32_NOPAD;
@@ -29,6 +29,16 @@ use uuid::Uuid;
 
 pub const USER_HEADER: &str = "x-mesh-resolved-principal";
 const SESSION_SECONDS: u64 = 12 * 60 * 60;
+const AVATAR_SIDE: u32 = 96;
+const MAX_AVATAR_BASE64: usize = 16 * 1024;
+const AVATAR_STORAGE_BUDGET: usize = 1024 * 1024;
+
+#[derive(Clone)]
+pub struct AccountSession {
+    user: String,
+    token_hash: String,
+    credential_hash: String,
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Account {
@@ -40,6 +50,8 @@ pub struct Account {
     totp: Option<Sealed>,
     last_step: Option<u64>,
     recovery: HashSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar: Option<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 struct Sealed {
@@ -288,6 +300,7 @@ pub struct AccountSummary {
     pub recovery_session: bool,
     pub two_factor_enabled: bool,
     pub recovery_codes_remaining: usize,
+    pub avatar: Option<String>,
 }
 fn account_summary(a: &Account) -> AccountSummary {
     AccountSummary {
@@ -296,6 +309,7 @@ fn account_summary(a: &Account) -> AccountSummary {
         recovery_session: false,
         two_factor_enabled: a.totp.is_some(),
         recovery_codes_remaining: a.recovery.len(),
+        avatar: a.avatar.clone(),
     }
 }
 fn issue_session(state: &AppState, user: String) -> ApiResult<String> {
@@ -346,8 +360,13 @@ pub async fn authenticate(
         .get(IDENTITY_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let path = request.uri().path();
+    let account_only = path == "/api/account" || path.starts_with("/api/account/");
+    if account_only && raw.is_none() {
+        return private(denied().into_response());
+    }
     if let Some(raw) = raw {
-        let resolved = (|| -> ApiResult<String> {
+        let resolved = (|| -> ApiResult<(String, Option<AccountSession>)> {
             if !(32..=128).contains(&raw.len()) {
                 return Err(denied());
             }
@@ -367,9 +386,14 @@ pub async fn authenticate(
                 if account_for(&store, &user)?.key_hash != credential_hash {
                     return Err(denied());
                 }
-                return Ok(user);
+                let session = AccountSession {
+                    user: user.clone(),
+                    token_hash: hash,
+                    credential_hash,
+                };
+                return Ok((user, Some(session)));
             }
-            if raw.starts_with("ms_") {
+            if account_only || raw.starts_with("ms_") {
                 return Err(denied());
             }
             if store.revoked_credentials.contains(&hash)
@@ -377,10 +401,13 @@ pub async fn authenticate(
             {
                 return Err(denied());
             }
-            Ok(hash) // Compatibility for existing anonymous cluster identities.
+            Ok((hash, None)) // Compatibility for existing anonymous cluster identities.
         })();
         match resolved {
-            Ok(user) => {
+            Ok((user, session)) => {
+                if let Some(session) = session {
+                    request.extensions_mut().insert(session);
+                }
                 request.headers_mut().insert(
                     USER_HEADER,
                     HeaderValue::from_str(&user).expect("hex principal"),
@@ -470,6 +497,7 @@ pub async fn signup(
             totp: None,
             last_step: None,
             recovery: HashSet::new(),
+            avatar: None,
         };
         let summary = account_summary(&account);
         store.accounts.insert(username.clone(), account);
@@ -561,40 +589,136 @@ pub async fn login(
 }
 pub async fn me(
     State(state): State<AppState>,
+    Extension(session): Extension<AccountSession>,
     headers: HeaderMap,
-) -> ApiResult<Json<Option<AccountSummary>>> {
-    let user = identity(&headers)?;
-    let recovery_session = is_recovery_session(&state, &headers, &user);
+) -> ApiResult<Json<AccountSummary>> {
+    let recovery_session = is_recovery_session(&state, &headers, &session.user);
     let store = state.store.lock().map_err(|_| unavailable())?;
-    Ok(Json(
+    let account = account_for(&store, &session.user)?;
+    let mut summary = account_summary(account);
+    summary.recovery_session = recovery_session;
+    Ok(Json(summary))
+}
+
+pub async fn logout(
+    State(state): State<AppState>,
+    Extension(session): Extension<AccountSession>,
+) -> ApiResult<StatusCode> {
+    let mut runtime = state.durability.lock().map_err(|_| unavailable())?;
+    runtime.accounts.sessions.remove(&session.token_hash);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvatarUpload {
+    jpeg: String,
+}
+
+fn normalize_avatar(encoded: &str) -> ApiResult<String> {
+    use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, ImageFormat, ImageReader, Limits};
+    use std::io::Cursor;
+
+    let invalid = || {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "Use a valid 96 × 96 JPEG thumbnail".into(),
+        )
+    };
+    if encoded.len() > MAX_AVATAR_BASE64 {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Profile picture is too large".into(),
+        ));
+    }
+    let bytes = BASE64.decode(encoded).map_err(|_| invalid())?;
+    let reader = || ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Jpeg);
+    if reader().into_dimensions().map_err(|_| invalid())? != (AVATAR_SIDE, AVATAR_SIDE) {
+        return Err(invalid());
+    }
+    let mut reader = reader();
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(AVATAR_SIDE);
+    limits.max_image_height = Some(AVATAR_SIDE);
+    limits.max_alloc = Some(1024 * 1024);
+    reader.limits(limits);
+    let rgb = reader.decode().map_err(|_| invalid())?.into_rgb8();
+    let mut thumbnail = Vec::new();
+    JpegEncoder::new_with_quality(&mut thumbnail, 78)
+        .encode(&rgb, AVATAR_SIDE, AVATAR_SIDE, ExtendedColorType::Rgb8)
+        .map_err(|_| invalid())?;
+    Ok(BASE64.encode(thumbnail))
+}
+
+async fn change_avatar(
+    state: &AppState,
+    session: &AccountSession,
+    avatar: Option<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    mutate_store(state, |store| {
+        // Recheck after acquiring the durable mutation lock, including on a storage retry.
+        let active = state
+            .durability
+            .lock()
+            .map_err(|_| unavailable())?
+            .accounts
+            .sessions
+            .get(&session.token_hash)
+            .is_some_and(|current| {
+                current.expires > now()
+                    && current.user == session.user
+                    && current.credential_hash == session.credential_hash
+            });
+        if !active {
+            return Err(denied());
+        }
+        let account = account_for(store, &session.user)?;
+        if !account.activated || account.key_hash != session.credential_hash {
+            return Err(denied());
+        }
+        if let Some(image) = &avatar {
+            let used: usize = store
+                .accounts
+                .values()
+                .filter(|other| other.id != session.user)
+                .filter_map(|other| other.avatar.as_ref().map(String::len))
+                .sum();
+            if used + image.len() > AVATAR_STORAGE_BUDGET {
+                return Err(ApiError(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "Profile picture storage is full".into(),
+                ));
+            }
+        }
+        let username = account.username.clone();
         store
             .accounts
-            .values()
-            .find(|a| {
-                a.id == user
-                    && (a.activated
-                        || secret_hash(
-                            headers
-                                .get(IDENTITY_HEADER)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or(""),
-                        ) != a.id)
-            })
-            .map(|a| {
-                let mut summary = account_summary(a);
-                summary.recovery_session = recovery_session;
-                summary
-            }),
-    ))
+            .get_mut(&username)
+            .ok_or_else(denied)?
+            .avatar
+            .clone_from(&avatar);
+        Ok(())
+    })
+    .await?;
+    Ok(Json(serde_json::json!({ "avatar": avatar })))
 }
-pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
-    if let Some(raw) = headers.get(IDENTITY_HEADER).and_then(|v| v.to_str().ok()) {
-        if let Ok(mut rt) = state.durability.lock() {
-            rt.accounts.sessions.remove(&secret_hash(raw));
-        }
-    }
-    StatusCode::NO_CONTENT
+
+pub async fn save_avatar(
+    State(state): State<AppState>,
+    Extension(session): Extension<AccountSession>,
+    Json(upload): Json<AvatarUpload>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let avatar = normalize_avatar(&upload.jpeg)?;
+    change_avatar(&state, &session, Some(avatar)).await
 }
+
+pub async fn remove_avatar(
+    State(state): State<AppState>,
+    Extension(session): Extension<AccountSession>,
+) -> ApiResult<Json<serde_json::Value>> {
+    change_avatar(&state, &session, None).await
+}
+
 #[derive(Deserialize)]
 pub struct FactorProof {
     key: String,

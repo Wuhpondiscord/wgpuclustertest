@@ -144,8 +144,8 @@ async fn account_activation_is_recoverable_and_preserves_cluster_ownership() {
             serde_json::Value::Null
         )
         .await
-        .1,
-        serde_json::Value::Null
+        .0,
+        StatusCode::UNAUTHORIZED
     );
     let alice = register(&router, &raw, "alice").await;
     assert_ne!(lost["key"], alice["key"]);
@@ -744,4 +744,161 @@ async fn last_recovery_code_can_reset_the_lost_authenticator_but_normal_sessions
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(login["account"]["two_factor_enabled"], false);
+}
+
+#[tokio::test]
+async fn profile_pictures_are_private_bounded_and_scoped_to_the_session_owner() {
+    use axum::http::Method;
+    use image::{codecs::jpeg::JpegEncoder, ExtendedColorType};
+
+    let state = test_state();
+    let router = crate::app(state.clone());
+    let profile = "/api/account/avatar";
+    let alice = register(&router, &"a".repeat(64), "alice").await;
+    let bob = register(&router, &"b".repeat(64), "bob").await;
+    let alice_session = alice["session"].as_str().unwrap();
+    let bob_session = bob["session"].as_str().unwrap();
+    let anonymous = "c".repeat(64);
+    for token in ["", anonymous.as_str(), alice["key"].as_str().unwrap()] {
+        for (method, path) in [
+            ("GET", "/api/account"),
+            ("POST", "/api/account/logout"),
+            ("POST", "/api/account/activate"),
+            ("POST", "/api/account/key"),
+            ("POST", "/api/account/key/confirm"),
+            ("POST", "/api/account/totp/setup"),
+            ("POST", "/api/account/totp/enable"),
+            ("POST", "/api/account/totp/disable"),
+            ("PUT", profile),
+            ("DELETE", profile),
+        ] {
+            assert_eq!(
+                call(&router, method, path, token, serde_json::json!({}))
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+    let forged = Request::builder()
+        .method(Method::DELETE)
+        .uri(profile)
+        .header(USER_HEADER, secret_hash(&"a".repeat(64)))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(forged).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let old_account = serde_json::to_value(&state.store.lock().unwrap().accounts["alice"]).unwrap();
+    assert!(old_account.get("avatar").is_none());
+    assert!(serde_json::from_value::<Account>(old_account)
+        .unwrap()
+        .avatar
+        .is_none());
+
+    let mut pixels = Vec::new();
+    JpegEncoder::new(&mut pixels)
+        .encode(&[85; 96 * 96 * 3], 96, 96, ExtendedColorType::Rgb8)
+        .unwrap();
+    let jpeg = BASE64.encode(&pixels);
+    for (body, expected) in [
+        (
+            serde_json::json!({"jpeg":"PHN2Zy8+"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"jpeg":"A".repeat(MAX_AVATAR_BASE64 + 1)}),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            serde_json::json!({"jpeg":jpeg,"username":"bob"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        assert_eq!(
+            call(&router, "PUT", profile, alice_session, body).await.0,
+            expected
+        );
+    }
+    let (status, saved) = call(
+        &router,
+        "PUT",
+        profile,
+        alice_session,
+        serde_json::json!({"jpeg":jpeg}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert!(saved["avatar"].as_str().is_some());
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            "/api/account",
+            alice_session,
+            serde_json::Value::Null
+        )
+        .await
+        .1["avatar"],
+        saved["avatar"]
+    );
+    assert!(call(
+        &router,
+        "GET",
+        "/api/account",
+        bob_session,
+        serde_json::Value::Null
+    )
+    .await
+    .1["avatar"]
+        .is_null());
+    assert_eq!(
+        call(
+            &router,
+            "DELETE",
+            profile,
+            alice_session,
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(call(
+        &router,
+        "GET",
+        "/api/account",
+        alice_session,
+        serde_json::Value::Null
+    )
+    .await
+    .1["avatar"]
+        .is_null());
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/api/account/logout",
+            alice_session,
+            serde_json::Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(
+            &router,
+            "PUT",
+            profile,
+            alice_session,
+            serde_json::json!({"jpeg":jpeg})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let _ = std::fs::remove_file(state.data_file.as_path());
 }

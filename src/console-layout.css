@@ -1,0 +1,151 @@
+/* Application dashboard */
+.application-content { grid-template-columns: 208px minmax(0, 1fr); gap: 24px; align-items: stretch; }
+.application-rail { background: #eef2f8; padding: 15px 12px; }
+.application-rail .rail-back { display: inline-flex; align-items: center; gap: 7px; text-decoration: none; color: #263b5a; }
+.selected-app-name { display: flex; align-items: center; gap: 9px; background: #fff; border: 1px solid var(--mesh-border); border-radius: 9px; padding: 10px; }
+.selected-app-name svg { flex-shrink: 0; color: #2956a5; }
+.selected-app-name small { display: flex; gap: 5px; align-items: center; color: var(--mesh-muted); margin-top: 3px; }
+.selected-app-name b { overflow-wrap: anywhere; }
+.application-detail { align-content: start; gap: 14px; }
+.application-overview { display: block; min-width: 0; padding: 2px 0 0; }
+.app-breadcrumb { display: flex; gap: 8px; margin: 0 0 10px !important; color: #566680; font-size: 12px; }
+.application-title h3 { font-size: clamp(25px, 4vw, 36px); font-weight: 800; }
+.application-overview .application-location { display: inline-block; margin: 5px 10px 0 0; }
+.app-permalink { overflow-wrap: anywhere; }
+.app-compute-link { display: inline-flex; gap: 5px; margin: 6px 0 0 10px; align-items: center; }
+.app-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin: 14px 0 0; }
+.app-metrics > div { padding: 11px 12px; min-width: 0; background: #fff; border: 1px solid var(--mesh-border); border-radius: 10px; }
+.app-metrics dt { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--mesh-muted); }
+.app-metrics dt svg { flex-shrink: 0; color: #2d589d; }
+.app-metrics dd { margin: 5px 0 0; color: #142747; font-size: 14px; font-weight: 750; overflow-wrap: anywhere; }
+.application-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(205px, 240px); align-items: start; gap: 14px; }
+.application-primary, .application-inspector { min-width: 0; }
+.application-inspector { display: grid; gap: 12px; }
+.application-inspector h4 { display: flex; align-items: center; gap: 7px; margin: 0 0 9px; font-size: 15px; }
+.application-inspector h4 svg { color: #2d589d; flex: none; }
+.inspector-card, .workspace-panel {
+  min-width: 0;
+  border: 1px solid var(--mesh-border);
+  border-radius: 11px;
+  background: #fff;
+  padding: 14px;
+}
+.inspector-card p { margin: 6px 0 10px; font-size: 13px; color: var(--mesh-muted); }
+.inspector-card a { color: var(--mesh-purple-deep); font-weight: 700; overflow-wrap: anywhere; }
+.inspector-card .manage-button { width: 100%; margin-top: 6px; min-height: 36px; height: auto; white-space: normal; }
+.access-counts { margin: 0 0 8px; font-size: 13px; }
+.access-counts > div { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--mesh-border); }
+.access-counts dd { margin: 0; font-weight: 750; }
+.application-runtime { display: grid; gap: 12px; padding: 0; border: 0; background: transparent; }
+.application-runtime .workspace-panel { margin: 0; }
+.application-primary > div > details { padding: 13px 14px; border: 1px solid var(--mesh-border); border-radius: 10px; background: #fff; }
+.workspace-panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.workspace-panel-heading h3 { margin: 0; font-size: 18px; }
+.workspace-panel-heading p { margin: 4px 0 10px; color: var(--mesh-muted); font-size: 13px; }
+.deployment-empty { padding: 12px; border: 1px dashed var(--mesh-border-strong); border-radius: 8px; color: var(--mesh-muted); }
+.deployed-workflow { border-left: 3px solid #24a35b; }
+.deployed-workflow p { font-size: 13px; color: var(--mesh-muted); }
+.deployment-panel .application-form { grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); align-items: end; }
+.deployment-panel .application-form p { margin: 0; font-size: 13px; color: var(--mesh-muted); }
+.run-metrics { font-size: 12px; color: var(--mesh-muted); }
+
+/* Cluster dashboard */
+.cluster-workspace .manage-heading { margin-bottom: 16px; }
+.cluster-workspace .manage-heading h1 { margin: 0; }
+.cluster-workspace .manage-layout { grid-template-columns: 208px minmax(0, 1fr); align-items: stretch; }
+.cluster-workspace .cluster-rail { min-height: 0; background: #eef2f8; }
+.cluster-workspace .cluster-content { border: 0; padding: 0; background: transparent; box-shadow: none; }
+.cluster-workspace .cluster-summary { padding: 14px; border: 1px solid var(--mesh-border); border-radius: 11px; background: #fff; }
+.cluster-workspace .summary-ident { min-width: 0; }
+.cluster-workspace .summary-ident h2 { overflow-wrap: anywhere; }
+.cluster-workspace .resource-grid { grid-template-columns: minmax(0, 1.7fr) minmax(225px, 1fr); align-items: start; }
+.cluster-inspector { min-width: 0; display: grid; gap: 12px; }
+.cluster-inspector .browser-quick-start { display: grid; margin: 0; gap: 8px; background: #eaf1ff; }
+.cluster-inspector .browser-quick-start h3 { margin: 0; font-size: 15px; }
+.cluster-inspector .browser-quick-start p { margin: 5px 0 0; font-size: 13px; }
+.cluster-recovery-help { margin-top: 12px; padding: 10px 12px; color: var(--mesh-muted); font-size: 13px; }
+.cluster-workspace .job-card { margin-top: 14px; }
+
+/* Dark vision workbench */
+.application-content[data-view="vision"] .application-body { display: block; }
+.vision-studio {
+  color-scheme: dark;
+  color: #edf4ff;
+  background: #101721;
+  border-color: #344257;
+  padding: 16px;
+  --mesh-paper: #171f2c;
+  --mesh-offwhite: #111b28;
+  --mesh-ink: #edf4ff;
+  --mesh-muted: #b6c6db;
+  --mesh-border: #364457;
+  --mesh-border-strong: #53647c;
+  --mesh-wash: #222e40;
+  --mesh-pale: #263957;
+  --mesh-purple: #245ae4;
+  --mesh-purple-hover: #356af0;
+  --mesh-purple-deep: #bdd2ff;
+}
+.studio-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.studio-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.studio-title > svg { color: #8bb6ff; }
+.studio-heading .context-chip { background: #26354a; color: #d2e0f7; }
+.studio-status { color: #c4d3e7; font-size: 12px; padding: 4px 7px; border: 1px solid #40516a; border-radius: 6px; }
+.vision-studio .studio-steps { background: #1b2636; border-color: #40516a; padding: 4px; margin: 14px 0; }
+.vision-studio .studio-steps button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 39px; color: #e0eafb; }
+.vision-studio .studio-steps button:hover { background: #2a3a51; }
+.vision-studio .studio-steps button[aria-pressed="true"] { background: #194cc8; border-color: #628eff; color: #fff; }
+.step-mark { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: #ffffff1d; color: #ecf3ff; }
+.step-mark.complete { background: #143d32; color: #95f1bd; }
+.vision-studio .studio-panel, .vision-studio .runtime-job { color: #edf4ff; background: #171f2c; border-color: #364457; }
+.vision-studio .studio-panel { margin-top: 12px; }
+.studio-panel-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.studio-panel-heading span, .studio-panel > p, .vision-compute p { color: #b6c6db; font-size: 13px; }
+.vision-studio .studio-panel h4 { margin: 0 0 8px; }
+.vision-studio .studio-note, .vision-studio .studio-note p, .vision-studio summary { color: #c5d3e5; }
+.vision-studio .manage-button { color: #edf4ff; background: #233044; border-color: #52617a; }
+.vision-studio .manage-button:hover { background: #30435e; }
+.vision-studio .manage-button.primary { color: #fff; background: #245ae4; border-color: #6a91ff; }
+.vision-studio .manage-button.primary:hover { background: #3266ec; }
+.vision-studio .manage-button.danger { color: #ffb4b4; border-color: #75474d; }
+.vision-studio input:not([type="checkbox"]), .vision-studio select { color: #edf4ff; background: #101923; border-color: #53647c; }
+.vision-studio .feedback.error { color: #ffd0d0; background: #3d2029; border-color: #7b414e; }
+.vision-studio .vision-inspector, .detector-upload { color: #edf4ff; background: #1d2838; border: 1px solid #40516a; border-radius: 9px; padding: 12px; }
+.vision-studio .vision-inspector h5, .detector-upload h5 { margin: 0 0 7px; font-size: 15px; }
+.vision-image-area, .detector-preview { background: #0a1019; border: 1px solid #364457; }
+.vision-studio .vision-canvas { margin: 9px auto; width: 100%; }
+.vision-studio .vision-canvas rect { fill: #00000015; stroke-width: .48; }
+.vision-studio .vision-canvas text { font-size: 3px; stroke-width: .35; }
+.detector-layout { grid-template-columns: minmax(0, 2fr) minmax(150px, .9fr) minmax(168px, 1fr); align-items: stretch; }
+.detector-name { font-size: 13px; font-weight: 700; margin: 0 0 9px; }
+.vision-studio .detector-facts div { border-color: #40516a; }
+.vision-studio .detector-facts dt { color: #b6c6db; }
+.vision-studio .detector-file { display: flex; align-items: center; text-align: center; gap: 7px; margin: 10px 0; padding: 15px 8px; border: 1px dashed #7587a4; border-radius: 8px; background: #101923; }
+.detector-file small { color: #b6c6db; font-weight: 400; }
+.vision-studio .detector-file input { padding: 5px; border: 0; }
+.detector-upload .primary { width: 100%; margin: 0; }
+.dataset-inputs { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.validation-results { border: 1px solid #40516a; border-radius: 8px; padding: 10px; margin: 10px 0; }
+.validation-results dl { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 10px 0 0; gap: 5px; }
+.validation-results dt { color: #b6c6db; font-size: 12px; }
+.validation-results dd { margin: 3px 0 0; font-size: 17px; font-weight: 750; }
+
+@media (max-width: 1120px) {
+  .application-body { grid-template-columns: minmax(0, 1fr); }
+  .application-inspector { grid-template-columns: repeat(auto-fit, minmax(min(185px, 100%), 1fr)); }
+  .detector-layout { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+  .detector-upload { grid-column: 1 / -1; }
+}
+@media (max-width: 850px) {
+  .application-content, .cluster-workspace .manage-layout { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .cluster-workspace .resource-grid { grid-template-columns: minmax(0, 1fr); }
+  .app-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .application-overview { padding: 0; }
+  .application-rail .studio-tabs { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+}
+@media (max-width: 650px) {
+  .detector-layout, .dataset-inputs { grid-template-columns: minmax(0, 1fr); }
+  .vision-studio .studio-steps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .vision-studio .studio-steps button { flex-direction: column; gap: 3px; padding: 5px 2px; line-height: 1.1; }
+  .validation-results dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
