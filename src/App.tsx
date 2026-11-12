@@ -1,45 +1,24 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { Activity, ArrowRight, Boxes, Check, Copy, Cpu, Layers3, Link2, LogOut, Pause, Play, Plus, RefreshCw, Settings, Shield, Trash2, Users, X } from 'lucide-react'
+import { ArrowRight, Copy, Cpu, RefreshCw, Settings, Shield, X } from 'lucide-react'
 import { PeerMeshNode } from './peer'
 import { HolderCustody } from './custody'
 import { executeRepair, type RepairTask } from './repair'
 import { api, getIdentity, isRevokedAccess } from './api'
 import { ComputeRunner, type RunnerState } from './compute-runner'
 import { ContributorControls } from './ContributorControls'
-import { WorkspaceNav, type Workspace } from './WorkspaceNav'
+import { MeshBrand, WorkspaceNav, type Workspace } from './WorkspaceNav'
 import { AccountApplications } from './AccountApplications'
+import { ClusterWorkspace, type Cluster, type ClusterInvite as ActiveInvite, type ClusterMember as Member } from './ClusterWorkspace'
 import { allContributionSettings, forgetNode, getNodeTokens, isRemembered, rememberNode, saveContributionSettings, setNodeToken, subscribeContributionSettings, type ContributionSettings } from './contribution-settings'
-import type { ClusterNode as Node, ComputeCheckpoint, ComputeJob } from './compute-types'
+import type { ClusterNode as Node, ComputeJob } from './compute-types'
 import { reconstruct2Plus1, sha256Hex, type EncodedShard } from './sharding'
 
-type Cluster = { id: string; name: string; role: 'owner' | 'member'; members: number; nodes: number; online_nodes: number }
-type Member = { id: string; role: 'owner' | 'member' }
-type ActiveInvite = { token: string; expires_at: number; project_name?: string | null; ml_only?: boolean }
 type InvitePreview = { cluster_id: string; cluster_name: string; expires_at: number; project_name?: string | null }
 type NodeCreated = { node: Node; token: string }
 type BrowserNodeConnection = { clusterId: string; paused: boolean; hasLock: boolean; lockPending: boolean; releaseLock: (() => void) | null; url: string; socket: WebSocket | null; retryTimer: number | null; heartbeatTimer: number | null; stableTimer: number | null; attempts: number; stopped: boolean; peerMesh: PeerMeshNode | null; custody: HolderCustody | null; repairRunning: string | null }
 type UiDialog =
   | { kind: 'input'; title: string; description: string; label: string; value: string; placeholder?: string; submitLabel: string; onSubmit: (value: string) => void }
   | { kind: 'confirm'; title: string; description: string; confirmLabel: string; requiredValue?: string; onConfirm: () => void }
-
-function checkpointHealth(job: ComputeJob) {
-  const checkpoint = job.checkpoints[job.checkpoints.length - 1]
-  if (!checkpoint) return ''
-  const label = checkpoint.durability === 'healthy' ? 'Healthy' : checkpoint.durability === 'degraded' ? 'Degraded' : 'Unavailable'
-  return `${label} · ${checkpoint.available_shards}/${checkpoint.shards.length} holders online · ${checkpoint.verified_holders} verified holder receipts`
-}
-
-function checkpointDiagnostics(checkpoint: ComputeCheckpoint) {
-  const execution = checkpoint.execution
-  const capture = execution?.gpu_readback_ms === undefined ? '' : `, readback ${execution.gpu_readback_ms.toFixed(1)} ms (within compute, ${execution.gpu_buffers_reused ? 'reused buffers' : 'fresh buffers'})`
-  const attempt = checkpoint.attempt
-  const timings = execution ? `${execution.execution_mode} · self-reported: compute ${execution.compute_ms.toFixed(1)} ms${capture}, CPU validation ${execution.validation_ms.toFixed(1)} ms, encoding ${execution.encoding_ms.toFixed(1)} ms, transfer ${execution.transfer_ms.toFixed(1)} ms${execution.fallback_reason ? ` · ${execution.fallback_reason}` : ''}` : 'Execution timings unavailable for this older checkpoint'
-  const reason = attempt?.previous_attempt_reason
-  const end = attempt?.previous_attempt_ended_at_ms
-  const failure = reason === 'disconnect' || reason === 'expiry'
-  const recovery = reason ? ` · previous attempt: ${reason}${failure && attempt?.failure_detected_at_ms != null && checkpoint.committed_at_ms != null ? ` · coordinator detection → commit ${Math.max(0,checkpoint.committed_at_ms-attempt.failure_detected_at_ms)} ms` : !failure && end != null && checkpoint.committed_at_ms != null ? ` → commit ${Math.max(0,checkpoint.committed_at_ms-end)} ms` : ''}` : ''
-  return `Worker ${checkpoint.worker_node_id?.slice(0,8) ?? 'unknown'}${attempt ? ` · generation ${attempt.generation}${attempt.previous_worker_id && attempt.previous_worker_id !== attempt.worker_id ? ' · different-worker takeover' : ''}` : ''} · ${timings}${recovery}`
-}
 
 function App() {
   const [workspace, setWorkspace] = useState<Workspace>(location.hash === '#applications' ? 'applications' : 'clusters')
@@ -50,6 +29,7 @@ function App() {
   }, [])
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [activeId, setActiveId] = useState('')
+  const [loadedClusterId, setLoadedClusterId] = useState('')
   const [nodes, setNodes] = useState<Node[]>([])
   const [members, setMembers] = useState<Member[]>([])
   const [invites, setInvites] = useState<ActiveInvite[]>([])
@@ -103,7 +83,7 @@ function App() {
       ])
       if (generation !== refreshGeneration.current || activeSelection.current !== nextId) return
       setNodes(nextNodes); setMembers(nextMembers)
-      setJobs(nextJobs); setInvites(nextInvites)
+      setJobs(nextJobs); setInvites(nextInvites); setLoadedClusterId(nextId)
       for (const [id, connection] of sockets.current) if (connection.clusterId === nextId && !nextNodes.some(node => node.id === id)) {
         stopContributor(id); forgetNode(id); stopBrowserNode(id)
       }
@@ -116,7 +96,7 @@ function App() {
         }
       }
       void restoreContributors(data, nextNodes).catch(() => setError('Could not restore a saved contributor; refresh to retry.'))
-    } else { setNodes([]); setMembers([]); setInvites([]); setJobs([]) }
+    } else { setNodes([]); setMembers([]); setInvites([]); setJobs([]); setLoadedClusterId('') }
   }
 
   useEffect(() => {
@@ -336,7 +316,6 @@ function App() {
     socket.addEventListener('open', () => {
       if (connection.stopped || sockets.current.get(id) !== connection) { socket.close(); return }
       socket.send(JSON.stringify({ type: 'authenticate', token: new URL(connection.url).searchParams.get('token') }))
-      setNotice(`${nameForNode(id)} connected`)
       if (connection.stableTimer !== null) window.clearTimeout(connection.stableTimer)
       connection.stableTimer = window.setTimeout(() => { connection.attempts = 0; connection.stableTimer = null }, 60000)
       connection.heartbeatTimer = window.setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send('{"type":"heartbeat"}') }, 15000)
@@ -633,17 +612,35 @@ function App() {
       <button className="manage-button" type="button" onClick={() => setShareLink('')}>Close link</button>
     </div>
   </section>
-  const brand = <a className="manage-brand" href="/"><span className="brand-glyph"><Layers3 size={18}/></span>Mesh</a>
-  const profileSlot = <div id="mesh-profile-slot" className="header-profile"/>
-  if (accountPath) return <div className="manage-app"><header className="manage-top">{brand}<WorkspaceNav current="applications"/>{profileSlot}</header><main className="manage-main application-main">
-    {sharedInvite}
-    {error && <p role="alert" className="feedback error">{error}</p>}
+  const currentWorkspace = accountPath ? 'applications' : workspace
+  const detailsReady = active?.id === loadedClusterId
+  const status = <>{error && <p role="alert" className="feedback error">{error}</p>}
     {notice && <p role="status" className="feedback success">{notice}</p>}
-    <AccountApplications {...accountActions}/>
-  </main></div>
+    {sharedInvite}</>
+
+  function deleteJob(job: ComputeJob) {
+    openConfirmDialog({
+      title: 'Delete job?',
+      description: 'Remove this job and its checkpoint metadata? Browser artifact bytes are retained until local storage is cleared.',
+      confirmLabel: 'Delete job',
+      onConfirm: () => void run(async () => {
+        await api(`/api/jobs/${job.id}`, { method: 'DELETE' })
+        await refreshClusters(activeSelection.current)
+      }),
+    })
+  }
+
   return <div className="manage-app">
-    <header className="manage-top">{brand}<WorkspaceNav current={workspace} onChange={setWorkspace}/><div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button>{profileSlot}</header>
-    <main className={`manage-main${workspace === 'applications' ? ' application-main' : ''}`}>
+    <header className="manage-top">
+      <MeshBrand/>
+      <WorkspaceNav current={currentWorkspace} onChange={accountPath ? undefined : setWorkspace}/>
+      <div className="header-utilities">
+        <div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div>
+        <button className="refresh-button" type="button" aria-label="Refresh" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={16}/></button>
+        <div id="mesh-profile-slot" className="header-profile"/>
+      </div>
+    </header>
+    <main className="manage-main workspace-main">
       {invite && <section className="resource-card join-card" aria-label="Cluster invitation">
         <h2>Invitation to {invite.cluster_name}</h2>
         {invite.project_name && <p>You’re invited to contribute to <strong>{invite.project_name}</strong>. Your browser receives the inputs for jobs it takes. Project compute access lasts until the link expires or the owner revokes it.</p>}
@@ -654,39 +651,32 @@ function App() {
           <button className="dismiss-button" disabled={joining} onClick={() => { setInvite(null); setJoinToken(''); history.replaceState({}, '', location.pathname) }} aria-label="Dismiss invitation"><X size={17}/></button>
         </div>
       </section>}
-      {sharedInvite}
-      <AccountApplications clusterId={active?.id} workspace={workspace} {...accountActions}
-        clusterPicker={clusters.length > 0 && <label className="cluster-picker">Compute cluster
+      <AccountApplications clusterId={accountPath ? undefined : active?.id} workspace={currentWorkspace} {...accountActions}
+        status={currentWorkspace === 'applications' ? status : undefined}
+        clusterPicker={!accountPath && clusters.length > 0 && <label className="cluster-picker">Compute cluster
           <select value={active?.id ?? ''} onChange={event => void run(() => refreshClusters(event.target.value))}>
             {clusters.map(cluster => <option key={cluster.id} value={cluster.id}>{cluster.name}</option>)}
           </select>
         </label>}/>
-      <div hidden={workspace !== 'clusters'} className="cluster-workspace">
-      <div className="manage-heading"><div><h1>Clusters</h1><p>Manage compute, connected browsers, and cluster access.</p></div><div className="heading-buttons"><button className="manage-button" onClick={openInviteDialog}><Link2 size={15}/>Join by invite</button><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>New cluster</button></div></div>
-      {error && <div className="feedback error">{error}</div>}{notice && <div className="feedback success"><Check size={14}/>{notice}</div>}
-      {busy ? <div className="empty-state">Connecting to coordinator…</div> : <div className="manage-layout">
-        <aside className="cluster-rail"><div className="rail-title">YOUR CLUSTERS <span>{clusters.length}</span></div>{clusters.map(c=><button key={c.id} className={`rail-cluster ${active?.id===c.id?'active':''}`} onClick={()=>void run(()=>refreshClusters(c.id))}><span className="rail-icon">{c.name.slice(0,2).toUpperCase()}</span><span className="rail-label"><b>{c.name}</b><small>{c.role} · {c.members} members</small></span><span className={`rail-state ${c.online_nodes?'online':''}`}/></button>)}{!clusters.length&&<p className="rail-empty">No clusters yet.</p>}</aside>
-        <section className="cluster-content">{!active ? <div className="empty-state"><div className="empty-symbol"><Boxes size={22}/></div><h2>Start your first cluster</h2><p>Create a pool, then invite members and register their nodes.</p><button className="manage-button primary" onClick={() => void createCluster()}><Plus size={16}/>Create cluster</button></div> : <>
-          <div className="cluster-summary"><div className="summary-ident"><span className="summary-icon">{active.name.slice(0,2).toUpperCase()}</span><div><div className="overline">{active.role === 'owner' ? 'OWNER' : 'MEMBER'} CLUSTER</div><h2>{active.name}</h2></div></div><div className="summary-actions">{active.role==='owner'?<><button className="manage-button" onClick={() => void makeInvite()}><Link2 size={15}/>Invite members</button><button className="manage-button" onClick={() => void renameCluster()}><Settings size={15}/>Rename</button><button className="manage-button danger" onClick={() => void deleteCluster()}><Trash2 size={15}/>Delete cluster</button></>:<button className="manage-button" onClick={() => void leaveCluster()}><LogOut size={15}/>Leave cluster</button>}</div></div>
-          <dl className="cluster-stats" aria-label="Cluster statistics">
-            <div><dt><Cpu size={15}/>Nodes online</dt><dd>{active.online_nodes}<small> / {active.nodes} registered</small></dd></div>
-            <div><dt><Users size={15}/>Members</dt><dd>{active.members}</dd></div>
-            <div><dt><Activity size={15}/>Unfinished compute jobs</dt><dd>{jobs.filter(job => job.cluster_id === active.id && job.completed_batches < job.total_batches).length}</dd></div>
-          </dl>
-          <div className="resource-grid"><article className="resource-card"><div className="card-heading"><div><h3><Cpu size={16}/>Nodes</h3><p>Machines registered to this cluster</p></div><div className="heading-buttons"><button className="manage-button small" disabled={nodes.filter(node=>node.online&&!node.paused&&node.holder_ready).length<2} onClick={() => void testPeerTransfer()}>Test P2P</button><button className="manage-button small primary" onClick={() => void createNode()}><Plus size={14}/>Add node</button></div></div>{nodes.length===0?<div className="table-empty">Start this browser or add a named node.</div>:<div className="node-list">{nodes.map(n=><div className="node-entry" key={n.id}><div className="node-row"><span className={`node-dot ${n.online&&!n.paused?'online':''}`}/><div className="node-name"><b>{n.name}</b><small>{n.paused?'Paused':n.online?(n.holder_ready?'Connected · storage verified':'Connected · refresh to enable storage verification'):'Offline'}{n.last_seen?` · seen ${new Date(n.last_seen*1000).toLocaleTimeString()}`:''}</small></div><button className="node-action" title={n.paused?'Resume':'Pause'} onClick={() => void toggleNode(n)}>{n.paused?<Play size={14}/>:<Pause size={14}/>}</button><button className="node-action danger" title="Remove node" onClick={() => void removeNode(n)}><Trash2 size={14}/></button></div>{getNodeTokens()[n.id]&&<ContributorControls settings={contributions[n.id]??settingsFor(n)} state={runnerStates[n.id]} remembered={isRemembered(n.id)} onToggle={()=>toggleContribution(n)} onChange={patch=>{updateContribution(n,patch)}} onRemember={remember=>{rememberNode(n.id,remember);setCredentialRevision(value=>value+1)}}/>}</div>)}</div>}</article>
-            <div className="cluster-inspector">
-          <div className="resource-card browser-quick-start">
-            <div><h3>Share compute from this browser</h3><p>{activeContributors.length ? 'Compute is enabled. Keep this tab open to contribute.' : 'Connect this tab as a node to contribute.'}</p></div>
-            {activeContributors.length > 0
-              ? <button className="manage-button" type="button" onClick={() => activeContributors.forEach(node => stopContributor(node.id))}>Stop this browser</button>
-              : <button className="manage-button primary" type="button" onClick={() => void run(() => startThisBrowser(active.id))}>Start this browser</button>}
-          </div>
-            <article className="resource-card"><div className="card-heading"><div><h3><Users size={16}/>Members</h3><p>People with access to this cluster</p></div><span className="count-chip">{members.length}</span></div><div className="member-list">{members.map(m=><div className="member-row" key={m.id}><span className="member-avatar">{m.role==='owner'?'O':'M'}</span><div className="node-name"><b>{m.role==='owner'?'Cluster owner':m.id}</b><small>{m.role==='owner'?'Full cluster control':'Contributor access'}</small></div><span className={`role-chip ${m.role}`}>{m.role}</span>{active.role==='owner'&&m.role!=='owner'&&<button className="node-action danger" title="Remove member" onClick={()=>void removeMember(m)}><Trash2 size={14}/></button>}</div>)}</div>{active.role==='owner'&&<div className="invite-management"><div className="invite-management-title">ACTIVE INVITES <span>{invites.length}</span></div>{invites.length?invites.map(inv=><div className="invite-row" key={inv.token}><span className="invite-key"><Link2 size={12}/>{inv.project_name ? inv.project_name + (inv.ml_only ? ' ML contributor' : ' contributor') : 'Cluster invite'}</span><span className="invite-expiry">expires {new Date(inv.expires_at*1000).toLocaleDateString()}</span><button className="node-action danger" title="Revoke invite" onClick={()=>void revokeInvite(inv)}><X size={13}/></button></div>):<div className="no-invites">No active links. Create one with Invite members.</div>}</div>}<div className="member-footnote">Removing a member also disconnects their nodes.</div></article></div></div>
-          <article className="resource-card job-card"><div className="card-heading"><div><h3><Activity size={16}/>Cluster demo jobs</h3><p>Run CPU or WebGPU diagnostics and inspect recoverable checkpoints.</p></div><div className="heading-buttons"><button className="manage-button small" onClick={() => void createComputeJob('cpu-hash')}>Create CPU demo</button><button className="manage-button small primary" onClick={() => void createComputeJob('vector-add')}>Create WebGPU job</button></div></div>{jobs.length===0?<div className="table-empty">Create a bounded CPU or WebGPU vector-add workload to exercise leases and recoverable checkpoints.</div>:<div className="job-list">{jobs.map(job=>{const done=job.completed_batches>=job.total_batches;const percent=Math.floor((job.completed_batches/job.total_batches)*100);const online=nodes.filter(node=>node.online&&!node.paused&&node.holder_ready).length;return <div className="job-row" key={job.id}><div className="job-title"><b>{job.workload==='vector-add'?'Vector addition (WebGPU with CPU fallback)':'Deterministic CPU hash'}</b><small>{job.total_units.toLocaleString()} elements · {job.completed_batches}/{job.total_batches} batches · {done?'Complete':'Available'}{job.checkpoints.length?` · ${job.checkpoints.length} recoverable checkpoint(s)`:''}</small>{job.checkpoints.length>0&&<><small className="checkpoint-durability">{checkpointHealth(job)}</small><small className="execution-diagnostics">{checkpointDiagnostics(job.checkpoints[job.checkpoints.length-1])}</small></>}<div className="job-progress"><span style={{width:`${percent}%`}}/></div></div><div className="heading-buttons">{active.role==='owner'&&<button aria-label="Delete job" title="Delete job" className="icon-button" onClick={()=>openConfirmDialog({title: 'Delete job?', description: 'Remove this job and its checkpoint metadata? Browser artifact bytes are retained until local storage is cleared.', confirmLabel: 'Delete job', onConfirm: ()=>{void run(async()=>{await api(`/api/jobs/${job.id}`,{method:'DELETE'});await refreshClusters(activeSelection.current)})}})}><Trash2 size={16}/></button>}{job.checkpoints.some(checkpoint=>checkpoint.shards.length>0)&&<button className="manage-button small" onClick={()=>void restoreLatestCheckpoint(job)}>Test restore</button>}<button className="manage-button small" disabled={done||online<2||runningJobIds.includes(job.id)} onClick={() => void runComputeJob(job)}>{done?'Complete':runningJobIds.includes(job.id)?'Running…':'Run on this node'}</button></div></div>})}</div>}</article>
-          <details className="cluster-recovery-help"><summary>How checkpoints recover</summary><p>With two nodes, Mesh stores full copies. With three, it prefers two data shards plus XOR parity. Choose Test restore on a checkpoint to fetch verified shards and reconstruct the original artifact.</p></details>
-        </>}</section>
-      </div>}
-      </div><footer className="manage-footer">Mesh early access <span>·</span> Cluster state is saved by the coordinator</footer>
+      <div hidden={currentWorkspace !== 'clusters'}>
+        <ClusterWorkspace active={active} clusters={clusters} nodes={detailsReady ? nodes : []}
+          jobs={jobs.filter(job => job.cluster_id === active?.id)} members={detailsReady ? members : []}
+          invites={detailsReady ? invites : []} detailsReady={detailsReady} busy={busy} error={error} notice={notice}
+          shareLink={currentWorkspace === 'clusters' ? sharedInvite : null}
+          runningJobIds={runningJobIds} browserContributing={detailsReady && activeContributors.length > 0}
+          renderContributor={node => localTokens[node.id] && <ContributorControls
+            settings={contributions[node.id] ?? settingsFor(node)} state={runnerStates[node.id]} remembered={isRemembered(node.id)}
+            onToggle={() => toggleContribution(node)} onChange={patch => updateContribution(node, patch)}
+            onRemember={remember => { rememberNode(node.id, remember); setCredentialRevision(value => value + 1) }}/>}
+          actions={{
+            select: id => void run(() => refreshClusters(id)),
+            create: createCluster, join: openInviteDialog, invite: makeInvite, rename: renameCluster, delete: deleteCluster, leave: leaveCluster,
+            addNode: createNode, toggleNode, removeNode, removeMember, revokeInvite, testPeer: testPeerTransfer,
+            createJob: createComputeJob, deleteJob, runJob: runComputeJob, restore: restoreLatestCheckpoint,
+            startBrowser: () => { if (active) void run(() => startThisBrowser(active.id)) },
+            stopBrowser: () => activeContributors.forEach(node => stopContributor(node.id)),
+          }}/>
+      </div>
     </main>
     {nodeCredentials && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setNodeCredentials(null)}}><section className="credentials-dialog"><button className="dialog-close" onClick={()=>setNodeCredentials(null)} aria-label="Close"><X size={17}/></button><div className="dialog-icon"><Cpu size={19}/></div><div className="overline">NODE REGISTERED</div><h2>{nodeCredentials.name}</h2><p>This tab connects the browser node to the coordinator and its cluster peers. Keep it open while the node is online.</p><div className="credential-value">{nodeCredentials.key}</div><button className="manage-button primary full-width" onClick={()=>void copy(nodeCredentials.key)}><Copy size={15}/>Copy node connection key</button><div className="credential-hint">Save this server-generated key securely. It is a bearer credential for this node. Use Contribute compute on this node to opt into cluster jobs. Remember this device is optional.</div></section></div>}
     {dialog && <div className="dialog-shade" onMouseDown={e=>{if(e.target===e.currentTarget)setDialog(null)}}><form className="credentials-dialog app-dialog" role="dialog" aria-modal="true" aria-labelledby="app-dialog-title" onSubmit={submitDialog}><button type="button" className="dialog-close" onClick={()=>setDialog(null)} aria-label="Close dialog"><X size={17}/></button><div className="dialog-icon">{dialog.kind==='input'?<Settings size={19}/>:<Shield size={19}/>}</div><div className="overline">{dialog.kind==='input'?'CLUSTER MANAGEMENT':'CONFIRM ACTION'}</div><h2 id="app-dialog-title">{dialog.title}</h2><p>{dialog.description}</p>{(dialog.kind==='input'||dialog.requiredValue)&&<><label className="field-label" htmlFor="app-dialog-value">{dialog.kind==='input'?dialog.label:'Type DELETE to confirm'}</label><input id="app-dialog-value" className="text-input" autoFocus value={dialogValue} onChange={e=>setDialogValue(e.target.value)} placeholder={dialog.kind==='input'?dialog.placeholder:dialog.requiredValue} data-testid="app-dialog-input" /></>}{dialog.kind==='confirm'&&<div className="credential-hint">Review this action before continuing.</div>}<div className="heading-buttons dialog-actions"><button type="button" className="manage-button" onClick={()=>setDialog(null)}>Cancel</button><button type="submit" className={`manage-button primary ${dialog.kind==='confirm'?'danger':''}`} disabled={dialog.kind==='input'?!dialogValue.trim():dialog.requiredValue!==undefined&&dialogValue!==dialog.requiredValue} data-testid="app-dialog-submit">{dialog.kind==='input'?dialog.submitLabel:dialog.confirmLabel}</button></div></form></div>}

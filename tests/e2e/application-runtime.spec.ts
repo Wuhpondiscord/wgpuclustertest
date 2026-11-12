@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { test, expect, type Browser } from '@playwright/test'
+import { test, expect, type Browser, type Locator } from '@playwright/test'
 import type { ApplicationJob } from '../../src/application-types'
 const origin = 'http://127.0.0.1:5173'
 const manifest = JSON.parse(readFileSync(new URL('../../mesh.json', import.meta.url), 'utf8'))
@@ -16,6 +16,11 @@ test.beforeAll(async () => {
   session = account.session
   await api('/api/account/activate', 'POST')
 })
+async function chooseDeploymentAction(panel: Locator, name: 'Run deployment' | 'Edit deployed workflow') {
+  await panel.getByLabel('Deployment actions', { exact: true }).click()
+  await panel.getByRole('button', { name, exact: true }).click()
+}
+
 async function fixture(browser: Browser) {
   const cluster = await api<{ id: string }>('/api/clusters', 'POST', { name: 'application runtime e2e' })
   const app = await api<{ id: string }>(`/api/clusters/${cluster.id}/applications`, 'POST', { name: 'Browser runtime', slug: `runtime-${randomBytes(4).toString('hex')}` })
@@ -150,7 +155,7 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
     await page.getByRole('link', { name: 'Applications', exact: true }).click()
   await page.getByRole('button', { name: 'Browser runtime · owner', exact: true }).click()
     await expect(panel.getByText(manifest.name, { exact: true })).toBeVisible()
-    await panel.getByRole('button', { name: 'Run deployment', exact: true }).click()
+    await chooseDeploymentAction(panel, 'Run deployment')
     const output = page.getByTestId('application-job')
     await expect(output.getByTestId('application-job-status')).toHaveText(['completed', 'completed'], { timeout: 60_000 })
     const jobs = await api<ApplicationJob[]>(`/api/applications/${f.app.id}/jobs`)
@@ -332,9 +337,20 @@ test('application studio separates cluster controls and edits deployed workflow 
     const page = f.page
     await expect(page.getByRole('button', { name: 'New cluster', exact: true })).toBeHidden()
     const panel = page.getByRole('region', { name: 'Application deployment' })
+    const menu = page.getByRole('complementary', { name: 'Application menu' })
+    const context = page.getByRole('complementary', { name: 'Application context' })
+    await page.setViewportSize({ width: 1440, height: 1000 })
+    await expect(menu.getByRole('button', { name: 'Deployments', exact: true })).toHaveAttribute('aria-pressed', 'true')
+    const [rail, content, inspector] = await Promise.all([menu.boundingBox(), panel.boundingBox(), context.boundingBox()])
+    expect(rail?.x).toBe(0)
+    expect(rail!.x + rail!.width).toBeLessThan(content!.x)
+    expect(content!.x + content!.width).toBeLessThan(inspector!.x)
+    await page.setViewportSize({ width: 820, height: 1000 })
+    await expect(menu.getByRole('navigation', { name: 'Application tools' })).toBeVisible()
+    await page.setViewportSize({ width: 1440, height: 1000 })
     await panel.getByRole('button', { name: 'Load sample workflow' }).click()
     await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
-    await expect(panel.getByRole('button', { name: 'Edit deployed workflow' })).toBeVisible()
+    await expect(panel.getByLabel('Deployment actions', { exact: true })).toBeVisible()
     const summary = page.getByRole('definition').filter({ hasText: 'Numerical checks' })
     await expect(summary).toBeVisible()
     await expect(page.getByRole('complementary', { name: 'Application context' }).getByRole('link', { name: 'application runtime e2e' })).toHaveAttribute('href', new RegExp(`cluster=${f.cluster.id}`))
@@ -344,7 +360,7 @@ test('application studio separates cluster controls and edits deployed workflow 
       await page.screenshot({ path: 'test-results-ui/applications-desktop.png' })
     }
     const before = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
-    await panel.getByRole('button', { name: 'Edit deployed workflow' }).click()
+    await chooseDeploymentAction(panel, 'Edit deployed workflow')
     const updated = { ...manifest, name: 'Edited numerical workflow' }
     await panel.getByLabel('Workflow JSON').fill(JSON.stringify(updated))
     await panel.getByRole('button', { name: 'Preview changes' }).click()
@@ -352,12 +368,13 @@ test('application studio separates cluster controls and edits deployed workflow 
     await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(updated.name, { exact: true })).toBeVisible()
     const after = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     expect(after.id).not.toBe(before.id)
-    await panel.getByRole('button', { name: 'Edit deployed workflow' }).click()
+    await chooseDeploymentAction(panel, 'Edit deployed workflow')
     await api(`/api/applications/${f.app.id}/deployment`, 'POST', { expected_revision_id: after.id, source: { kind: 'upload' }, manifest: { ...updated, name: 'Changed in another tab' } })
     await panel.getByRole('button', { name: 'Preview changes' }).click()
     await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
     await expect(panel.getByRole('alert')).toContainText('changed')
-    await page.getByRole('button', { name: 'Access & settings' }).click()
+    await context.getByRole('button', { name: 'Manage access' }).click()
+    await expect(menu.getByRole('button', { name: 'Access & settings' })).toHaveAttribute('aria-pressed', 'true')
     await page.getByLabel('New application name').fill('Updated project')
     await page.getByRole('button', { name: 'Save application name' }).click()
     await expect(page.getByRole('heading', { name: 'Updated project', exact: true })).toBeVisible()
@@ -426,6 +443,7 @@ test('vision studio trains a boxed dataset on a real browser worker and reloads 
     await page.screenshot({ path: 'test-results-ui/vision-studio-mobile.png', fullPage: true })
     await page.reload()
     await page.getByRole('button', { name: 'Browser runtime · owner', exact: true }).click()
+    await page.getByRole('button', { name: 'Application menu', exact: true }).click()
     await page.getByRole('button', { name: 'Vision studio', exact: true }).click()
     await expect(page.getByRole('button', { name: 'Download deployed detector' })).toBeVisible()
     expect((await api<{ id: string }>(`/api/applications/${f.app.id}/detector`)).id).toBe(deployment.id)

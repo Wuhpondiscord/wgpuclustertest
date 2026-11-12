@@ -1,8 +1,8 @@
 # Persistent browser contributors
 
-Register a browser node, wait for **Connected · storage verified**, and click **Contribute compute** on that device. Opt-in is per node. Participation continues while the tab is open, including when the queue is empty or every remaining batch is leased elsewhere. **Stop contributing** cancels its current attempt and releases the exact lease when the coordinator can be reached.
+Open **Clusters → Workers**, register a browser node, wait for **Connected · storage verified**, and click **Contribute compute** on that device. Opt-in is per node. Participation continues while the tab is open, including when the queue is empty or every remaining batch is leased elsewhere. **Stop contributing** cancels its current attempt and releases the exact lease when the coordinator can be reached.
 
-The runner discovers jobs in that node's cluster and processes one batch at a time. The manual **Run on this node** control runs a selected job using the same recovery machinery. Multiple participating nodes can claim independent batches. Their immutable checkpoints and the Rust generation/attempt/epoch checks prevent a late previous worker from replacing an accepted result.
+The runner discovers jobs in that node's cluster and processes one batch at a time. Open **Diagnostics** to test peer connections, create demo jobs, run a job manually with **Run on this node**, or test checkpoint restoration. Multiple participating nodes can claim independent batches. Their immutable checkpoints and the Rust generation/attempt/epoch checks prevent a late previous worker from replacing an accepted result.
 
 ## Device controls
 

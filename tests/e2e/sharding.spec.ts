@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { expect, test, type Browser, type BrowserContext } from '@playwright/test'
+import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test'
 
 const baseURL = 'http://127.0.0.1:5173'
 const ownerIdentity = () => randomBytes(32).toString('hex')
@@ -96,6 +96,13 @@ async function openPeer(browser: Browser, identity: string, nodeId: string, toke
   return { context, page }
 }
 
+async function openClusterView(page: Page, name: 'Workers' | 'Diagnostics' | 'Members & invites') {
+  const menu = page.getByRole('button', { name: 'Cluster menu', exact: true })
+  if (await menu.isVisible() && await menu.getAttribute('aria-expanded') !== 'true') await menu.click()
+  const nav = page.getByRole('navigation', { name: 'Cluster tools' })
+  await nav.getByRole('button', { name, exact: true }).click()
+}
+
 async function threePeerFixture(browser: Browser) {
   const identities = [ownerIdentity(), ownerIdentity(), ownerIdentity()]
   const clusterId = (await api<{ id: string }>(identities[0], '/api/clusters', 'POST', { name: 'three-device-preflight' })).id
@@ -138,6 +145,7 @@ test('maximum vector batches replan after holder ACK then finish with two device
       }
       await route.continue()
     })
+    await openClusterView(peers[0].page, 'Diagnostics')
     await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
     const current = await waitFor(() => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{
       batch_index: number; bytes: number; shards: Array<{ bytes: number }>
@@ -181,6 +189,7 @@ test('a surviving device resumes unfinished GPU job batches after the compute br
       if (route.request().postDataJSON().lease.task_id.endsWith(':1')) { signalInFlight(); return }
       await route.continue()
     })
+    await openClusterView(peers[0].page, 'Diagnostics')
     await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
     await inFlight
     const read = () => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{ batch_index: number; sha256: string }> }>>(identities[0], `/api/clusters/${clusterId}/jobs`)
@@ -189,6 +198,7 @@ test('a surviving device resumes unfinished GPU job batches after the compute br
     await waitFor(() => api<Array<{ id: string; online: boolean }>>(identities[1], `/api/clusters/${clusterId}/nodes`),
       nodesNow => nodesNow.some(node => node.id === nodes[0].node.id && !node.online), 'the compute worker to disconnect')
     await peers[1].page.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await openClusterView(peers[1].page, 'Diagnostics')
     await expect(peers[1].page.getByRole('button', { name: 'Run on this node' })).toBeEnabled()
     await peers[1].page.getByRole('button', { name: 'Run on this node' }).click()
     const completed = (await waitFor(read, jobs => jobs.some(item => item.id === job.id && item.completed_batches === 3), 'a surviving worker to reclaim and finish every batch', 90_000)).find(item => item.id === job.id)!
@@ -208,6 +218,7 @@ test('contributors survive more than a minute idle then automatically take over 
       if (route.request().postDataJSON().lease.task_id.endsWith(':1')) { held(); return }
       await route.continue()
     })
+    await openClusterView(peers[0].page, 'Diagnostics')
     await peers[0].page.getByRole('button', { name: 'Run on this node', exact: true }).click()
     await inFlight
     const read = () => api<Array<{ id: string; completed_batches: number; checkpoints: Array<{
@@ -230,7 +241,9 @@ test('contributors survive more than a minute idle then automatically take over 
     expect(takenOver.attempt.failure_detected_at_ms).not.toBeNull()
     expect(takenOver.attempt.previous_attempt_reason).toBe('disconnect')
     expect(takenOver.committed_at_ms).toBeGreaterThanOrEqual(takenOver.attempt.failure_detected_at_ms!)
-    await expect(peers[nodes.findIndex(node => node.node.id === takenOver.worker_node_id)].page.locator('.execution-diagnostics')).toContainText('coordinator detection → commit')
+    const recoveredPage = peers[nodes.findIndex(node => node.node.id === takenOver.worker_node_id)].page
+    await openClusterView(recoveredPage, 'Diagnostics')
+    await expect(recoveredPage.locator('.execution-diagnostics')).toContainText('coordinator detection → commit')
     expect(takenOver.attempt.reassigned_at_ms).toBeGreaterThanOrEqual(takenOver.attempt.failure_detected_at_ms!)
     expect(['webgpu', 'cpu-fallback']).toContain(takenOver.execution.execution_mode)
     expect(takenOver.execution.transfer_ms).toBeGreaterThanOrEqual(0)
@@ -463,9 +476,11 @@ test('contributor controls and execution diagnostics fit desktop and mobile layo
     await page.getByRole('button', { name: 'Contribute compute', exact: true }).click()
     await waitFor(() => api<Array<{ id: string; completed_batches: number }>>(fixture.identities[0], `/api/clusters/${fixture.clusterId}/jobs`),
       jobs => jobs.some(item => item.id === job.id && item.completed_batches === 1), 'execution diagnostics for the layout check')
+    await openClusterView(page, 'Diagnostics')
     await expect(page.locator('.execution-diagnostics')).toContainText('self-reported')
     await page.screenshot({ path: 'test-results-ui/contributor-controls-desktop.png', fullPage: true })
     await page.setViewportSize({ width: 390, height: 844 })
+    await openClusterView(page, 'Workers')
     await expect(page.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
     await expect(page.getByLabel('Contribution duty cycle', { exact: true })).toBeVisible()
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
@@ -548,6 +563,7 @@ test('every device checks every peer and the UI CPU demo completes and restores'
   const fixture = await threePeerFixture(browser)
   try {
     for (const { page } of fixture.peers) {
+      await openClusterView(page, 'Diagnostics')
       await page.getByRole('button', { name: 'Test P2P', exact: true }).click()
       await expect(page.getByText('Peer transfers verified to all 2 other connected node(s). Run this test on every device to check all network pairs.', { exact: true })).toBeVisible({ timeout: 45_000 })
       await expect(page.locator('.feedback.error')).toHaveCount(0)
@@ -618,16 +634,46 @@ test('a different peer cannot replace transfer metadata or inject chunks', async
   expect(outcome.bytes).toEqual([1, 2, 3])
 })
 
-test('cluster creation uses an in-app form instead of browser prompts', async ({ page }) => {
+test('the root cluster menu creates a cluster and exposes worker, diagnostic and access views', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByText('Coordinator online')).toBeVisible()
-  await page.getByRole('button', { name: 'New cluster' }).click()
+  const rail = page.getByRole('complementary', { name: 'Cluster menu' })
+  await expect(rail.getByRole('button', { name: 'Join by invite' })).toBeVisible()
+  expect((await rail.boundingBox())?.x).toBe(0)
+  await rail.getByRole('button', { name: 'New cluster' }).click()
   const dialog = page.getByRole('dialog')
   await expect(dialog.getByRole('heading', { name: 'Create a cluster' })).toBeVisible()
   await dialog.getByLabel('Cluster name').fill('modal-smoke-test')
   await dialog.getByRole('button', { name: 'Create cluster' }).click()
   await expect(page.getByRole('heading', { name: 'modal-smoke-test' })).toBeVisible()
   await expect(page.getByText('Created “modal-smoke-test”')).toBeVisible()
+
+  const tools = rail.getByRole('navigation', { name: 'Cluster tools' })
+  const workers = page.getByRole('region', { name: 'Cluster workers' })
+  const inspector = page.getByRole('complementary', { name: 'Cluster context' })
+  await expect(tools.getByRole('button', { name: 'Workers' })).toHaveAttribute('aria-pressed', 'true')
+  await expect(workers.getByRole('button', { name: 'Add node' })).toBeVisible()
+  await expect(inspector.getByRole('button', { name: 'Start this browser' })).toBeVisible()
+  if (process.env.MESH_TEST_PREVIEW) await page.screenshot({ path: 'test-results-ui/clusters-redesign-desktop.png' })
+  await inspector.getByRole('button', { name: 'Invite members' }).click()
+  const share = page.getByRole('region', { name: 'Share invite link' })
+  await expect(share.getByLabel('Invite link')).toHaveValue(/\?invite=/)
+  await share.getByRole('button', { name: 'Close link' }).click()
+  await inspector.getByRole('button', { name: 'View active invites' }).click()
+  const invites = page.getByRole('region', { name: 'Active invites' })
+  await invites.getByRole('button', { name: 'Revoke invite' }).click()
+  await page.getByRole('dialog', { name: 'Revoke invite?' }).getByRole('button', { name: 'Revoke invite' }).click()
+  await expect(invites).toContainText('No active links.')
+  await openClusterView(page, 'Diagnostics')
+  await expect(page.getByRole('button', { name: 'Test P2P' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Create WebGPU job' })).toBeVisible()
+  await expect(workers).toBeHidden()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await openClusterView(page, 'Members & invites')
+  await expect(page.getByRole('region', { name: 'Active invites' })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Cluster demo jobs' })).toBeHidden()
+  await expect(page.getByRole('button', { name: 'Cluster menu', exact: true })).toHaveAttribute('aria-expanded', 'false')
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true)
 
   const identity = await page.evaluate(() => localStorage.getItem('mesh.identity') ?? '')
   const clusters = await api<Array<{ id: string; name: string }>>(identity, '/api/clusters')
@@ -653,8 +699,10 @@ test('reconnecting an older cluster node preserves the selected cluster', async 
       })
     })
     context = peer.context
+    await peer.page.getByLabel('Switch cluster', { exact: true }).click()
     await peer.page.getByRole('button', { name: /older-node-cluster owner/ }).click()
     await expect(peer.page.getByText('Connected · storage verified')).toBeVisible()
+    await peer.page.getByLabel('Switch cluster', { exact: true }).click()
     await peer.page.getByRole('button', { name: /selected-cluster owner/ }).click()
     await expect(peer.page.getByRole('heading', { name: 'selected-cluster', exact: true })).toBeVisible()
     await peer.page.evaluate(() => (window as unknown as { dropTestSockets: () => void }).dropTestSockets())
@@ -692,6 +740,7 @@ test('reconstructs a 2+1 checkpoint after one peer goes offline', async ({ brows
     const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', {
       workload: 'vector-add', total_units: 100_000, batch_units: 100_000,
     })
+    await openClusterView(peers[0].page, 'Diagnostics')
     const runButton = peers[0].page.getByRole('button', { name: 'Run on this node' })
     await expect(runButton).toBeEnabled()
     await runButton.click()
@@ -744,6 +793,7 @@ test('keeps a large checkpoint recoverable when a peer disconnects mid-transfer'
     const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', {
       workload: 'vector-add', total_units: 100_000, batch_units: 100_000,
     })
+    await openClusterView(peers[0].page, 'Diagnostics')
     await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
     const transferNotice = peers[0].page.locator('.feedback.success').filter({ hasText: 'Sending checkpoint artifact' })
     await expect(transferNotice).toBeVisible({ timeout: 45_000 })
@@ -809,6 +859,7 @@ test('renews a lease through a slow commit and a temporary renewal failure', asy
       await new Promise(resolve => setTimeout(resolve, 52_000))
       await route.continue()
     })
+    await openClusterView(peers[0].page, 'Diagnostics')
     await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
     const jobs = await waitFor(() => api<Array<{ id: string; completed_batches: number }>>(identity, `/api/clusters/${clusterId}/jobs`),
       jobs => jobs.some(item => item.id === job.id && item.completed_batches === 1), 'a checkpoint committed beyond its original lease deadline', 90_000)
@@ -888,6 +939,7 @@ test(`repairs ${workload} checkpoints onto a spare and survives a second origina
       nodes => nodes.length === identities.length && nodes.every(node => node.online), 'the live worker and spare nodes')
     const units = workload === 'vector-add' ? 100_000 : 1000
     const job = await api<{ id: string }>(identities[0], `/api/clusters/${clusterId}/jobs`, 'POST', { workload, total_units: units, batch_units: units })
+    await openClusterView(peers[0].page, 'Diagnostics')
     await peers[0].page.getByRole('button', { name: 'Run on this node' }).click()
     const read = () => api<Array<{ id: string; checkpoints: Checkpoint[] }>>(identities[0], `/api/clusters/${clusterId}/jobs`)
     const initial = (await waitFor(read, jobs => jobs.some(item => item.id === job.id && item.checkpoints[0]?.verified_holders === desiredHolders),
@@ -909,6 +961,7 @@ test(`repairs ${workload} checkpoints onto a spare and survives a second origina
     await api(identities[0], `/api/nodes/${second.node_id}/pause`, 'POST')
     const restorePage = desiredHolders === 3 ? peers[0].page : peers[created.findIndex(node => node.node.id === spare.node.id)].page
     await restorePage.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await openClusterView(restorePage, 'Diagnostics')
     await restorePage.getByRole('button', { name: 'Test restore' }).click()
     await expect(restorePage.getByText(`Recovered batch 1 from ${desiredHolders - 1} verified shard(s); full artifact SHA-256 matches.`, { exact: true })).toBeVisible({ timeout: 45_000 })
   } finally {
