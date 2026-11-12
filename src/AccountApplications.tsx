@@ -196,7 +196,7 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
             <p>Private management page · Browser job runtime</p>
           </div>
           <div className="application-context">
-            <span><Users size={16}/><b>{selected.members.length}</b> app members</span>
+            <span><Users size={16}/><b>{selected.members.length}</b> {selected.members.length === 1 ? 'app member' : 'app members'}</span>
           </div>
           {selected.role !== 'viewer' && <div className="application-actions">
             <button className="manage-button" disabled={busy} onClick={() => void run(() => startBrowser(selected.cluster_id))}>Contribute from this browser</button>
@@ -206,8 +206,8 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
         </header>
         <div hidden={currentTab !== 'vision'}><VisionStudio key={`vision-${selected.id}`} app={selected.id} role={selected.role} canShare={Boolean(selected.can_share_compute)}/></div>
         <div hidden={currentTab !== 'workflows'}>
-        <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
         <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role}/>
+        <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
         </div><div hidden={currentTab !== 'access'}>
         <div className="application-settings resource-card">
         <h3>Settings &amp; access</h3>

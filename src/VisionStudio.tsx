@@ -122,15 +122,9 @@ export function VisionStudio({ app, role, canShare }: { app: string; role: 'owne
   return <section className="vision-studio" aria-label="Object detection studio">
     <div className="studio-heading"><h3>Vision studio</h3><span className="context-chip">Preview</span></div>
     {role !== 'viewer' && <nav className="studio-steps" aria-label="Vision steps">{(['dataset', 'train', 'deploy'] as const).map((value, index) => <button key={value} type="button" aria-pressed={step === value} onClick={() => setStep(value)}>{index + 1} · {value === 'dataset' ? 'Label images' : value === 'train' ? 'Train & evaluate' : 'Deploy & test'}</button>)}</nav>}
-    <details className="studio-note"><summary>How this preview works</summary><p>Uses frozen MobileNetV4 features and a small prototype head. Cluster workers extract features for each region, then this tab fits the head. Detection searches 35 square windows per image and suppresses overlapping boxes. Small or crowded objects may be missed. Similarity scores are not probabilities.</p></details>
     {error && <p role="alert" className="feedback error">{error}</p>}{status && <p role="status">{status}</p>}
     {busy && <button className="manage-button" onClick={() => action.current?.abort()}>Cancel vision operation</button>}
     {role !== 'viewer' && <>
-      <ImageContributor app={app} purpose="Contribute to vision training and detection"/>
-      {canShare && <div><button className="manage-button" disabled={busy} onClick={() => void perform(async () => {
-        const invite = await api<{ token: string }>(`/api/applications/${app}/contributor-invites?ml_only=true`, { method: 'POST' })
-        setLink(`${location.origin}/#ml-invite=${invite.token}`)
-      })}>Invite vision contributors</button>{link && <label>Vision contributor link<input readOnly value={link} onFocus={event => event.currentTarget.select()}/></label>}</div>}
       <section className="studio-panel" hidden={step !== 'dataset'} aria-label="Vision dataset"><h4>Image dataset</h4>
         <p>Up to 32 images and 16 boxes per image. Images stay in this tab until you start a run. Export the dataset to save your annotations. Only cropped regions are sent to trusted contributors.</p>
         <div className="heading-buttons"><button className="manage-button" disabled={busy || images.length > 0} onClick={() => { setImages(sampleDataset()); setSelected(0); invalidate() }}>Load box detection sample</button><button className="manage-button" disabled={busy || !images.length} onClick={() => downloadJson('mesh-vision-dataset.json', { version: 1, images })}>Export labeled dataset</button></div>
@@ -209,5 +203,13 @@ export function VisionStudio({ app, role, canShare }: { app: string; role: 'owne
       }}/></label>}
       {role === 'owner' && <button className="manage-button" disabled={busy} onClick={() => void perform(async signal => { const value = await api<Saved | null>(endpoint, { signal }); setSaved(value); setLoaded(true); setDraft(null); setPrediction(null); setValidation(null); revision.current = value?.id ?? null })}>Reload deployed detector</button>}
     </section>
+    {role !== 'viewer' && <div className="vision-compute">
+      <ImageContributor app={app} purpose="Contribute to vision training and detection"/>
+      {canShare && <div><button className="manage-button" disabled={busy} onClick={() => void perform(async () => {
+        const invite = await api<{ token: string }>(`/api/applications/${app}/contributor-invites?ml_only=true`, { method: 'POST' })
+        setLink(`${location.origin}/#ml-invite=${invite.token}`)
+      })}>Invite vision contributors</button>{link && <label>Vision contributor link<input readOnly value={link} onFocus={event => event.currentTarget.select()}/></label>}</div>}
+    </div>}
+    <details className="studio-note"><summary>How this preview works</summary><p>Uses frozen MobileNetV4 features and a small prototype head. Cluster workers extract features for each region, then this tab fits the head. Detection searches 35 square windows per image and suppresses overlapping boxes. Small or crowded objects may be missed. Similarity scores are not probabilities.</p></details>
   </section>
 }

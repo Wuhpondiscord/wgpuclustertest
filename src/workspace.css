@@ -166,6 +166,7 @@
 .deployment-panel > h3, .studio-heading h3 { margin: 0; font-size: 20px; }
 .runtime-job { border-color: var(--mesh-border); background: #f9fbfe; }
 .runtime-job > button, .runtime-job > a { margin: 4px 8px 0 0; }
+.vision-compute { margin-top: 14px; }
 .studio-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
 .studio-steps { gap: 5px; margin: 14px 0; padding: 4px; border: 1px solid var(--mesh-border); border-radius: 9px; background: #f0f4fa; }
 .studio-steps button { text-align: center; padding: 8px 6px; background: transparent; border-color: transparent; border-radius: 6px; font-size: 13px; }
