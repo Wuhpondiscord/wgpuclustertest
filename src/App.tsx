@@ -635,7 +635,7 @@ function App() {
   </section>
   const brand = <a className="manage-brand" href="/"><span className="brand-glyph"><Layers3 size={18}/></span>Mesh</a>
   const profileSlot = <div id="mesh-profile-slot" className="header-profile"/>
-  if (accountPath) return <div className="manage-app"><header className="manage-top">{brand}<WorkspaceNav current="applications"/>{profileSlot}</header><main className="manage-main">
+  if (accountPath) return <div className="manage-app"><header className="manage-top">{brand}<WorkspaceNav current="applications"/>{profileSlot}</header><main className="manage-main application-main">
     {sharedInvite}
     {error && <p role="alert" className="feedback error">{error}</p>}
     {notice && <p role="status" className="feedback success">{notice}</p>}
@@ -643,7 +643,7 @@ function App() {
   </main></div>
   return <div className="manage-app">
     <header className="manage-top">{brand}<WorkspaceNav current={workspace} onChange={setWorkspace}/><div className={`control-badge ${coordinatorStatus}`}><i/>{coordinatorStatus === 'online' ? 'Coordinator online' : coordinatorStatus === 'offline' ? 'Coordinator unavailable' : 'Checking coordinator'}</div><button className="refresh-button" title="Refresh" onClick={() => void run(() => refreshClusters())}><RefreshCw size={15}/></button>{profileSlot}</header>
-    <main className="manage-main">
+    <main className={`manage-main${workspace === 'applications' ? ' application-main' : ''}`}>
       {invite && <section className="resource-card join-card" aria-label="Cluster invitation">
         <h2>Invitation to {invite.cluster_name}</h2>
         {invite.project_name && <p>You’re invited to contribute to <strong>{invite.project_name}</strong>. Your browser receives the inputs for jobs it takes. Project compute access lasts until the link expires or the owner revokes it.</p>}

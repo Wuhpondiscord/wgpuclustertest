@@ -55,6 +55,7 @@ test('an image batch uses invited browsers and recovers a disconnected MobileNet
   const guests = [await browser.newContext(), await browser.newContext()]
   const pages = await Promise.all(guests.map(context => context.newPage()))
   try {
+    await f.page.getByRole('button', { name: 'Runs', exact: true }).click()
     await f.page.getByText('Image classification (ML)', { exact: true }).click()
     await f.page.getByRole('button', { name: 'Share ML contributor link' }).click()
     const link = f.page.getByLabel('ML contributor link', { exact: true })
@@ -126,6 +127,7 @@ test('a guest joins from one link and passes the quick test without an account',
     await page.getByRole('button', { name: 'Join and contribute' }).click()
     await expect(page.getByRole('button', { name: 'Stop contributing', exact: true })).toBeVisible()
     expect(await page.evaluate(() => sessionStorage.getItem('mesh.account-session'))).toBeNull()
+    await f.page.getByRole('button', { name: 'Runs', exact: true }).click()
     await f.page.getByRole('button', { name: 'Run quick test' }).click()
     await expect(f.page.getByText('Test passed. The verified result is [5,7,9].', { exact: true })).toBeVisible()
   } finally {
@@ -141,7 +143,7 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
     const panel = page.getByRole('region', { name: 'Application deployment' })
     await panel.getByRole('button', { name: 'Load sample workflow', exact: true }).click()
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
-    await panel.getByRole('button', { name: 'Save deployment', exact: true }).click()
+    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
     await expect(panel.getByText(manifest.name, { exact: true })).toBeVisible()
     const saved = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     await page.reload()
@@ -158,12 +160,13 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
     expect(jobs.every(job => job.deployment?.revision_id === saved.id)).toBe(true)
 
     const uploaded = { ...manifest, name: 'Uploaded workflow' }
+    await page.getByRole('button', { name: 'Deployments', exact: true }).click()
     await panel.getByText('Replace deployment', { exact: true }).click()
     await panel.getByLabel('Upload mesh.json').setInputFiles({
       name: 'mesh.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(uploaded)),
     })
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
-    await panel.getByRole('button', { name: 'Replace deployment', exact: true }).click()
+    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
     await expect(panel.getByText(uploaded.name, { exact: true })).toBeVisible()
 
     const sha = 'a'.repeat(40)
@@ -183,8 +186,9 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
     await panel.getByLabel('Branch or commit').fill('main')
     await panel.getByRole('button', { name: 'Preview GitHub workflow', exact: true }).click()
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
+    await panel.getByText('Workflow preview', { exact: true }).click()
     await expect(panel.getByText(sha, { exact: true })).toBeVisible()
-    await panel.getByRole('button', { name: 'Replace deployment', exact: true }).click()
+    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
     await expect(panel.getByText(imported.name, { exact: true })).toBeVisible()
     const replacement = await api<{ id: string; source: unknown }>(`/api/applications/${f.app.id}/deployment`)
     expect(replacement.id).not.toBe(saved.id)
@@ -201,6 +205,7 @@ test('queued browser matrix jobs commit once after a lost response and scoped SD
       if (!dropped) { dropped = true; await route.fetch(); await route.abort(); return }
       await route.continue()
     })
+    await f.page.getByRole('button', { name: 'Runs', exact: true }).click()
     await f.page.getByLabel('Operation template').selectOption('matmul')
     await f.page.getByRole('button', { name: 'Queue application job', exact: true }).click()
     await expect(f.page.getByTestId('application-job-status')).toHaveText('completed', { timeout: 60_000 })
@@ -232,6 +237,7 @@ test('real pinned MiniLM embeddings execute only after model-download opt-in', a
   test.setTimeout(300_000)
   const f = await fixture(browser)
   try {
+    await f.page.getByRole('button', { name: 'Runs', exact: true }).click()
     await f.page.getByLabel('Operation template').selectOption('embedding')
     await f.page.getByLabel('Text to embed').fill('A cat sits on a mat.\nA kitten rests on a rug.\nThe stock exchange closed lower today.')
     await f.page.getByLabel('Result verification').selectOption('single')
@@ -327,7 +333,7 @@ test('application studio separates cluster controls and edits deployed workflow 
     await expect(page.getByRole('button', { name: 'New cluster', exact: true })).toBeHidden()
     const panel = page.getByRole('region', { name: 'Application deployment' })
     await panel.getByRole('button', { name: 'Load sample workflow' }).click()
-    await panel.getByRole('button', { name: 'Save deployment', exact: true }).click()
+    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
     await expect(panel.getByRole('button', { name: 'Edit deployed workflow' })).toBeVisible()
     const summary = page.getByRole('definition').filter({ hasText: 'Numerical checks' })
     await expect(summary).toBeVisible()
@@ -342,16 +348,16 @@ test('application studio separates cluster controls and edits deployed workflow 
     const updated = { ...manifest, name: 'Edited numerical workflow' }
     await panel.getByLabel('Workflow JSON').fill(JSON.stringify(updated))
     await panel.getByRole('button', { name: 'Preview changes' }).click()
-    await panel.getByRole('button', { name: 'Replace deployment', exact: true }).click()
+    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
     await expect(panel.getByText(updated.name, { exact: true })).toBeVisible()
     const after = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     expect(after.id).not.toBe(before.id)
     await panel.getByRole('button', { name: 'Edit deployed workflow' }).click()
     await api(`/api/applications/${f.app.id}/deployment`, 'POST', { expected_revision_id: after.id, source: { kind: 'upload' }, manifest: { ...updated, name: 'Changed in another tab' } })
     await panel.getByRole('button', { name: 'Preview changes' }).click()
-    await panel.getByRole('button', { name: 'Replace deployment', exact: true }).click()
+    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
     await expect(panel.getByRole('alert')).toContainText('changed')
-    await page.getByRole('button', { name: 'Settings & access' }).click()
+    await page.getByRole('button', { name: 'Access & settings' }).click()
     await page.getByLabel('New application name').fill('Updated project')
     await page.getByRole('button', { name: 'Save application name' }).click()
     await expect(page.getByRole('heading', { name: 'Updated project', exact: true })).toBeVisible()
@@ -366,7 +372,13 @@ test('vision studio trains a boxed dataset on a real browser worker and reloads 
   const f = await fixture(browser)
   try {
     const page = f.page
-    await page.getByRole('button', { name: 'Vision studio', exact: true }).click()
+    const overview = page.getByRole('region', { name: 'Vision Studio overview' })
+    if (process.env.MESH_TEST_PREVIEW) {
+      const deploymentPanel = page.getByRole('region', { name: 'Application deployment' })
+      await deploymentPanel.getByRole('button', { name: 'Load sample workflow' }).click()
+      await deploymentPanel.getByRole('button', { name: 'Publish revision' }).click()
+    }
+    await overview.getByRole('button', { name: 'Open labeling' }).click()
     const studio = page.getByRole('region', { name: 'Object detection studio' })
     await studio.getByRole('button', { name: 'Load box detection sample' }).click()
     await studio.getByRole('button', { name: 'Continue to training' }).click()
@@ -393,10 +405,20 @@ test('vision studio trains a boxed dataset on a real browser worker and reloads 
     await studio.getByRole('button', { name: 'Detect objects on cluster' }).click()
     await expect(studio.getByText('Detection complete using the deployed revision.', { exact: true })).toBeVisible({ timeout: 120_000 })
     await studio.getByRole('button', { name: 'Stop ML worker' }).click()
+    await page.getByRole('button', { name: 'Deployments', exact: true }).click()
+    await expect(overview.getByRole('article', { name: 'Label images summary' })).toContainText('6 training · 2 held out')
+    await expect(overview.getByRole('article', { name: 'Train and evaluate summary' })).toContainText('Precision')
+    await expect(overview.getByRole('img', { name: 'Last test image' })).toBeVisible()
     if (process.env.MESH_TEST_PREVIEW) {
       await page.setViewportSize({ width: 1440, height: 1000 })
       await page.evaluate(() => window.scrollTo(0, 0))
-      await page.screenshot({ path: 'test-results-ui/vision-studio-desktop.png' })
+      await page.screenshot({ path: 'test-results-ui/applications-light-desktop.png' })
+    }
+    await overview.getByRole('button', { name: 'Test detector' }).click()
+    await expect(studio.getByRole('button', { name: 'Detect objects on cluster' })).toBeVisible()
+    if (process.env.MESH_TEST_PREVIEW) {
+      await page.evaluate(() => window.scrollTo(0, 0))
+      await page.screenshot({ path: 'test-results-ui/vision-studio-light-desktop.png' })
     }
     await page.setViewportSize({ width: 390, height: 844 })
     const overflow = await page.evaluate(() => [...document.querySelectorAll('body *')].filter(element => element.getBoundingClientRect().right > innerWidth + 1).map(element => ({ tag: element.tagName, className: element.className, width: element.getBoundingClientRect().width, text: element.textContent?.slice(0, 60) })))

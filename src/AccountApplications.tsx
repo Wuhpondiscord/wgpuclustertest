@@ -1,8 +1,8 @@
 import { createPortal } from 'react-dom'
-import { Activity, ArrowLeft, Boxes, ChevronDown, FileCode2, Image as ImageIcon, Link2, LockKeyhole, Monitor, Settings2, Users } from 'lucide-react'
+import { Activity, ArrowLeft, Boxes, ChevronDown, FileCode2, Image as ImageIcon, Link2, LockKeyhole, Monitor, Play, Settings2, Users } from 'lucide-react'
 import { prepareAvatar } from './profile-picture'
 import { ApplicationRuntime } from './ApplicationRuntime'
-import { VisionStudio } from './VisionStudio'
+import { VisionOverview, VisionStudio, type VisionStage, type VisionStageRequest, type VisionSummary } from './VisionStudio'
 import { ImageBatchRuntime } from './ImageBatchRuntime'
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { api, setIdentity } from './api'
@@ -34,7 +34,9 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
   const [applications, setApplications] = useState<Application[]>([])
   const [runtimeSummary, setRuntimeSummary] = useState<{ appId: string; activeRuns: number } | null>(null)
   const [deploymentSummary, setDeploymentSummary] = useState<{ appId: string; name?: string; revision?: string } | null>(null)
-  const [studioTab, setStudioTab] = useState<'workflows' | 'vision' | 'access'>('workflows')
+  const [visionSummary, setVisionSummary] = useState<VisionSummary | null>(null)
+  const [visionRequest, setVisionRequest] = useState<VisionStageRequest | null>(null)
+  const [studioTab, setStudioTab] = useState<'workflows' | 'runs' | 'vision' | 'access'>('workflows')
   const [editName, setEditName] = useState('')
   const [selected, setSelected] = useState<Application | null>(null)
   const [mode, setMode] = useState<'signup' | 'login' | 'security' | 'profile' | null>(null)
@@ -169,10 +171,17 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
   const operators = selected?.members.filter(item => item.role === 'operator').length ?? 0
   const currentTab = studioTab === 'access' && selected?.role !== 'owner' ? 'workflows' : studioTab
   const tools = [
-    { id: 'workflows', label: 'Workflows & runs', icon: FileCode2 },
+    { id: 'workflows', label: 'Deployments', icon: FileCode2 },
+    { id: 'runs', label: 'Runs', icon: Play },
     { id: 'vision', label: 'Vision studio', icon: ImageIcon },
-    { id: 'access', label: 'Settings & access', icon: Settings2 },
+    { id: 'access', label: 'Access & settings', icon: Settings2 },
   ] as const
+  const openVisionStage = (stage: VisionStage) => {
+    if (!selected) return
+    setVisionRequest({ appId: selected.id, stage })
+    setStudioTab('vision')
+  }
+  const currentVision = visionSummary?.appId === selected?.id ? visionSummary : null
   return <section className="account-applications" aria-label="Account and private applications">
     {profileSlot && createPortal(controls, profileSlot)}
     {error && !mode && <p className="feedback error" role="alert">{error}</p>}
@@ -198,24 +207,31 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
       </div>}
       {selected && <article className="application-detail">
         <header className="application-overview">
-          <p className="app-breadcrumb"><span>Applications</span><span aria-hidden="true">/</span><span>{currentTab === 'vision' ? 'Vision studio' : currentTab === 'access' ? 'Settings & access' : 'Workflows & runs'}</span></p>
-          <div className="application-title"><h3>{selected.name}</h3><span className="context-chip"><LockKeyhole size={13}/>Private</span></div>
-          <p className="application-location">Private management page · Browser job runtime</p>
-          <a className="app-permalink" href={selected.url}>{selected.url}</a>
-          {currentTab === 'vision' && compute && <a className="app-compute-link" href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}><Monitor size={14}/>{compute.name}</a>}
+          <div className="application-title">
+            <h3>{selected.name}</h3>
+            <span className="context-chip"><LockKeyhole size={13}/>Private</span>
+            <a className="app-permalink" href={selected.url} aria-label="Open application URL" title="Open application URL"><Link2 size={16}/></a>
+          </div>
+          {compute && <p className="application-location">Compute cluster <a className="app-compute-link" href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}>{compute.name}</a></p>}
           <dl className="app-metrics" aria-label="Application summary">
             <div><dt><FileCode2 size={17}/>Workflow</dt><dd>{deployment ? deployment.name ?? 'None deployed' : '—'}</dd></div>
             <div><dt><Boxes size={17}/>Deployed revision</dt><dd>{deployment?.revision ?? '—'}</dd></div>
             <div><dt><Monitor size={17}/>Cluster workers</dt><dd>{compute ? `${compute.online_nodes} online / ${compute.nodes} registered` : '—'}</dd></div>
-            <div><dt><Activity size={17}/>Active application runs</dt><dd>{activeRuns ?? '—'}</dd></div>
+            <div><dt><Users size={17}/>Access status</dt><dd>{viewers} viewers · {operators} operators</dd></div>
           </dl>
         </header>
         <div className="application-body">
         <div className="application-primary">
-        <div hidden={currentTab !== 'vision'}><VisionStudio key={`vision-${selected.id}`} app={selected.id} role={selected.role} canShare={Boolean(selected.can_share_compute)}/></div>
-        <div hidden={currentTab !== 'workflows'}>
-        <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role} onRunsChange={setRuntimeSummary} onDeploymentChange={setDeploymentSummary}/>
-        <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
+        <div hidden={currentTab !== 'vision'}><VisionStudio key={`vision-${selected.id}`} app={selected.id} role={selected.role} canShare={Boolean(selected.can_share_compute)} stageRequest={visionRequest} onSummary={setVisionSummary}/></div>
+        <div hidden={currentTab !== 'workflows' && currentTab !== 'runs'}>
+          <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role}
+            view={currentTab === 'runs' ? 'runs' : 'workflows'}
+            onShowRuns={() => setStudioTab('runs')}
+            onRunsChange={setRuntimeSummary} onDeploymentChange={setDeploymentSummary}
+            visionOverview={<VisionOverview summary={currentVision} role={selected.role} openStage={openVisionStage}/>}/>
+          <div hidden={currentTab !== 'runs'}>
+            <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
+          </div>
         </div><div hidden={currentTab !== 'access'}>
         <div className="application-settings resource-card">
         <h3>Settings &amp; access</h3>
@@ -228,16 +244,17 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
         </div></div>
         </div>
         <aside className="application-inspector" aria-label="Application context" hidden={currentTab === 'vision'}>
-          {compute && <section className="inspector-card">
+          <section className="inspector-card">
             <h4><Monitor size={17}/>Compute source</h4>
-            <a href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}>{compute.name}</a>
-            <p>{compute.online_nodes} online / {compute.nodes} registered</p>
-          </section>}
+            {compute && <><a href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}>{compute.name}</a>
+            <p>{compute.online_nodes} online / {compute.nodes} registered</p></>}
+            <div className="inspector-status"><Activity size={16}/><span>Active application runs</span><b>{activeRuns ?? '—'}</b></div>
+          </section>
           {selected.role !== 'viewer' && <section className="inspector-card">
-            <h4><Link2 size={17}/>Contributors</h4>
-            <p>Start this browser or invite someone you trust to run jobs.</p>
+            <h4><Link2 size={17}/>Contributor link</h4>
+            <p>Invite a trusted worker to contribute compute to this application.</p>
+            {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}><Link2 size={15}/>Share contributor link</button>}
             <button className="manage-button" disabled={busy} onClick={() => void run(() => startBrowser(selected.cluster_id))}>Contribute from this browser</button>
-            {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}>Share contributor link</button>}
           </section>}
           <section className="inspector-card">
             <h4><Users size={17}/>App access</h4>
