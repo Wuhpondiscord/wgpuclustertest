@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, Ellipsis, Eye, Pencil, Play, X } from 'lucide-react'
 import { api, ApiError } from './api'
+import { ConfirmAction } from './ConfirmAction'
 import type { ApplicationInput, ApplicationJob } from './application-types'
 import template from '../mesh.json'
 
@@ -72,8 +73,9 @@ async function importFromGithub(value: string, ref: string): Promise<Candidate> 
   return { manifest, source: { kind: 'github', repository, commit } }
 }
 
-export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChange }: {
+export function ApplicationDeployment({ appId, appName, role, onQueued, onDeploymentChange }: {
   appId: string
+  appName: string
   role: 'owner' | 'operator' | 'viewer'
   onQueued: (jobs: ApplicationJob[]) => void
   onDeploymentChange: (summary: { appId: string; name?: string; revision?: string }) => void
@@ -90,6 +92,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const [confirmation, setConfirmation] = useState<'publish' | 'remove' | null>(null)
   const importDetails = useRef<HTMLDetailsElement>(null)
   const deploymentActions = useRef<HTMLDetailsElement>(null)
   const pendingRun = useRef<{ revision: string; key: string } | null>(null)
@@ -166,7 +169,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
     ? draftManifest.name : 'Workflow draft'
 
   return <section className="deployment-panel workspace-panel" aria-label="Application deployment">
-    <div className="workspace-panel-heading"><div><h2>Deployments</h2><p>Publish a workflow revision and run it on your cluster.</p></div></div>
+    <div className="workspace-panel-heading"><div><h3>Workflow deployment</h3><p>Preview and run the published workflow, or prepare a new revision.</p></div></div>
     {error && <p role="alert" className="feedback error">{error}</p>}
     {message && <p role="status" className="deployment-message">{message}</p>}
     {loaded && !active && !candidate && <div className="deployment-empty">
@@ -217,12 +220,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
           <pre>{JSON.stringify(active.manifest, null, 2)}</pre>
           <div className="deployment-actions">
             <a download="mesh.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(active.manifest, null, 2))}`}>Download deployed manifest</a>
-            {role === 'owner' && <button className="manage-button danger" type="button" disabled={busy} onClick={() => void perform(async () => {
-              await api(`${path}/${active.id}`, { method: 'DELETE' })
-              setActive(null)
-              setShowPublished(false)
-              setMessage('Deployment removed.')
-            })}>Remove deployment</button>}
+            {role === 'owner' && <button className="manage-button danger" type="button" disabled={busy} onClick={() => setConfirmation('remove')}>Remove deployment</button>}
           </div>
         </div>}
       </>}
@@ -231,7 +229,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
           <span className="context-chip"><Pencil size={14}/>Draft</span>
           <div className="deployment-ident"><strong>{draftName}</strong><small>Unpublished workflow</small></div>
           <div className="deployment-actions">
-            <button type="button" className="manage-button primary small" disabled={busy} onClick={() => void perform(deploy)}>Publish revision</button>
+            <button type="button" className="manage-button primary small" disabled={busy} onClick={() => setConfirmation('publish')}>Publish revision</button>
             <button type="button" className="manage-button small" aria-label="Discard preview" title="Discard preview" disabled={busy} onClick={() => setCandidate(null)}><X size={16}/></button>
           </div>
         </div>
@@ -276,5 +274,19 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
       </form>
     </details>}
     {!loaded && error && <button className="manage-button" type="button" disabled={busy} onClick={() => void perform(() => refresh())}>Reload deployment</button>}
+    {confirmation === 'publish' && candidate && <ConfirmAction title="Publish workflow revision?" action="Confirm publish revision"
+      onClose={() => setConfirmation(null)} onConfirm={() => void perform(deploy)}>
+      <p>Publish <strong>{draftName}</strong> to <strong>{appName}</strong>{active ? `, replacing revision ${active.id.slice(0, 8)}.` : '.'}</p>
+      <p>Queued jobs keep the revision they were submitted with.</p>
+    </ConfirmAction>}
+    {confirmation === 'remove' && active && <ConfirmAction title="Remove workflow deployment?" action="Confirm remove deployment" danger
+      onClose={() => setConfirmation(null)} onConfirm={() => void perform(async () => {
+        await api(`${path}/${active.id}`, { method: 'DELETE' })
+        setActive(null)
+        setShowPublished(false)
+        setMessage('Deployment removed.')
+      })}>
+      <p>Remove <strong>{active.manifest.name}</strong> (revision {active.id.slice(0, 8)}) from <strong>{appName}</strong>.</p>
+    </ConfirmAction>}
   </section>
 }

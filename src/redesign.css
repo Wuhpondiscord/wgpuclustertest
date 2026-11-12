@@ -1,34 +1,15 @@
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 [hidden] { display: none !important; }
 .workspace-nav { display: flex; gap: 6px; margin-right: auto; margin-left: 32px; }
 .workspace-nav a { color: var(--mesh-muted); text-decoration: none; font-weight: 700; padding: 10px 16px; border-radius: 9px; }
 .workspace-nav a[aria-current="page"] { color: var(--mesh-purple-deep); background: var(--mesh-pale); }
-.studio-heading h3 { font-size: 24px; margin: 10px 0; }
-.studio-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 22px 0; }
-.studio-steps span { background: var(--mesh-wash); color: var(--mesh-purple-deep); font-weight: 700; border-radius: 10px; padding: 16px; }
-.studio-note { color: var(--mesh-muted); font-size: 13px; line-height: 1.7; max-width: 85ch; }
-.studio-panel { border: 1px solid var(--mesh-border); padding: 22px; border-radius: 14px; margin: 22px 0; background: white; }
-.studio-panel h4 { margin: 0 0 16px; font-size: 18px; }
-.vision-studio label { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; font-weight: 600; }
-.vision-studio input:not([type="checkbox"]), .vision-studio select { padding: 10px; border-radius: 8px; border: 1px solid var(--mesh-border); background: white; width: 100%; min-width: 0; }
-.vision-studio label:has(input[type="checkbox"]) { flex-direction: row; align-items: center; }
-.vision-studio .manage-button { margin: 4px 6px 4px 0; }
-.vision-layout { display: grid; grid-template-columns: minmax(200px, 1.4fr) minmax(200px, 1fr); gap: 24px; align-items: start; }
-.vision-canvas { position: relative; width: 100%; max-width: 640px; margin: 16px 0; background: #181526; border-radius: 8px; overflow: hidden; line-height: 0; }
-.vision-canvas img { width: 100%; height: auto; display: block; }
-.vision-canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
-.vision-canvas rect { fill: #7c3aed20; stroke: #b6ff66; stroke-width: 0.6; }
-.vision-canvas rect.background-box { stroke: #ffcd66; fill: #ffcd6620; }
-.vision-canvas text { font-size: 3px; font-weight: 700; fill: white; stroke: #181526; stroke-width: 0.12; paint-order: stroke; }
 .manifest-editor { padding: 20px; margin: 20px 0; border: 1px solid var(--mesh-border); border-radius: 12px; background: var(--mesh-wash); }
 .manifest-editor label { display: block; font-weight: 700; }
 .manifest-editor textarea { width: 100%; min-height: 340px; resize: vertical; margin: 12px 0; padding: 16px; font: 13px/1.6 ui-monospace, monospace; border: 1px solid var(--mesh-border); border-radius: 8px; }
 @media (max-width: 700px) {
   .workspace-nav { margin-left: 10px; gap: 0; }
   .workspace-nav a { padding: 10px 8px; font-size: 13px; }
-  .vision-layout, .studio-steps { grid-template-columns: 1fr; }
-  .studio-panel { padding: 14px; }
   .manage-top .control-badge { display: none; }
 }
 
@@ -40,7 +21,7 @@ body {
   min-height: 100vh;
   background: var(--mesh-offwhite);
   color: var(--mesh-ink);
-  font-family: 'DM Sans', Inter, ui-sans-serif, system-ui, sans-serif;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -74,7 +55,7 @@ body {
   min-height: 100vh;
   background: var(--mesh-offwhite);
   color: var(--mesh-ink);
-  font-family: 'DM Sans', Inter, ui-sans-serif, system-ui, sans-serif;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
 }
 button, input { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
@@ -456,10 +437,3 @@ button { -webkit-tap-highlight-color: transparent; }
 .share-link input { min-width: 0; width: 100%; box-sizing: border-box; padding: 8px; }
 .runtime-job { margin: .75rem 0; padding: .75rem; border: 1px solid #344054; border-radius: 8px; }
 .runtime-job code { overflow-wrap: anywhere; font-size: 12px; }
-
-.vision-studio .manage-button { max-width: 100%; white-space: normal; height: auto; min-height: 36px; }
-.vision-layout > * { min-width: 0; }
-
-.studio-steps button { border: 1px solid var(--mesh-border); border-radius: 10px; background: white; padding: 14px; text-align: left; font-weight: 700; color: var(--mesh-muted); }
-.studio-steps button[aria-pressed="true"] { background: var(--mesh-pale); color: var(--mesh-purple-deep); border-color: var(--mesh-lavender); }
-.studio-note summary { cursor: pointer; padding: 10px 0; }

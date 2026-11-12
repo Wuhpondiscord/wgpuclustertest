@@ -4,19 +4,19 @@ The top navigation separates **Clusters** (members, nodes, contribution controls
 
 ## Edit a deployed workflow
 
-In **Applications → application → Workflows & runs**, choose **View deployed manifest** or **Edit deployed workflow**. Edit the JSON, preview, and save the replacement. The editor captures the original revision. A concurrent edit causes a conflict instead of overwriting someone else's work. Cancel the draft and reopen the deployed workflow to edit the newer revision. Running jobs retain the manifest revision they were queued from. Upload and public GitHub import remain available. This is a declarative workflow editor, not arbitrary code or web-page hosting.
+In **Applications → application → Deployments → Workflow**, choose **Preview** or use **Deployment actions → Edit deployed workflow**. Edit the JSON, preview it, and confirm **Publish revision**. The editor captures the original revision. A concurrent edit causes a conflict instead of overwriting someone else's work. Cancel the draft and reopen the deployed workflow to edit the newer revision. Running jobs retain the manifest revision they were queued from. Upload and public GitHub import remain available. This editor publishes declarative Mesh workflows.
 
-Use **Settings & access** to rename an application without changing its URL, manage explicit app members, or delete the application. Cluster membership alone does not grant access to its private application dashboard.
+Use **Access & settings** to rename an application without changing its URL, manage explicit app members, or delete the application. Cluster membership alone does not grant access to its private application dashboard.
 
 ## Train and deploy a detector
 
-1. Open **Vision studio**, start an ML worker, or use **Invite vision contributors**. Friends can open that link and start a worker without installing software or creating an account. Revoke contributor links in the cluster's Active invites.
-2. Load the included colored-block sample to exercise the flow, or add your own images. Draw boxes around every target object and choose a label. Label several regions containing none of the target objects as **background**. Numeric box controls support keyboard-only annotation. There can be one to four object classes, with at least two training boxes per class and two background boxes.
+1. Open **Deployments → Vision detector**. The three stages share the dataset, model draft and test results while the app is open.
+2. In **Label images**, load the colored-block sample or add your own images. Draw a box around each object and assign a class. Select a box to move, resize, relabel or delete it. **Box coordinates** supports keyboard-only editing. Add at least two training boxes per class and two labeled background boxes, with up to four object classes.
 3. Mark at least one different annotated image as **Held-out validation**. It is excluded from fitting. Use varied training images and a representative validation set. Identical image bytes cannot be in both splits.
-4. **Train detector on cluster** sends bounded RGB crops to the app's ML workers. Every crop is an independent leased task, with renewal, retry, expiry and fencing. The browser coordinator tab fits a small prototype head from returned features. Validation uses sliding-window predictions on held-out whole images, not the ground-truth crops.
+4. In **Train & evaluate**, start an ML worker or share an **Invite vision contributors** link. Friends can start a worker from that link without installing software or creating an account. **Train detector on cluster** sends bounded RGB crops to those workers. Each crop is independently leased and retryable. The management tab fits a small prototype head from returned features and measures sliding-window predictions on held-out images.
 5. Inspect the predicted boxes and precision/recall at IoU 0.5. These are single-threshold detection metrics, not mAP. A minimum similarity adjustment recomputes validation predictions. Once tuned, this validation set is no longer an independent test set.
-6. The application owner can **Deploy detector**. This saves the name, thresholds, class counts and compact learned prototypes in the encrypted coordinator snapshot. The backbone revision is pinned. Existing models remain active until a replacement saves successfully.
-7. Upload a genuinely new image under **Deployed detector**, then **Detect objects on cluster**. Download the normalized bounding boxes, labels, cosine similarity scores and model revision. Export/import the trained model to back it up or deploy it to another application. Remove a deployed model through the explicit confirmation control.
+6. Under **Deploy & test**, the application owner can review the draft and confirm **Publish detector**. The coordinator saves the name, thresholds, class counts and compact learned prototypes in its encrypted snapshot. The workflow and detector publish independently.
+7. Choose a new test image, then select **Detect objects on cluster**. Download the normalized bounding boxes, labels, cosine similarity scores and model revision. Use **Detector settings** to import a backup model or remove the published detector.
 
 ## What this model does
 
