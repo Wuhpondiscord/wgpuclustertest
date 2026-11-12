@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { api } from './api'
 import { ApplicationDeployment } from './ApplicationDeployment'
 import { ApplicationJobForm, quickTestInput } from './ApplicationJobForm'
@@ -7,9 +7,12 @@ import type { ApplicationJob } from './application-types'
 type RunSummary = { appId: string; activeRuns: number }
 type DeploymentSummary = { appId: string; name?: string; revision?: string }
 type AppKey = { id: string; label: string; expires_at: number; read_only: boolean }
-export function ApplicationRuntime({ appId, role, onRunsChange, onDeploymentChange }: {
+export function ApplicationRuntime({ appId, role, onRunsChange, onDeploymentChange, visionOverview, view, onShowRuns }: {
   appId: string
   role: 'owner' | 'operator' | 'viewer'
+  view: 'workflows' | 'runs'
+  onShowRuns: () => void
+  visionOverview: ReactNode
   onRunsChange: (summary: RunSummary) => void
   onDeploymentChange: (summary: DeploymentSummary) => void
 }) {
@@ -83,10 +86,15 @@ const job = await mesh.embeddings(['Your text here']);
 const result = await mesh.wait(job);
 console.log(result.output);`
   return <section className="application-runtime" aria-label="Browser application runtime">
+    <div className="workflow-surface" hidden={view !== 'workflows'}>
     <ApplicationDeployment appId={appId} role={role} onDeploymentChange={onDeploymentChange} onQueued={queued => {
       const ids = new Set(queued.map(job => job.id))
       setJobs(current => [...queued, ...current.filter(job => !ids.has(job.id))])
+      onShowRuns()
     }}/>
+    {visionOverview}
+    </div>
+    <div className="runs-surface" hidden={view !== 'runs'}>
     <section className="workspace-panel" aria-label="Browser jobs">
     <div className="workspace-panel-heading"><div><h3>Browser jobs</h3><p>Queue work and inspect results from this application’s workers.</p></div><span className="context-chip">{activeRuns} active</span></div>
     {error && <p role="alert" className="feedback error">{error}</p>}
@@ -117,6 +125,7 @@ console.log(result.output);`
     </section>
     <details className="workspace-panel sdk-panel"><summary>Developer SDK and asynchronous inference API</summary><p>POST <code>{base}/jobs</code> or <code>{base}/inference</code> returns 202 and a job ID. Poll its status URL. Use an application API key in the Authorization Bearer header; keep it on your backend, or enter it in a trusted local tool. A key embedded in a public website is public.</p><pre>{example}</pre><a href="/sdk/mesh-client.d.ts">SDK type declarations</a><p>Supported: vector_add, matmul, and minilm-l6-v2 text embeddings (384 dimensions, up to 4 texts, truncated to 128 tokens). Model weights are pinned and integrity checked. This is an asynchronous inference API; streaming chat is not implemented.</p></details>
     {role === 'owner' && <details className="workspace-panel sdk-panel"><summary>Application API keys</summary><p>Scoped to this app, expire after 30 days. Keys are shown once and stored as hashes. Revoke them here independently of your account key.</p><form className="application-form" onSubmit={event => { event.preventDefault(); void run(async () => { const value = await api<{ key: string }>(`${base}/keys`, { method: 'POST', body: JSON.stringify({ label, read_only: readOnly }) }); setIssued(value.key) }) }}><label>API key label<input value={label} maxLength={80} required onChange={event => setLabel(event.target.value)}/></label><label><input type="checkbox" checked={readOnly} onChange={event => setReadOnly(event.target.checked)}/>Read only</label><button className="manage-button" disabled={busy}>Generate application API key</button></form>{keys.map(key => <p key={key.id}>{key.label} · {key.read_only ? 'read only' : 'submit and read'} · expires {new Date(key.expires_at * 1000).toLocaleDateString()} <button className="manage-button small danger" disabled={busy} onClick={() => void run(async () => { await api(`${base}/keys/${key.id}`, { method: 'DELETE' }) })}>Revoke {key.label}</button></p>)}</details>}
+    </div>
     {issued && <div className="dialog-shade"><section ref={dialog} role="dialog" aria-modal="true" aria-label="Save application API key" className="credentials-dialog"><h2>Save application API key</h2><p>Shown once. Save it securely; closing this dialog hides it permanently. You can revoke and replace it if needed.</p><code className="account-secret">{issued}</code><button className="manage-button" onClick={() => void navigator.clipboard.writeText(issued).catch(() => setError('Clipboard unavailable; select and copy the key above'))}>Copy application key</button><button className="manage-button primary" onClick={() => setIssued(null)}>I saved the application key</button></section></div>}
   </section>
 }

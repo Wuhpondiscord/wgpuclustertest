@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Check, Eye, Pencil, Play } from 'lucide-react'
 import { api, ApiError } from './api'
 import type { ApplicationInput, ApplicationJob } from './application-types'
 import template from '../mesh.json'
@@ -79,6 +80,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
 }) {
   const path = `/api/applications/${appId}/deployment`
   const [active, setActive] = useState<Deployment | null>(null)
+  const [showPublished, setShowPublished] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const [candidate, setCandidate] = useState<Candidate | null>(null)
   const [editor, setEditor] = useState<string | null>(null)
@@ -88,6 +90,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const importDetails = useRef<HTMLDetailsElement>(null)
   const pendingRun = useRef<{ revision: string; key: string } | null>(null)
 
   async function refresh(signal?: AbortSignal) {
@@ -139,6 +142,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
     setActive(deployment)
     setCandidate(null)
     setEditor(null)
+    if (importDetails.current) importDetails.current.open = false
     setMessage('Deployment saved. Run it when your workers are ready.')
   }
 
@@ -156,25 +160,71 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
     setMessage(`Queued ${jobs.length} workflow job${jobs.length === 1 ? '' : 's'}.`)
   }
 
+  const draftManifest = candidate?.manifest
+  const draftName = typeof draftManifest === 'object' && draftManifest !== null && 'name' in draftManifest && typeof draftManifest.name === 'string'
+    ? draftManifest.name : 'Workflow draft'
+
   return <section className="deployment-panel workspace-panel" aria-label="Application deployment">
-    <div className="workspace-panel-heading"><div><h3>Workflow deployment</h3><p>Preview a workflow definition, publish a revision, and run it on your cluster.</p></div></div>
+    <div className="workspace-panel-heading"><div><h3>Deployments</h3><p>Publish a workflow revision and run it on your cluster.</p></div></div>
     {error && <p role="alert" className="feedback error">{error}</p>}
-    {message && <p role="status">{message}</p>}
-    {loaded && !active && <div className="deployment-empty">No workflow deployed.</div>}
-    {active && <article className="runtime-job deployed-workflow">
-      <div className="application-title"><strong>{active.manifest.name}</strong><span className="published-chip">Deployed</span></div>
-      <p>{active.manifest.jobs.length} jobs · {active.source.kind === 'github' ? `${active.source.repository} @ ${active.source.commit.slice(0, 12)}` : 'Local manifest'}</p>
-      <p>Revision <code>{active.id.slice(0, 8)}</code> · Saved {new Date(active.deployed_at_ms).toLocaleString()}</p><details><summary>View deployed manifest</summary><pre>{JSON.stringify(active.manifest, null, 2)}</pre></details>
-      <ul>{active.manifest.jobs.map(job => <li key={job.name}>{job.name} · {job.input.operation}</li>)}</ul>
-      <a download="mesh.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(active.manifest, null, 2))}`}>Download deployed manifest</a>
-      {role !== 'viewer' && <button className="manage-button primary" type="button" disabled={busy} onClick={() => void perform(() => run(active))}>Run deployment</button>}
-      {role === 'owner' && <button className="manage-button" disabled={busy} onClick={() => { setEditRevision(active.id); setEditor(JSON.stringify(active.manifest, null, 2)); setCandidate(null) }}>Edit deployed workflow</button>}
-      {role === 'owner' && <button className="manage-button danger" type="button" disabled={busy} onClick={() => void perform(async () => {
-        await api(`${path}/${active.id}`, { method: 'DELETE' })
-        setActive(null)
-        setMessage('Deployment removed.')
-      })}>Remove deployment</button>}
-    </article>}
+    {message && <p role="status" className="deployment-message">{message}</p>}
+    {loaded && !active && !candidate && <div className="deployment-empty">
+      <span>No workflow deployed.</span>
+      {role === 'owner' && <button className="manage-button" type="button" disabled={busy} onClick={() => {
+        setError('')
+        setMessage('')
+        setEditor(null)
+        setCandidate({ manifest: template, source: { kind: 'upload' } })
+      }}>Load sample workflow</button>}
+    </div>}
+    {(active || candidate) && <div className="deployment-list">
+      {active && <>
+        <div className="deployment-row">
+          <span className="published-chip"><Check size={14}/>Published</span>
+          <div className="deployment-ident">
+            <strong>{active.manifest.name}</strong>
+            <small>Revision {active.id.slice(0, 8)} · {active.manifest.jobs.length} jobs</small>
+          </div>
+          <div className="deployment-actions">
+            <button className="manage-button small" type="button" aria-expanded={showPublished} onClick={() => setShowPublished(value => !value)}><Eye size={15}/>{showPublished ? 'Close preview' : 'Preview'}</button>
+            {role !== 'viewer' && <button className="manage-button small" type="button" disabled={busy} onClick={() => void perform(() => run(active))}><Play size={14}/>Run deployment</button>}
+            {role === 'owner' && <button className="manage-button small" type="button" disabled={busy} onClick={() => {
+              setEditRevision(active.id)
+              setEditor(JSON.stringify(active.manifest, null, 2))
+              setCandidate(null)
+            }}><Pencil size={14}/>Edit deployed workflow</button>}
+          </div>
+        </div>
+        {showPublished && <div className="deployment-expanded">
+          <p>{active.source.kind === 'github' ? `${active.source.repository} @ ${active.source.commit.slice(0, 12)}` : 'Local manifest'} · Saved {new Date(active.deployed_at_ms).toLocaleString()}</p>
+          <pre>{JSON.stringify(active.manifest, null, 2)}</pre>
+          <div className="deployment-actions">
+            <a download="mesh.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(active.manifest, null, 2))}`}>Download deployed manifest</a>
+            {role === 'owner' && <button className="manage-button danger" type="button" disabled={busy} onClick={() => void perform(async () => {
+              await api(`${path}/${active.id}`, { method: 'DELETE' })
+              setActive(null)
+              setShowPublished(false)
+              setMessage('Deployment removed.')
+            })}>Remove deployment</button>}
+          </div>
+        </div>}
+      </>}
+      {candidate && role === 'owner' && <>
+        <div className="deployment-row">
+          <span className="context-chip"><Pencil size={14}/>Draft</span>
+          <div className="deployment-ident"><strong>{draftName}</strong><small>Unpublished workflow</small></div>
+          <div className="deployment-actions">
+            <button type="button" className="manage-button primary small" disabled={busy} onClick={() => void perform(deploy)}>Publish revision</button>
+            <button type="button" className="manage-button small" disabled={busy} onClick={() => setCandidate(null)}>Discard preview</button>
+          </div>
+        </div>
+        <details className="deployment-expanded">
+          <summary>Workflow preview</summary>
+          {candidate.source.kind === 'github' && <p>{candidate.source.repository} @ <code>{candidate.source.commit}</code></p>}
+          <pre>{JSON.stringify(candidate.manifest, null, 2)}</pre>
+        </details>
+      </>}
+    </div>}
     {role === 'owner' && editor !== null && <section className="manifest-editor" aria-label="Workflow editor">
       <h4>Edit workflow</h4><p>Changes stay in this draft until you preview and save. Running jobs keep their original revision.</p>
       <label>Workflow JSON<textarea spellCheck={false} value={editor} onChange={event => { setEditor(event.target.value); setCandidate(null) }}/></label>
@@ -184,17 +234,8 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
       })}>Preview changes</button>
       <button className="manage-button" disabled={busy} onClick={() => { setEditor(null); setCandidate(null) }}>Cancel editing</button>
     </section>}
-    {role === 'owner' && <details open={!active || !!candidate}>
+    {role === 'owner' && <details ref={importDetails} className="deployment-import">
       <summary>{active ? 'Replace deployment' : 'Upload or import a workflow'}</summary>
-    {role === 'owner' && <div className="application-form">
-      <button className="manage-button" type="button" disabled={busy || !loaded} onClick={() => {
-        setError('')
-        setMessage('')
-        setEditor(null)
-        setCandidate({ manifest: template, source: { kind: 'upload' } })
-      }}>Load sample workflow</button>
-      <p>One contributing node is enough to run the sample. Expect <code>[4, 6]</code> from vector addition and <code>[19, 22, 43, 50]</code> from matrix multiplication.</p>
-    </div>}
       <div className="application-form">
         <a download="mesh.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(template, null, 2))}`}>Download example mesh.json</a>
         <label>Upload mesh.json<input type="file" accept=".json,application/json" disabled={busy || !loaded} onChange={event => {
@@ -216,13 +257,6 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
         <p>Place mesh.json at the repository root. For a private repository, upload its manifest file.</p>
         <button type="submit" className="manage-button" disabled={busy || !loaded}>Preview GitHub workflow</button>
       </form>
-      {candidate && <div className="runtime-job">
-        <div className="application-title"><strong>Workflow preview</strong><span className="context-chip">Draft</span></div>
-        {candidate.source.kind === 'github' && <p>{candidate.source.repository} @ <code>{candidate.source.commit}</code></p>}
-        <pre>{JSON.stringify(candidate.manifest, null, 2)}</pre>
-        <button type="button" className="manage-button primary" disabled={busy} onClick={() => void perform(deploy)}>{active ? 'Replace deployment' : 'Save deployment'}</button>
-        <button type="button" className="manage-button" disabled={busy} onClick={() => setCandidate(null)}>Discard preview</button>
-      </div>}
     </details>}
     {!loaded && error && <button className="manage-button" type="button" disabled={busy} onClick={() => void perform(() => refresh())}>Reload deployment</button>}
   </section>

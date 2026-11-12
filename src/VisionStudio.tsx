@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type PointerEvent } from 'react'
-import { Check, ImageUp, Play, ScanLine, Tag } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
+import { Check, Image as ImageIcon, ImageUp, Layers3, Play, ScanLine, Tag } from 'lucide-react'
 import { api } from './api'
 import { ImageContributor } from './ImageBatchRuntime'
 import { backgroundLabel, detect, evaluateDetections, fitDetector, regionWindows, validateDetector, type Box, type Detection, type Detector } from './vision-detector'
@@ -9,10 +9,29 @@ type Saved = { id: string; name: string; saved_at_ms: number; model: Detector }
 type FeatureRow = { index: number; features: number[]; worker_id: string }
 type Validation = { images: VisionImage[]; regions: Array<Array<Box & { features: number[] }>> }
 
-function BoxCanvas({ image, detections, onBox }: { image: VisionImage; detections?: Detection[]; onBox?: (box: Box) => void }) {
+export type VisionStage = 'dataset' | 'train' | 'deploy'
+export type VisionStageRequest = { appId: string; stage: VisionStage }
+export type VisionSummary = {
+  appId: string
+  training: number
+  heldOut: number
+  classes: string[]
+  example: VisionImage | null
+  metrics: ReturnType<typeof evaluateDetections> | null
+  deployed: { name: string; id: string } | null
+  hasDraft: boolean
+  test: { image: VisionImage; predictions: Detection[] } | null
+}
+
+function BoxCanvas({ image, detections, onBox, compact = false }: {
+  image: VisionImage
+  detections?: Detection[]
+  onBox?: (box: Box) => void
+  compact?: boolean
+}) {
   const [size, setSize] = useState<{ source: string; width: number; height: number }>()
-  const maxWidth = size?.source === image.data ? Math.min(size.width * 2, 410 * size.width / size.height) : undefined
-  const colors = ['#63a5ff', '#5ee497', '#ec9bf2', '#ffb86b']
+  const maxWidth = size?.source === image.data ? Math.min(size.width * 2, (compact ? 144 : 410) * size.width / size.height) : undefined
+  const colors = ['#0d5ce8', '#008446', '#8f369f', '#a84910']
   const labels = [...new Set((detections ?? image.boxes).map(box => box.label).filter(label => label !== backgroundLabel))].sort()
   const [start, setStart] = useState<{ x: number; y: number } | null>(null)
   const [draft, setDraft] = useState<Box | null>(null)
@@ -27,14 +46,101 @@ function BoxCanvas({ image, detections, onBox }: { image: VisionImage; detection
     onPointerDown={event => { if (!onBox) return; event.currentTarget.setPointerCapture(event.pointerId); setStart(point(event)) }}
     onPointerMove={event => { if (!start) return; const end = point(event); setDraft({ x: Math.min(start.x, end.x), y: Math.min(start.y, end.y), width: Math.abs(end.x - start.x), height: Math.abs(end.y - start.y) }) }}
     onPointerUp={() => { if (draft && draft.width >= 0.01 && draft.height >= 0.01) onBox?.(draft); setStart(null); setDraft(null) }} onPointerCancel={() => { setStart(null); setDraft(null) }}>
-    {(detections ?? image.boxes).map((box, index) => <g key={index}><rect x={box.x * 100} y={box.y * 100} width={box.width * 100} height={box.height * 100} style={box.label === backgroundLabel ? undefined : { stroke: colors[labels.indexOf(box.label) % colors.length] }} className={box.label === backgroundLabel ? 'background-box' : ''}/><text x={box.x * 100 + 1} y={box.y * 100 + 4}>{box.label === backgroundLabel ? 'background' : box.label}{'score' in box ? ` ${Number(box.score).toFixed(2)}` : ''}</text></g>)}
+    {(detections ?? image.boxes).map((box, index) => {
+      const isBackground = box.label === backgroundLabel
+      const color = isBackground ? '#755018' : colors[labels.indexOf(box.label) % colors.length]
+      const text = isBackground ? 'background' : box.label
+      const title = 'score' in box ? `${text} ${Number(box.score).toFixed(2)}` : text
+      const width = Math.min(88, title.length * 1.8 + 3)
+      const x = Math.min(100 - width, box.x * 100)
+      const y = Math.max(0, box.y * 100 - 5)
+      return <g key={index}>
+        <rect x={box.x * 100} y={box.y * 100} width={box.width * 100} height={box.height * 100}
+          style={{ stroke: color }} className={isBackground ? 'background-box' : ''}/>
+        <rect x={x} y={y} width={width} height={5} rx={.6} style={{ fill: color, stroke: 'none' }}/>
+        <text x={x + 1} y={y + 3.65}>{title}</text>
+      </g>
+    })}
     {draft && <rect x={draft.x * 100} y={draft.y * 100} width={draft.width * 100} height={draft.height * 100}/>}
   </svg></div>
 }
 
-export function VisionStudio({ app, role, canShare }: { app: string; role: 'owner' | 'operator' | 'viewer'; canShare: boolean }) {
+export function VisionOverview({ summary, role, openStage }: {
+  summary: VisionSummary | null
+  role: 'owner' | 'operator' | 'viewer'
+  openStage: (stage: VisionStage) => void
+}) {
+  const result = summary?.test
+  const strongest = result?.predictions.reduce<Detection | null>((best, item) =>
+    !best || item.score > best.score ? item : best, null)
+  const metrics = summary?.metrics
+  return <section className="workspace-panel vision-overview" aria-label="Vision Studio overview">
+    <div className="workspace-panel-heading">
+      <div><h3>Vision Studio <span className="context-chip">Preview</span></h3>
+        <p>Label images, evaluate a detector, and test the deployed revision.</p>
+      </div>
+    </div>
+    <div className="vision-overview-grid">
+      {role !== 'viewer' && <>
+        <article className="vision-stage-card" aria-label="Label images summary">
+          <h4><Tag size={17}/>1. Label images</h4>
+          <div className="vision-stage-content">
+            {summary?.example
+              ? <BoxCanvas image={summary.example} compact/>
+              : <div className="stage-image-empty"><ImageIcon size={23}/><span>Add images to begin labeling</span></div>}
+            <p className="stage-fact"><b>{summary ? summary.training + summary.heldOut : 0} images</b>
+              <span>{summary?.training ?? 0} training · {summary?.heldOut ?? 0} held out</span>
+            </p>
+            {Boolean(summary?.classes.length) && <ul className="stage-classes" aria-label="Dataset classes">
+              {summary?.classes.slice(0, 4).map(label => <li key={label}>{label}</li>)}
+              {(summary?.classes.length ?? 0) > 4 && <li>+{(summary?.classes.length ?? 0) - 4} more</li>}
+            </ul>}
+            <button className="manage-button" onClick={() => openStage('dataset')}>Open labeling</button>
+          </div>
+        </article>
+        <article className="vision-stage-card" aria-label="Train and evaluate summary">
+          <h4><Layers3 size={17}/>2. Train &amp; evaluate</h4>
+          <div className="vision-stage-content">
+            <p className="stage-description">Fit a detector and check its results on held-out images.</p>
+            <p className="stage-row"><span>Held-out images</span><b>{summary?.heldOut ?? 0}</b></p>
+            {metrics ? <dl className="stage-metrics">
+              <div><dt>Precision</dt><dd>{Math.round(metrics.precision * 100)}%</dd></div>
+              <div><dt>Recall</dt><dd>{Math.round(metrics.recall * 100)}%</dd></div>
+              <div><dt>Objects found</dt><dd>{metrics.matched}/{metrics.objects}</dd></div>
+            </dl> : <p className="stage-result">Evaluation appears here after training.</p>}
+            <button className="manage-button" onClick={() => openStage('train')}>Open training</button>
+          </div>
+        </article>
+      </>}
+      <article className="vision-stage-card" aria-label="Deployment and test summary">
+        <h4><Play size={17}/>{role === 'viewer' ? 'Deployed detector' : '3. Deploy & test'}</h4>
+        <div className="vision-stage-content">
+          {summary?.deployed
+            ? <p className="stage-fact"><b>{summary.deployed.name}</b><span>Revision {summary.deployed.id.slice(0, 8)}</span></p>
+            : <p className="stage-description">No detector deployed.</p>}
+          {result && <div className="stage-test">
+            <img src={result.image.data} alt="Last test image"/>
+            <div><b>Last test</b><p>{strongest ? `${strongest.label} (${strongest.score.toFixed(2)})` : 'No detections'}</p></div>
+          </div>}
+          {role !== 'viewer' && !result && <p className="stage-result">Test a deployed detector on a new image.</p>}
+          <button className="manage-button" onClick={() => openStage(
+            !summary?.deployed && summary?.hasDraft && role !== 'viewer' ? 'train' : 'deploy'
+          )}>{role === 'viewer' ? 'View detector' : summary?.deployed ? 'Test detector' : summary?.hasDraft ? 'Review detector draft' : 'Open deployment'}</button>
+        </div>
+      </article>
+    </div>
+  </section>
+}
+
+export function VisionStudio({ app, role, canShare, stageRequest, onSummary }: {
+  app: string
+  role: 'owner' | 'operator' | 'viewer'
+  canShare: boolean
+  stageRequest: VisionStageRequest | null
+  onSummary: (summary: VisionSummary) => void
+}) {
   const endpoint = `/api/applications/${app}/detector`
-  const [step, setStep] = useState<'dataset' | 'train' | 'deploy'>('dataset')
+  const [step, setStep] = useState<VisionStage>('dataset')
   const [saved, setSaved] = useState<Saved | null>(null)
   const [removeConfirmed, setRemoveConfirmed] = useState(false)
   const [loaded, setLoaded] = useState(false)
@@ -55,10 +161,17 @@ export function VisionStudio({ app, role, canShare }: { app: string; role: 'owne
   const [workers, setWorkers] = useState(0)
   const action = useRef<AbortController | null>(null)
   const revision = useRef<string | null>(null)
+  const choseStage = useRef(false)
+  useEffect(() => {
+    if (stageRequest?.appId === app && role !== 'viewer') {
+      choseStage.current = true
+      setStep(stageRequest.stage)
+    }
+  }, [app, role, stageRequest])
   const current = images[selected]
   useEffect(() => {
     const controller = new AbortController()
-    void api<Saved | null>(endpoint, { signal: controller.signal }).then(value => { setSaved(value); revision.current = value?.id ?? null; setLoaded(true); if (value) setStep('deploy') }).catch(error => { if (!controller.signal.aborted) setError(error.message) })
+    void api<Saved | null>(endpoint, { signal: controller.signal }).then(value => { setSaved(value); revision.current = value?.id ?? null; setLoaded(true); if (value && !choseStage.current) setStep('deploy') }).catch(error => { if (!controller.signal.aborted) setError(error.message) })
     return () => { controller.abort(); action.current?.abort() }
   }, [endpoint])
   async function perform(operation: (signal: AbortSignal) => Promise<void>) {
@@ -126,7 +239,22 @@ export function VisionStudio({ app, role, canShare }: { app: string; role: 'owne
     setValidation({ images: heldout, regions: heldout.map((_, index) => windows.map((box, offset) => ({ ...box, features: rows[examples.length + index * windows.length + offset].features }))) })
     setStatus('Training complete. Review held-out detection results before deploying.')
   }
-  const metrics = draft && validation ? evaluateDetections(validation.regions.map(regions => detect(draft, regions)), validation.images.map(image => image.boxes)) : null
+  const metrics = useMemo(() => draft && validation
+    ? evaluateDetections(validation.regions.map(regions => detect(draft, regions)), validation.images.map(image => image.boxes))
+    : null, [draft, validation])
+  useEffect(() => {
+    onSummary({
+      appId: app,
+      training: images.filter(image => image.split === 'train').length,
+      heldOut: images.filter(image => image.split === 'validation').length,
+      classes: [...new Set(images.flatMap(image => image.boxes.map(box => box.label)))].filter(label => label !== backgroundLabel),
+      example: images.find(image => image.boxes.some(box => box.label !== backgroundLabel)) ?? images[0] ?? null,
+      metrics,
+      deployed: saved && { name: saved.name, id: saved.id },
+      hasDraft: Boolean(draft),
+      test: testImage && prediction ? { image: testImage, predictions: prediction } : null,
+    })
+  }, [app, images, metrics, saved, draft, testImage, prediction, onSummary])
   return <section className="vision-studio" aria-label="Object detection studio">
     <header className="studio-heading"><div className="studio-title"><ScanLine size={21}/><h3>Vision studio</h3><span className="context-chip">Preview</span></div><span className="studio-status">{saved ? 'Detector deployed' : draft ? 'Detector draft' : 'No detector deployed'}</span></header>
     {role !== 'viewer' && <nav className="studio-steps" aria-label="Vision steps">
@@ -135,7 +263,7 @@ export function VisionStudio({ app, role, canShare }: { app: string; role: 'owne
         { id: 'train', label: 'Train & evaluate', icon: ScanLine, complete: Boolean(draft) },
         { id: 'deploy', label: 'Deploy & test', icon: Play, complete: Boolean(saved) },
       ] as const).map(({ id, label: stepLabel, icon: Icon, complete }, index) =>
-        <button key={id} type="button" aria-label={`${index + 1} · ${stepLabel}`} aria-pressed={step === id} onClick={() => setStep(id)}>
+        <button key={id} type="button" aria-label={`${index + 1} · ${stepLabel}`} aria-pressed={step === id} onClick={() => { choseStage.current = true; setStep(id) }}>
           <span className={`step-mark${complete && step !== id ? ' complete' : ''}`} aria-hidden="true">{complete && step !== id ? <Check size={15}/> : <Icon size={15}/>}</span>{stepLabel}
         </button>)}
     </nav>}

@@ -57,7 +57,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await expect(page.getByLabel('Application slug', { exact: true })).toHaveValue('private-image-worker')
   await page.getByLabel('Application slug', { exact: true }).fill('image-worker')
   await page.getByRole('button', { name: 'Create private application', exact: true }).click()
-  await expect(page.locator('.application-overview a').first()).toHaveAttribute('href', `/${username}/image-worker`)
+  await expect(page.getByRole('link', { name: 'Open application URL', exact: true })).toHaveAttribute('href', `/${username}/image-worker`)
   // A stale session must require sign-in, not become a new anonymous principal.
   await page.evaluate(() => sessionStorage.setItem('mesh.account-session', `ms_${'0'.repeat(64)}`))
   await page.getByRole('button', { name: 'Refresh', exact: true }).click()
@@ -102,7 +102,7 @@ test('server-issued account keys, authenticator enrollment, recovery login and p
   await reset.getByRole('button', { name: 'Close account dialog', exact: true }).click()
   await page.goto(`/${username}/image-worker`)
   await expect(page.getByRole('heading', { name: 'Private image worker', exact: true })).toBeVisible()
-  await expect(page.getByText('Private management page · Browser job runtime', { exact: true })).toBeVisible()
+  await expect(page.locator('.application-overview').getByText('Private', { exact: true })).toBeVisible()
   await page.setViewportSize({ width: 390, height: 844 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true)
   await page.screenshot({ path: 'test-results-ui/private-application-mobile.png', fullPage: true })
