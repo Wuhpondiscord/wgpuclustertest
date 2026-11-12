@@ -1,12 +1,12 @@
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { test, expect, type Browser, type Locator } from '@playwright/test'
+import { test, expect, type Browser, type Locator, type Page } from '@playwright/test'
 import type { ApplicationJob } from '../../src/application-types'
 const origin = 'http://127.0.0.1:5173'
 const manifest = JSON.parse(readFileSync(new URL('../../mesh.json', import.meta.url), 'utf8'))
 let session: string
-async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
-  const response = await fetch(`${origin}${path}`, { method, headers: { 'X-Mesh-Identity': session, ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) })
+async function api<T>(path: string, method = 'GET', body?: unknown, identity = session): Promise<T> {
+  const response = await fetch(`${origin}${path}`, { method, headers: { 'X-Mesh-Identity': identity, ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) })
   if (!response.ok) throw new Error(`${path}: ${response.status} ${await response.text()}`)
   return response.status === 204 ? undefined as T : response.json()
 }
@@ -21,9 +21,21 @@ async function chooseDeploymentAction(panel: Locator, name: 'Run deployment' | '
   await panel.getByRole('button', { name, exact: true }).click()
 }
 
+async function publishWorkflow(page: Page, panel: Locator) {
+  await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+  await page.getByRole('dialog', { name: 'Publish workflow revision?' }).getByRole('button', { name: 'Confirm publish revision' }).click()
+}
+
+async function openVision(page: Page) {
+  const menu = page.getByRole('button', { name: 'Application menu', exact: true })
+  if (await menu.isVisible() && await menu.getAttribute('aria-expanded') !== 'true') await menu.click()
+  await page.getByRole('navigation', { name: 'Application tools' }).getByRole('button', { name: 'Deployments', exact: true }).click()
+  await page.getByRole('navigation', { name: 'Deployment tools' }).getByRole('button', { name: 'Vision detector' }).click()
+}
+
 async function fixture(browser: Browser) {
   const cluster = await api<{ id: string }>('/api/clusters', 'POST', { name: 'application runtime e2e' })
-  const app = await api<{ id: string }>(`/api/clusters/${cluster.id}/applications`, 'POST', { name: 'Browser runtime', slug: `runtime-${randomBytes(4).toString('hex')}` })
+  const app = await api<{ id: string; url: string }>(`/api/clusters/${cluster.id}/applications`, 'POST', { name: 'Browser runtime', slug: `runtime-${randomBytes(4).toString('hex')}` })
   const node = await api<{ node: { id: string }; token: string }>(`/api/clusters/${cluster.id}/nodes`, 'POST', { name: 'runtime browser' })
   const context = await browser.newContext()
   await context.addInitScript(({ session, node, clusterId }) => {
@@ -145,16 +157,18 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
   const f = await fixture(browser)
   try {
     const { page } = f
+    await page.getByRole('button', { name: 'Deployments', exact: true }).click()
     const panel = page.getByRole('region', { name: 'Application deployment' })
     await panel.getByRole('button', { name: 'Load sample workflow', exact: true }).click()
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
-    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
-    await expect(panel.getByText(manifest.name, { exact: true })).toBeVisible()
+    await publishWorkflow(page, panel)
+    await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(manifest.name, { exact: true })).toBeVisible()
     const saved = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     await page.reload()
     await page.getByRole('link', { name: 'Applications', exact: true }).click()
-  await page.getByRole('button', { name: 'Browser runtime · owner', exact: true }).click()
-    await expect(panel.getByText(manifest.name, { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Browser runtime · owner', exact: true }).click()
+    await page.getByRole('button', { name: 'Deployments', exact: true }).click()
+    await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(manifest.name, { exact: true })).toBeVisible()
     await chooseDeploymentAction(panel, 'Run deployment')
     const output = page.getByTestId('application-job')
     await expect(output.getByTestId('application-job-status')).toHaveText(['completed', 'completed'], { timeout: 60_000 })
@@ -171,7 +185,7 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
       name: 'mesh.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(uploaded)),
     })
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
-    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+    await publishWorkflow(page, panel)
     await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(uploaded.name, { exact: true })).toBeVisible()
 
     const sha = 'a'.repeat(40)
@@ -193,7 +207,7 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
     await panel.getByText('Workflow preview', { exact: true }).click()
     await expect(panel.getByText(sha, { exact: true })).toBeVisible()
-    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+    await publishWorkflow(page, panel)
     await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(imported.name, { exact: true })).toBeVisible()
     const replacement = await api<{ id: string; source: unknown }>(`/api/applications/${f.app.id}/deployment`)
     expect(replacement.id).not.toBe(saved.id)
@@ -340,6 +354,9 @@ test('application studio separates cluster controls and edits deployed workflow 
     const menu = page.getByRole('complementary', { name: 'Application menu' })
     const context = page.getByRole('complementary', { name: 'Application context' })
     await page.setViewportSize({ width: 1440, height: 1000 })
+    await expect(menu.getByRole('button', { name: 'Overview', exact: true })).toHaveAttribute('aria-pressed', 'true')
+    await expect(menu.getByRole('button', { name: 'Vision studio', exact: true })).toHaveCount(0)
+    await page.getByRole('region', { name: 'Current deployments' }).getByRole('button', { name: 'Open deployments' }).click()
     await expect(menu.getByRole('button', { name: 'Deployments', exact: true })).toHaveAttribute('aria-pressed', 'true')
     const [rail, content, inspector] = await Promise.all([menu.boundingBox(), panel.boundingBox(), context.boundingBox()])
     expect(rail?.x).toBe(0)
@@ -349,29 +366,34 @@ test('application studio separates cluster controls and edits deployed workflow 
     await expect(menu.getByRole('navigation', { name: 'Application tools' })).toBeVisible()
     await page.setViewportSize({ width: 1440, height: 1000 })
     await panel.getByRole('button', { name: 'Load sample workflow' }).click()
-    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+    await publishWorkflow(page, panel)
     await expect(panel.getByLabel('Deployment actions', { exact: true })).toBeVisible()
-    const summary = page.getByRole('definition').filter({ hasText: 'Numerical checks' })
-    await expect(summary).toBeVisible()
+    await menu.getByRole('button', { name: 'Overview', exact: true }).click()
+    await expect(page.getByRole('region', { name: 'Current deployments' })).toContainText('Numerical checks')
     await expect(page.getByRole('complementary', { name: 'Application context' }).getByRole('link', { name: 'application runtime e2e' })).toHaveAttribute('href', new RegExp(`cluster=${f.cluster.id}`))
     if (process.env.MESH_TEST_PREVIEW) {
       await page.setViewportSize({ width: 1440, height: 1000 })
       await page.evaluate(() => window.scrollTo(0, 0))
-      await page.screenshot({ path: 'test-results-ui/applications-desktop.png' })
+      await page.screenshot({ path: 'test-results-ui/application-overview-desktop.png' })
     }
+    await menu.getByRole('button', { name: 'Deployments', exact: true }).click()
     const before = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     await chooseDeploymentAction(panel, 'Edit deployed workflow')
     const updated = { ...manifest, name: 'Edited numerical workflow' }
     await panel.getByLabel('Workflow JSON').fill(JSON.stringify(updated))
     await panel.getByRole('button', { name: 'Preview changes' }).click()
     await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+    await page.getByRole('dialog', { name: 'Publish workflow revision?' }).getByRole('button', { name: 'Cancel' }).click()
+    expect((await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)).id).toBe(before.id)
+    await expect(panel.locator('.deployment-row').filter({ hasText: 'Unpublished workflow' })).toContainText(updated.name)
+    await publishWorkflow(page, panel)
     await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(updated.name, { exact: true })).toBeVisible()
     const after = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     expect(after.id).not.toBe(before.id)
     await chooseDeploymentAction(panel, 'Edit deployed workflow')
     await api(`/api/applications/${f.app.id}/deployment`, 'POST', { expected_revision_id: after.id, source: { kind: 'upload' }, manifest: { ...updated, name: 'Changed in another tab' } })
     await panel.getByRole('button', { name: 'Preview changes' }).click()
-    await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
+    await publishWorkflow(page, panel)
     await expect(panel.getByRole('alert')).toContainText('changed')
     await context.getByRole('button', { name: 'Manage access' }).click()
     await expect(menu.getByRole('button', { name: 'Access & settings' })).toHaveAttribute('aria-pressed', 'true')
@@ -384,28 +406,97 @@ test('application studio separates cluster controls and edits deployed workflow 
   } finally { await f.close() }
 })
 
+test('vision labeling edits, resizes, and exports normalized bounding boxes', async ({ browser }) => {
+  const f = await fixture(browser)
+  try {
+    const { page } = f
+    await openVision(page)
+    const dataset = page.getByRole('region', { name: 'Vision dataset' })
+    await dataset.getByRole('button', { name: 'Load box detection sample' }).click()
+    const canvas = dataset.getByLabel('Image annotation canvas').locator('.vision-frame')
+    await canvas.getByRole('img').scrollIntoViewIfNeeded()
+    const frame = (await canvas.boundingBox())!
+    expect(frame.width).toBeGreaterThan(400)
+    await page.mouse.move(frame.x + frame.width * 0.69, frame.y + frame.height * 0.67)
+    await page.mouse.down()
+    await page.mouse.move(frame.x + frame.width * 0.84, frame.y + frame.height * 0.81, { steps: 5 })
+    await page.mouse.up()
+    const annotation = dataset.getByRole('button', { name: '3. my-object', exact: true })
+    await expect(annotation).toBeVisible()
+    await annotation.click()
+    const handle = canvas.locator('[data-box="2"] [data-corner="se"]')
+    await handle.scrollIntoViewIfNeeded()
+    const corner = (await handle.boundingBox())!
+    await page.mouse.move(corner.x + corner.width / 2, corner.y + corner.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(corner.x + corner.width / 2 + frame.width * 0.07, corner.y + corner.height / 2 + frame.height * 0.06, { steps: 5 })
+    await page.mouse.up()
+    await dataset.getByLabel('Object class', { exact: true }).fill('inspection-target')
+    await dataset.getByRole('button', { name: 'Apply class to selected box' }).click()
+    await expect(dataset.getByRole('button', { name: '3. inspection-target', exact: true })).toBeVisible()
+    await dataset.getByRole('button', { name: 'Zoom in' }).click()
+    await expect(dataset.getByLabel('Zoom level')).toHaveText('125%')
+    await dataset.getByRole('button', { name: 'Pan image' }).click()
+    await expect(canvas).toHaveAttribute('data-tool', 'pan')
+    await expect(dataset.getByText('Local changes · export to keep your dataset.')).toBeVisible()
+    page.once('dialog', dialog => dialog.dismiss())
+    await page.getByRole('button', { name: 'All applications' }).click()
+    await expect(dataset).toBeVisible()
+
+    const download = page.waitForEvent('download')
+    await dataset.getByRole('button', { name: 'Export labeled dataset' }).click()
+    const exported = JSON.parse(readFileSync((await (await download).path())!, 'utf8'))
+    const box = exported.images[0].boxes[2]
+    expect(box.label).toBe('inspection-target')
+    expect(box.x).toBeCloseTo(0.69, 2)
+    expect(box.y).toBeCloseTo(0.67, 2)
+    expect(box.width).toBeCloseTo(0.22, 2)
+    expect(box.height).toBeCloseTo(0.20, 2)
+    await page.setViewportSize({ width: 390, height: 844 })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true)
+  } finally { await f.close() }
+})
+
 test('vision studio trains a boxed dataset on a real browser worker and reloads its deployed model', async ({ browser }) => {
   test.setTimeout(300_000)
   const f = await fixture(browser)
   try {
     const page = f.page
-    const overview = page.getByRole('region', { name: 'Vision Studio overview' })
-    if (process.env.MESH_TEST_PREVIEW) {
-      const deploymentPanel = page.getByRole('region', { name: 'Application deployment' })
-      await deploymentPanel.getByRole('button', { name: 'Load sample workflow' }).click()
-      await deploymentPanel.getByRole('button', { name: 'Publish revision' }).click()
-    }
-    await overview.getByRole('button', { name: 'Open labeling' }).click()
+    await openVision(page)
     const studio = page.getByRole('region', { name: 'Object detection studio' })
     await studio.getByRole('button', { name: 'Load box detection sample' }).click()
+    const datasetStage = studio.getByRole('region', { name: 'Vision dataset' })
+    const trainingStage = studio.getByRole('region', { name: 'Train and evaluate detector' })
+    const deployStage = studio.getByRole('region', { name: 'Deploy and test detector' })
+    await expect(datasetStage).toBeVisible()
+    await expect(trainingStage).toBeHidden()
+    await expect(deployStage).toBeHidden()
+    await expect(page.getByRole('complementary', { name: 'Application context' })).toBeHidden()
+    if (process.env.MESH_TEST_PREVIEW) {
+      await page.setViewportSize({ width: 1440, height: 1000 })
+      await page.evaluate(() => window.scrollTo(0, 0))
+      await page.screenshot({ path: 'test-results-ui/vision-labeling-desktop.png', fullPage: true })
+    }
     await studio.getByRole('button', { name: 'Continue to training' }).click()
+    await expect(datasetStage).toBeHidden()
+    await expect(trainingStage).toBeVisible()
     await expect(studio.getByText('6 training images · 2 validation images', { exact: true })).toBeVisible()
     await studio.getByRole('button', { name: 'Start ML worker' }).click()
     await studio.getByRole('button', { name: 'Train detector on cluster' }).click()
     await expect(studio.getByTestId('detection-validation')).toContainText('Held-out detection', { timeout: 240_000 })
     console.log('Vision sample:', await studio.getByTestId('detection-validation').innerText())
-    await expect(studio.getByText('Detector draft · 1 contributing browsers', { exact: false })).toBeVisible()
-    await studio.getByRole('button', { name: 'Deploy detector', exact: true }).click()
+    await expect(studio.getByText('Detector draft · 1 contributing browser', { exact: false })).toBeVisible()
+    if (process.env.MESH_TEST_PREVIEW) {
+      await page.evaluate(() => window.scrollTo(0, 0))
+      await page.screenshot({ path: 'test-results-ui/vision-training-desktop.png' })
+    }
+    await trainingStage.getByRole('button', { name: 'Review detector' }).click()
+    await expect(trainingStage).toBeHidden()
+    await expect(deployStage).toBeVisible()
+    await deployStage.getByRole('button', { name: 'Publish detector', exact: true }).click()
+    const confirm = page.getByRole('dialog', { name: 'Publish detector?' })
+    await expect(confirm).toContainText('Browser runtime')
+    await confirm.getByRole('button', { name: 'Confirm publish detector' }).click()
     await expect(studio.getByRole('button', { name: 'Download deployed detector' })).toBeVisible()
     const deployment = await api<{ id: string; model: { labels: string[]; prototypes: string[]; counts: number[] } }>(`/api/applications/${f.app.id}/detector`)
     expect(deployment.model.labels).toEqual(['__background__', 'blue-block', 'red-block'])
@@ -422,30 +513,37 @@ test('vision studio trains a boxed dataset on a real browser worker and reloads 
     await studio.getByRole('button', { name: 'Detect objects on cluster' }).click()
     await expect(studio.getByText('Detection complete using the deployed revision.', { exact: true })).toBeVisible({ timeout: 120_000 })
     await studio.getByRole('button', { name: 'Stop ML worker' }).click()
-    await page.getByRole('button', { name: 'Deployments', exact: true }).click()
-    await expect(overview.getByRole('article', { name: 'Label images summary' })).toContainText('6 training · 2 held out')
-    await expect(overview.getByRole('article', { name: 'Train and evaluate summary' })).toContainText('Precision')
-    await expect(overview.getByRole('img', { name: 'Last test image' })).toBeVisible()
-    if (process.env.MESH_TEST_PREVIEW) {
-      await page.setViewportSize({ width: 1440, height: 1000 })
-      await page.evaluate(() => window.scrollTo(0, 0))
-      await page.screenshot({ path: 'test-results-ui/applications-light-desktop.png' })
-    }
-    await overview.getByRole('button', { name: 'Test detector' }).click()
-    await expect(studio.getByRole('button', { name: 'Detect objects on cluster' })).toBeVisible()
+    await expect(deployStage.getByRole('img', { name: 'new-test.jpg' })).toBeVisible()
     if (process.env.MESH_TEST_PREVIEW) {
       await page.evaluate(() => window.scrollTo(0, 0))
-      await page.screenshot({ path: 'test-results-ui/vision-studio-light-desktop.png' })
+      await page.screenshot({ path: 'test-results-ui/vision-deploy-desktop.png', fullPage: true })
     }
     await page.setViewportSize({ width: 390, height: 844 })
-    const overflow = await page.evaluate(() => [...document.querySelectorAll('body *')].filter(element => element.getBoundingClientRect().right > innerWidth + 1).map(element => ({ tag: element.tagName, className: element.className, width: element.getBoundingClientRect().width, text: element.textContent?.slice(0, 60) })))
-    expect(overflow).toEqual([])
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true)
     await page.screenshot({ path: 'test-results-ui/vision-studio-mobile.png', fullPage: true })
     await page.reload()
     await page.getByRole('button', { name: 'Browser runtime · owner', exact: true }).click()
-    await page.getByRole('button', { name: 'Application menu', exact: true }).click()
-    await page.getByRole('button', { name: 'Vision studio', exact: true }).click()
+    await openVision(page)
+    await studio.getByRole('button', { name: '3 · Deploy & test' }).click()
     await expect(page.getByRole('button', { name: 'Download deployed detector' })).toBeVisible()
     expect((await api<{ id: string }>(`/api/applications/${f.app.id}/detector`)).id).toBe(deployment.id)
+
+    const username = `viewer-${randomBytes(4).toString('hex')}`
+    const viewer = await api<{ session: string }>('/api/accounts', 'POST', { username }, randomBytes(32).toString('hex'))
+    await api('/api/account/activate', 'POST', undefined, viewer.session)
+    const invite = await api<{ token: string }>(`/api/clusters/${f.cluster.id}/invites`, 'POST')
+    await api('/api/invites/join', 'POST', { token: invite.token }, viewer.session)
+    await api(`/api/applications/${f.app.id}/members`, 'POST', { username, role: 'viewer' })
+    const viewerContext = await browser.newContext()
+    try {
+      await viewerContext.addInitScript(session => sessionStorage.setItem('mesh.account-session', session), viewer.session)
+      const viewerPage = await viewerContext.newPage()
+      await viewerPage.goto(f.app.url)
+      await openVision(viewerPage)
+      const viewerStudio = viewerPage.getByRole('region', { name: 'Object detection studio' })
+      await expect(viewerStudio.getByRole('button', { name: 'Download deployed detector' })).toBeVisible()
+      await expect(viewerStudio.getByRole('navigation', { name: 'Vision steps' })).toHaveCount(0)
+      await expect(viewerStudio.getByRole('button', { name: 'Publish detector' })).toHaveCount(0)
+    } finally { await viewerContext.close() }
   } finally { await f.close() }
 })

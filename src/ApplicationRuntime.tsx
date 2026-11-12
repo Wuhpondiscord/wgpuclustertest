@@ -1,23 +1,24 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import { ApplicationDeployment } from './ApplicationDeployment'
 import { ApplicationJobForm, quickTestInput } from './ApplicationJobForm'
 import type { ApplicationJob } from './application-types'
 
-type RunSummary = { appId: string; activeRuns: number }
+export type RunSummary = { appId: string; activeRuns: number; recent: Array<{ id: string; name: string; status: ApplicationJob['status'] }> }
 type DeploymentSummary = { appId: string; name?: string; revision?: string }
 type AppKey = { id: string; label: string; expires_at: number; read_only: boolean }
-export function ApplicationRuntime({ appId, role, onRunsChange, onDeploymentChange, visionOverview, view, onShowRuns }: {
+export function ApplicationRuntime({ appId, appName, role, onRunsChange, onDeploymentChange, view, onShowRuns }: {
   appId: string
+  appName: string
   role: 'owner' | 'operator' | 'viewer'
-  view: 'workflows' | 'runs'
+  view: 'workflows' | 'runs' | 'hidden'
   onShowRuns: () => void
-  visionOverview: ReactNode
   onRunsChange: (summary: RunSummary) => void
   onDeploymentChange: (summary: DeploymentSummary) => void
 }) {
   const base = `/api/applications/${appId}`
   const [jobs, setJobs] = useState<ApplicationJob[]>([])
+  const [loaded, setLoaded] = useState(false)
   const [keys, setKeys] = useState<AppKey[]>([])
   const [quickTestId, setQuickTestId] = useState<string>()
   const [label, setLabel] = useState('Developer SDK')
@@ -29,7 +30,7 @@ export function ApplicationRuntime({ appId, role, onRunsChange, onDeploymentChan
   const dialog = useRef<HTMLElement>(null)
   async function refresh(signal?: AbortSignal) {
     const [list, info] = await Promise.all([api<ApplicationJob[]>(`${base}/jobs`, { signal }), api<{ metrics: typeof metrics }>(`${base}/runtime`, { signal })])
-    setJobs(list); setMetrics(info.metrics)
+    setJobs(list); setMetrics(info.metrics); setLoaded(true)
     if (role === 'owner') setKeys(await api<AppKey[]>(`${base}/keys`, { signal }))
   }
   useEffect(() => {
@@ -73,8 +74,10 @@ export function ApplicationRuntime({ appId, role, onRunsChange, onDeploymentChan
   }
   const activeRuns = jobs.filter(job => ['queued', 'running', 'awaiting_verification'].includes(job.status)).length
   useEffect(() => {
-    if (metrics !== null || jobs.length) onRunsChange({ appId, activeRuns })
-  }, [appId, activeRuns, jobs.length, metrics, onRunsChange])
+    if (loaded) onRunsChange({ appId, activeRuns, recent: jobs.slice(0, 3).map(job => ({
+      id: job.id, name: job.deployment?.name ?? job.input.operation.replace(/_/g, ' '), status: job.status,
+    })) })
+  }, [appId, activeRuns, jobs, loaded, onRunsChange])
   const quickTest = jobs.find(job => job.id === quickTestId)
   const quickTestPending = quickTest && ['queued', 'running', 'awaiting_verification'].includes(quickTest.status)
   const example = `import { MeshClient } from '${location.origin}/sdk/mesh-client.mjs';
@@ -85,14 +88,13 @@ const mesh = new MeshClient({
 const job = await mesh.embeddings(['Your text here']);
 const result = await mesh.wait(job);
 console.log(result.output);`
-  return <section className="application-runtime" aria-label="Browser application runtime">
+  return <section className="application-runtime" aria-label="Browser application runtime" hidden={view === 'hidden'}>
     <div className="workflow-surface" hidden={view !== 'workflows'}>
-    <ApplicationDeployment appId={appId} role={role} onDeploymentChange={onDeploymentChange} onQueued={queued => {
+    <ApplicationDeployment appId={appId} appName={appName} role={role} onDeploymentChange={onDeploymentChange} onQueued={queued => {
       const ids = new Set(queued.map(job => job.id))
       setJobs(current => [...queued, ...current.filter(job => !ids.has(job.id))])
       onShowRuns()
     }}/>
-    {visionOverview}
     </div>
     <div className="runs-surface" hidden={view !== 'runs'}>
     <section className="workspace-panel" aria-label="Browser jobs">

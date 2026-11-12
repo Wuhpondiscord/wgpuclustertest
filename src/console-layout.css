@@ -1,9 +1,9 @@
 .manage-app {
   --workspace-rail-width: clamp(172px, 16vw, 240px);
   --workspace-header-height: 64px;
-  --workspace-canvas: #f8f9fc;
-  --workspace-rail: #f1f4f9;
-  --workspace-blue: #064cf4;
+  --workspace-canvas: #f8fafc;
+  --workspace-rail: #f1f5f9;
+  --workspace-blue: #2563eb;
   background: var(--workspace-canvas);
 }
 
@@ -60,7 +60,7 @@
 .manage-top .refresh-button:hover { background: #edf3ff; color: #0849d8; }
 .header-profile { flex: none; }
 .manage-button { border-radius: 8px; box-shadow: none; }
-.manage-button.primary { background: #0754fa; border-color: #0754fa; box-shadow: none; }
+.manage-button.primary { background: #2563eb; border-color: #2563eb; box-shadow: none; }
 .manage-button:hover { transform: none; }
 .manage-button.primary.danger { background: var(--mesh-error); border-color: var(--mesh-error); }
 
@@ -236,8 +236,6 @@
 .app-access-settings { display: grid; gap: 14px; }
 .access-form { grid-template-columns: repeat(auto-fit, minmax(min(165px, 100%), 1fr)); align-items: end; }
 .application-url { overflow-wrap: anywhere; margin: 8px 0; font-size: 13px; }
-.application-delete { margin-top: 12px; border-top: 1px solid var(--mesh-border); padding-top: 12px; }
-.application-delete label { display: flex; align-items: center; gap: 7px; margin: 8px 0; font-size: 13px; }
 .cluster-workspace .invite-row, .cluster-workspace .node-row, .cluster-workspace .member-row, .cluster-workspace .job-row { border-color: var(--mesh-border); }
 .cluster-workspace .invite-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 5px 0; }
 .cluster-workspace .invite-key, .cluster-workspace .invite-expiry { font-size: 12px; }
@@ -342,84 +340,10 @@
 .deployment-panel .application-form p { margin: 0; font-size: 13px; color: var(--mesh-muted); }
 .run-metrics { font-size: 12px; color: var(--mesh-muted); }
 
-.vision-overview h3 { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-.vision-overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 10px; }
-.vision-stage-card { min-width: 0; display: flex; flex-direction: column; border: 1px solid #dce5f4; border-radius: 9px; background: #f7f9fc; overflow: hidden; }
-.vision-stage-card h4 { display: flex; align-items: center; gap: 8px; margin: 0; padding: 10px; font-size: 16px; background: #e8effe; }
-.vision-stage-card h4 svg { color: #234a87; flex: none; }
-.vision-stage-content { flex: 1; display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 10px; font-size: 13px; }
-.vision-stage-content > .manage-button { margin-top: auto; min-height: 34px; height: auto; white-space: normal; }
-.vision-stage-content > p, .stage-test p { margin: 0; }
-.stage-image-empty { display: grid; gap: 5px; justify-items: center; align-content: center; min-height: 86px; padding: 8px; text-align: center; color: #3d5579; background: #edf2f9; border: 1px dashed #b9cae1; border-radius: 7px; }
-.vision-stage-content .vision-canvas { margin: 0 auto; }
-.stage-fact { display: grid; gap: 3px; }
-.stage-fact span, .stage-description { color: #425670; }
-.stage-row, .stage-metrics > div { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; padding: 6px; }
-.stage-metrics, .stage-row, .stage-result { border: 1px solid var(--mesh-border); border-radius: 7px; background: #fff; }
-.stage-metrics { margin: 0; }
-.stage-metrics > div + div { border-top: 1px solid var(--mesh-border); }
-.stage-metrics dd { margin: 0; font-weight: 700; }
-.stage-result { padding: 8px; color: #4d607c; }
-.stage-classes { display: flex; gap: 4px; flex-wrap: wrap; list-style: none; padding: 0; margin: 0; }
-.stage-classes li { padding: 3px 6px; border-radius: 5px; background: #e2ecff; color: #1a4288; }
-.stage-test { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 7px; align-items: center; }
-.stage-test img { display: block; width: 70px; height: 59px; object-fit: cover; border-radius: 5px; }
-.stage-test p { margin-top: 3px; overflow-wrap: anywhere; color: #254d9b; }
-
 /* Vision Studio uses the same light surfaces as the dashboard. */
-.vision-studio { color: var(--mesh-ink); background: #fff; border-color: #dce4f1; padding: 14px; }
-.studio-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
-.studio-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.studio-title > svg { color: #2a559e; }
-.studio-status { color: #3c587d; background: #f2f6fc; font-size: 12px; padding: 4px 7px; border: 1px solid #d8e3f4; border-radius: 6px; }
-.vision-studio .studio-steps { background: #f0f4fb; border-color: #dce5f3; padding: 4px; margin: 14px 0; }
-.vision-studio .studio-steps button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 39px; color: #2c4161; }
-.vision-studio .studio-steps button:hover { background: #e7effd; }
-.vision-studio .studio-steps button[aria-pressed="true"] { background: #dce9ff; border-color: #a8c6ff; color: #173b8b; }
-.vision-studio .step-mark { display: grid; place-items: center; flex: none; width: 24px; height: 24px; padding: 0; border-radius: 50%; background: #d8e6fc; color: #254d8a; }
-.vision-studio .step-mark.complete { background: #dcf4e4; color: #146837; }
-.vision-studio .studio-panel, .vision-studio .runtime-job { background: #f9fbfd; border-color: var(--mesh-border); }
-.vision-studio .studio-panel { margin-top: 12px; }
-.studio-panel-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.studio-panel-heading span, .studio-panel > p, .vision-compute p { color: var(--mesh-muted); font-size: 13px; }
-.vision-studio .studio-panel h4 { margin: 0 0 8px; }
-.vision-studio .vision-inspector, .detector-upload { color: var(--mesh-ink); background: #fff; border: 1px solid var(--mesh-border); border-radius: 9px; padding: 12px; }
-.vision-studio .vision-inspector h5, .detector-upload h5 { margin: 0 0 7px; font-size: 15px; }
-.vision-image-area, .detector-preview { background: #eaf0f9; color: #1c2d49; border: 1px solid #dbe5f2; }
-.vision-studio .vision-canvas { margin: 9px auto; width: 100%; }
-.vision-canvas rect { fill: #0000000d; stroke-width: .48; }
-.vision-canvas text { font-size: 3px; stroke: none; fill: #fff; }
-.vision-filmstrip button { border-color: #bccde5; }
-.detector-empty { color: #526786; }
-.detector-layout { grid-template-columns: minmax(0, 2fr) minmax(150px, .9fr) minmax(168px, 1fr); align-items: stretch; }
-.detector-name { font-size: 13px; font-weight: 700; margin: 0 0 9px; }
-.vision-studio .detector-facts div { border-color: var(--mesh-border); }
-.vision-studio .detector-facts dt, .detector-file small { color: var(--mesh-muted); }
-.vision-studio .detector-file { display: flex; align-items: center; text-align: center; gap: 7px; margin: 10px 0; padding: 15px 8px; border: 1px dashed #a9bcd8; border-radius: 8px; background: #f5f8fd; }
-.detector-file small { font-weight: 400; }
-.vision-studio .detector-file input { padding: 5px; border: 0; background: transparent; }
-.detector-upload .primary { width: 100%; margin: 0; }
-.dataset-inputs { display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.validation-results { border: 1px solid var(--mesh-border); border-radius: 8px; padding: 10px; margin: 10px 0; }
-.validation-results dl { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 10px 0 0; gap: 5px; }
-.validation-results dt { color: var(--mesh-muted); font-size: 12px; }
-.validation-results dd { margin: 3px 0 0; font-size: 17px; font-weight: 750; }
-
-@media (min-width: 1030px) and (max-width: 1330px) {
-  .detector-layout { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
-  .detector-upload { grid-column: 1 / -1; }
-}
-@media (max-width: 900px) {
-  .detector-layout { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
-  .detector-upload { grid-column: 1 / -1; }
-}
 @media (max-width: 650px) {
-  .detector-layout, .dataset-inputs { grid-template-columns: minmax(0, 1fr); }
   .deployment-row { grid-template-columns: minmax(64px, auto) minmax(0, 1fr); }
   .deployment-row .deployment-actions { grid-column: 1 / -1; }
   .deployment-menu-options { inset-inline: 0 auto; }
-  .vision-studio .studio-steps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .vision-studio .studio-steps button { flex-direction: column; gap: 3px; padding: 5px 2px; line-height: 1.1; }
-  .validation-results dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .workspace-nav a[aria-current="page"]::after { bottom: -4px; }
 }

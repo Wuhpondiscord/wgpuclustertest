@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
-import { Check, Image as ImageIcon, ImageUp, Layers3, Play, ScanLine, Tag } from 'lucide-react'
-import { api } from './api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowRight, Check, CloudUpload, Download, ImageUp, Play } from 'lucide-react'
+import { api, ApiError } from './api'
+import { ConfirmAction } from './ConfirmAction'
+import { classColor, VisionCanvas } from './VisionCanvas'
+import { VisionDatasetEditor } from './VisionDatasetEditor'
 import { ImageContributor } from './ImageBatchRuntime'
 import { backgroundLabel, detect, evaluateDetections, fitDetector, regionWindows, validateDetector, type Box, type Detection, type Detector } from './vision-detector'
 import { cropRegion, downloadJson, readVisionImage, sampleDataset, validateDataset, type VisionImage } from './vision-data'
@@ -9,148 +12,32 @@ type Saved = { id: string; name: string; saved_at_ms: number; model: Detector }
 type FeatureRow = { index: number; features: number[]; worker_id: string }
 type Validation = { images: VisionImage[]; regions: Array<Array<Box & { features: number[] }>> }
 
-export type VisionStage = 'dataset' | 'train' | 'deploy'
-export type VisionStageRequest = { appId: string; stage: VisionStage }
-export type VisionSummary = {
-  appId: string
-  training: number
-  heldOut: number
-  classes: string[]
-  example: VisionImage | null
-  metrics: ReturnType<typeof evaluateDetections> | null
-  deployed: { name: string; id: string } | null
-  hasDraft: boolean
-  test: { image: VisionImage; predictions: Detection[] } | null
-}
+type VisionStage = 'dataset' | 'train' | 'deploy'
+export type VisionSummary = { appId: string; detector: { name: string; id: string } | null; datasetDirty: boolean }
+const stages = [
+  { id: 'dataset', label: 'Label images' },
+  { id: 'train', label: 'Train & evaluate' },
+  { id: 'deploy', label: 'Deploy & test' },
+] as const
 
-function BoxCanvas({ image, detections, onBox, compact = false }: {
-  image: VisionImage
-  detections?: Detection[]
-  onBox?: (box: Box) => void
-  compact?: boolean
-}) {
-  const [size, setSize] = useState<{ source: string; width: number; height: number }>()
-  const maxWidth = size?.source === image.data ? Math.min(size.width * 2, (compact ? 144 : 410) * size.width / size.height) : undefined
-  const colors = ['#0d5ce8', '#008446', '#8f369f', '#a84910']
-  const labels = [...new Set((detections ?? image.boxes).map(box => box.label).filter(label => label !== backgroundLabel))].sort()
-  const [start, setStart] = useState<{ x: number; y: number } | null>(null)
-  const [draft, setDraft] = useState<Box | null>(null)
-  const point = (event: PointerEvent<SVGSVGElement>) => {
-    const bounds = event.currentTarget.getBoundingClientRect()
-    return { x: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)), y: Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)) }
-  }
-  return <div className="vision-canvas" style={{ maxWidth }}><img src={image.data} alt={image.name} onLoad={event => {
-    const img = event.currentTarget
-    setSize({ source: image.data, width: img.naturalWidth, height: img.naturalHeight })
-  }}/><svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label={onBox ? 'Draw a box around an object. Numeric box controls are also available below.' : 'Predicted bounding boxes'}
-    onPointerDown={event => { if (!onBox) return; event.currentTarget.setPointerCapture(event.pointerId); setStart(point(event)) }}
-    onPointerMove={event => { if (!start) return; const end = point(event); setDraft({ x: Math.min(start.x, end.x), y: Math.min(start.y, end.y), width: Math.abs(end.x - start.x), height: Math.abs(end.y - start.y) }) }}
-    onPointerUp={() => { if (draft && draft.width >= 0.01 && draft.height >= 0.01) onBox?.(draft); setStart(null); setDraft(null) }} onPointerCancel={() => { setStart(null); setDraft(null) }}>
-    {(detections ?? image.boxes).map((box, index) => {
-      const isBackground = box.label === backgroundLabel
-      const color = isBackground ? '#755018' : colors[labels.indexOf(box.label) % colors.length]
-      const text = isBackground ? 'background' : box.label
-      const title = 'score' in box ? `${text} ${Number(box.score).toFixed(2)}` : text
-      const width = Math.min(88, title.length * 1.8 + 3)
-      const x = Math.min(100 - width, box.x * 100)
-      const y = Math.max(0, box.y * 100 - 5)
-      return <g key={index}>
-        <rect x={box.x * 100} y={box.y * 100} width={box.width * 100} height={box.height * 100}
-          style={{ stroke: color }} className={isBackground ? 'background-box' : ''}/>
-        <rect x={x} y={y} width={width} height={5} rx={.6} style={{ fill: color, stroke: 'none' }}/>
-        <text x={x + 1} y={y + 3.65}>{title}</text>
-      </g>
-    })}
-    {draft && <rect x={draft.x * 100} y={draft.y * 100} width={draft.width * 100} height={draft.height * 100}/>}
-  </svg></div>
-}
-
-export function VisionOverview({ summary, role, openStage }: {
-  summary: VisionSummary | null
-  role: 'owner' | 'operator' | 'viewer'
-  openStage: (stage: VisionStage) => void
-}) {
-  const result = summary?.test
-  const strongest = result?.predictions.reduce<Detection | null>((best, item) =>
-    !best || item.score > best.score ? item : best, null)
-  const metrics = summary?.metrics
-  return <section className="workspace-panel vision-overview" aria-label="Vision Studio overview">
-    <div className="workspace-panel-heading">
-      <div><h3>Vision Studio <span className="context-chip">Preview</span></h3>
-        <p>Label images, evaluate a detector, and test the deployed revision.</p>
-      </div>
-    </div>
-    <div className="vision-overview-grid">
-      {role !== 'viewer' && <>
-        <article className="vision-stage-card" aria-label="Label images summary">
-          <h4><Tag size={17}/>1. Label images</h4>
-          <div className="vision-stage-content">
-            {summary?.example
-              ? <BoxCanvas image={summary.example} compact/>
-              : <div className="stage-image-empty"><ImageIcon size={23}/><span>Add images to begin labeling</span></div>}
-            <p className="stage-fact"><b>{summary ? summary.training + summary.heldOut : 0} images</b>
-              <span>{summary?.training ?? 0} training · {summary?.heldOut ?? 0} held out</span>
-            </p>
-            {Boolean(summary?.classes.length) && <ul className="stage-classes" aria-label="Dataset classes">
-              {summary?.classes.slice(0, 4).map(label => <li key={label}>{label}</li>)}
-              {(summary?.classes.length ?? 0) > 4 && <li>+{(summary?.classes.length ?? 0) - 4} more</li>}
-            </ul>}
-            <button className="manage-button" onClick={() => openStage('dataset')}>Open labeling</button>
-          </div>
-        </article>
-        <article className="vision-stage-card" aria-label="Train and evaluate summary">
-          <h4><Layers3 size={17}/>2. Train &amp; evaluate</h4>
-          <div className="vision-stage-content">
-            <p className="stage-description">Fit a detector and check its results on held-out images.</p>
-            <p className="stage-row"><span>Held-out images</span><b>{summary?.heldOut ?? 0}</b></p>
-            {metrics ? <dl className="stage-metrics">
-              <div><dt>Precision</dt><dd>{Math.round(metrics.precision * 100)}%</dd></div>
-              <div><dt>Recall</dt><dd>{Math.round(metrics.recall * 100)}%</dd></div>
-              <div><dt>Objects found</dt><dd>{metrics.matched}/{metrics.objects}</dd></div>
-            </dl> : <p className="stage-result">Evaluation appears here after training.</p>}
-            <button className="manage-button" onClick={() => openStage('train')}>Open training</button>
-          </div>
-        </article>
-      </>}
-      <article className="vision-stage-card" aria-label="Deployment and test summary">
-        <h4><Play size={17}/>{role === 'viewer' ? 'Deployed detector' : '3. Deploy & test'}</h4>
-        <div className="vision-stage-content">
-          {summary?.deployed
-            ? <p className="stage-fact"><b>{summary.deployed.name}</b><span>Revision {summary.deployed.id.slice(0, 8)}</span></p>
-            : <p className="stage-description">No detector deployed.</p>}
-          {result && <div className="stage-test">
-            <img src={result.image.data} alt="Last test image"/>
-            <div><b>Last test</b><p>{strongest ? `${strongest.label} (${strongest.score.toFixed(2)})` : 'No detections'}</p></div>
-          </div>}
-          {role !== 'viewer' && !result && <p className="stage-result">Test a deployed detector on a new image.</p>}
-          <button className="manage-button" onClick={() => openStage(
-            !summary?.deployed && summary?.hasDraft && role !== 'viewer' ? 'train' : 'deploy'
-          )}>{role === 'viewer' ? 'View detector' : summary?.deployed ? 'Test detector' : summary?.hasDraft ? 'Review detector draft' : 'Open deployment'}</button>
-        </div>
-      </article>
-    </div>
-  </section>
-}
-
-export function VisionStudio({ app, role, canShare, stageRequest, onSummary }: {
+export function VisionStudio({ app, appName, role, canShare, compute, onSummary }: {
   app: string
+  appName: string
   role: 'owner' | 'operator' | 'viewer'
   canShare: boolean
-  stageRequest: VisionStageRequest | null
+  compute?: { name: string; url: string }
   onSummary: (summary: VisionSummary) => void
 }) {
   const endpoint = `/api/applications/${app}/detector`
   const [step, setStep] = useState<VisionStage>('dataset')
   const [saved, setSaved] = useState<Saved | null>(null)
-  const [removeConfirmed, setRemoveConfirmed] = useState(false)
+  const [confirmation, setConfirmation] = useState<'publish' | 'remove' | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [draft, setDraft] = useState<Detector | null>(null)
   const [name, setName] = useState('Custom object detector')
   const [images, setImages] = useState<VisionImage[]>([])
-  const [selected, setSelected] = useState(0)
-  const [label, setLabel] = useState('my-object')
-  const [background, setBackground] = useState(false)
-  const [numeric, setNumeric] = useState<Box>({ x: 0.1, y: 0.1, width: 0.5, height: 0.5 })
+  const [datasetDirty, setDatasetDirty] = useState(false)
+  const [pendingPublication, setPendingPublication] = useState(false)
   const [validation, setValidation] = useState<Validation | null>(null)
   const [testImage, setTestImage] = useState<VisionImage | null>(null)
   const [prediction, setPrediction] = useState<Detection[] | null>(null)
@@ -159,37 +46,72 @@ export function VisionStudio({ app, role, canShare, stageRequest, onSummary }: {
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
   const [workers, setWorkers] = useState(0)
+  const [thisWorkerEnabled, setThisWorkerEnabled] = useState(false)
   const action = useRef<AbortController | null>(null)
   const revision = useRef<string | null>(null)
-  const choseStage = useRef(false)
-  useEffect(() => {
-    if (stageRequest?.appId === app && role !== 'viewer') {
-      choseStage.current = true
-      setStep(stageRequest.stage)
-    }
-  }, [app, role, stageRequest])
-  const current = images[selected]
   useEffect(() => {
     const controller = new AbortController()
-    void api<Saved | null>(endpoint, { signal: controller.signal }).then(value => { setSaved(value); revision.current = value?.id ?? null; setLoaded(true); if (value && !choseStage.current) setStep('deploy') }).catch(error => { if (!controller.signal.aborted) setError(error.message) })
+    void api<Saved | null>(endpoint, { signal: controller.signal }).then(value => {
+      setSaved(value)
+      revision.current = value?.id ?? null
+      setLoaded(true)
+    }).catch(error => { if (!controller.signal.aborted) setError(error.message) })
     return () => { controller.abort(); action.current?.abort() }
   }, [endpoint])
+  useEffect(() => {
+    if (!datasetDirty) return
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [datasetDirty])
+
   async function perform(operation: (signal: AbortSignal) => Promise<void>) {
     if (action.current) return
     const controller = new AbortController(); action.current = controller
     setBusy(true); setError(''); setStatus('')
     try { await operation(controller.signal) }
-    catch (error) { setError(controller.signal.aborted ? 'Operation cancelled. The deployed model is unchanged.' : error instanceof Error ? error.message : 'Vision request failed') }
+    catch (error) { setError(controller.signal.aborted ? 'Operation cancelled.' : error instanceof Error ? error.message : 'Vision request failed') }
     finally { action.current = null; setBusy(false) }
   }
-  function invalidate() { setDraft(null); setValidation(null); setPrediction(null) }
-  function addBox(box: Box) {
-    const annotation = { ...box, label: background ? backgroundLabel : label.trim() }
+  function changeDataset(next: VisionImage[], dirty = true) {
     try {
-      if (!current) return
-      const next = images.map((image, index) => index === selected ? { ...image, boxes: [...image.boxes, annotation] } : image)
-      validateDataset({ version: 1, images: next }); setImages(next); invalidate(); setError('')
-    } catch (error) { setError(error instanceof Error ? error.message : 'Invalid box') }
+      setImages(next.length ? validateDataset({ version: 1, images: next }) : [])
+      setDatasetDirty(dirty && next.length > 0)
+      setDraft(null)
+      setPendingPublication(false)
+      setValidation(null)
+      setStatus('')
+      setError('')
+      return true
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Invalid dataset')
+      return false
+    }
+  }
+  function exportDataset() {
+    downloadJson('mesh-vision-dataset.json', { version: 1, images })
+    setDatasetDirty(false)
+    setStatus('Dataset exported.')
+  }
+  async function addImages(files: File[]) {
+    await perform(async signal => {
+      if (images.length + files.length > 32) throw new Error('Use up to 32 images')
+      const additions: VisionImage[] = []
+      for (const file of files) {
+        signal.throwIfAborted()
+        additions.push(await readVisionImage(file, file.name))
+      }
+      signal.throwIfAborted()
+      changeDataset([...images, ...additions])
+    })
+  }
+  async function importDataset(file: File) {
+    await perform(async signal => {
+      if (file.size > 8 * 1024 * 1024) throw new Error('Dataset exceeds 8 MiB')
+      const content = JSON.parse(await file.text())
+      signal.throwIfAborted()
+      changeDataset(validateDataset(content), false)
+    })
   }
   async function features(regions: Array<{ image: VisionImage; box: Box }>, signal: AbortSignal) {
     if (!regions.length || regions.length > 1024) throw new Error('Use between 1 and 1,024 regions per run')
@@ -235,128 +157,262 @@ export function VisionStudio({ app, role, canShare, stageRequest, onSummary }: {
     const rows = await features(regions, signal)
     signal.throwIfAborted()
     const model = fitDetector(examples.map((example, index) => ({ label: example.box.label, features: rows[index].features })))
-    setDraft(model); setStep('train'); revision.current = saved?.id ?? null
+    setDraft(model); setPendingPublication(true); revision.current = saved?.id ?? null
     setValidation({ images: heldout, regions: heldout.map((_, index) => windows.map((box, offset) => ({ ...box, features: rows[examples.length + index * windows.length + offset].features }))) })
-    setStatus('Training complete. Review held-out detection results before deploying.')
+    setStatus('Training complete. Review the held-out results.')
   }
   const metrics = useMemo(() => draft && validation
     ? evaluateDetections(validation.regions.map(regions => detect(draft, regions)), validation.images.map(image => image.boxes))
     : null, [draft, validation])
+  const classes = useMemo(() => [...new Set(images.flatMap(image => image.boxes.map(box => box.label)))]
+    .filter(label => label !== backgroundLabel).sort(), [images])
+  const heldOut = images.filter(image => image.split === 'validation').length
+  const reviewingDraft = role === 'owner' && pendingPublication ? draft : null
+  const deployStage = role === 'viewer' || step === 'deploy'
+
   useEffect(() => {
-    onSummary({
-      appId: app,
-      training: images.filter(image => image.split === 'train').length,
-      heldOut: images.filter(image => image.split === 'validation').length,
-      classes: [...new Set(images.flatMap(image => image.boxes.map(box => box.label)))].filter(label => label !== backgroundLabel),
-      example: images.find(image => image.boxes.some(box => box.label !== backgroundLabel)) ?? images[0] ?? null,
-      metrics,
-      deployed: saved && { name: saved.name, id: saved.id },
-      hasDraft: Boolean(draft),
-      test: testImage && prediction ? { image: testImage, predictions: prediction } : null,
-    })
-  }, [app, images, metrics, saved, draft, testImage, prediction, onSummary])
+    if (loaded || datasetDirty) onSummary({ appId: app, detector: saved && { name: saved.name, id: saved.id }, datasetDirty })
+  }, [app, datasetDirty, loaded, saved, onSummary])
+
+  async function reloadDetector(signal: AbortSignal) {
+    const deployment = await api<Saved | null>(endpoint, { signal })
+    setSaved(deployment)
+    setLoaded(true)
+    setPrediction(null)
+    if (!pendingPublication) revision.current = deployment?.id ?? null
+  }
+  async function publishDetector(signal: AbortSignal) {
+    if (!reviewingDraft) return
+    try {
+      const deployment = await api<Saved>(endpoint, {
+        method: 'POST',
+        body: JSON.stringify({ name: name.trim(), model: reviewingDraft, expected_revision_id: revision.current }),
+        signal,
+      })
+      setSaved(deployment)
+      setPendingPublication(false)
+      setPrediction(null)
+      revision.current = deployment.id
+      setStatus('Detector published. You can now test this revision.')
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) await reloadDetector(signal).catch(() => undefined)
+      throw error
+    }
+  }
+  async function removeDetector(signal: AbortSignal) {
+    if (!saved) return
+    await api(`${endpoint}/${saved.id}`, { method: 'DELETE', signal })
+    setSaved(null)
+    setPrediction(null)
+    revision.current = null
+    setStatus('Published detector removed.')
+  }
+  async function importDetector(file: File, signal: AbortSignal) {
+    if (file.size > 48 * 1024) throw new Error('Model exceeds 48 KiB')
+    const value = JSON.parse(await file.text())
+    signal.throwIfAborted()
+    setDraft(validateDetector(value.model))
+    setName(typeof value.name === 'string' ? value.name.slice(0, 80) : 'Imported detector')
+    setPendingPublication(true)
+    setValidation(null)
+    revision.current = saved?.id ?? null
+    setStatus('Detector imported as a draft. Review it before publishing.')
+  }
+  async function testDetector(signal: AbortSignal) {
+    if (!saved || !testImage) return
+    const windows = regionWindows()
+    const rows = await features(windows.map(box => ({ image: testImage, box })), signal)
+    setPrediction(detect(saved.model, windows.map((box, index) => ({ ...box, features: rows[index].features }))))
+    setStatus('Detection complete using the deployed revision.')
+  }
+  function chooseStage(next: VisionStage) {
+    setStatus('')
+    setError('')
+    setStep(next)
+  }
+
   return <section className="vision-studio" aria-label="Object detection studio">
-    <header className="studio-heading"><div className="studio-title"><ScanLine size={21}/><h3>Vision studio</h3><span className="context-chip">Preview</span></div><span className="studio-status">{saved ? 'Detector deployed' : draft ? 'Detector draft' : 'No detector deployed'}</span></header>
-    {role !== 'viewer' && <nav className="studio-steps" aria-label="Vision steps">
-      {([
-        { id: 'dataset', label: 'Label images', icon: Tag, complete: Boolean(validation) },
-        { id: 'train', label: 'Train & evaluate', icon: ScanLine, complete: Boolean(draft) },
-        { id: 'deploy', label: 'Deploy & test', icon: Play, complete: Boolean(saved) },
-      ] as const).map(({ id, label: stepLabel, icon: Icon, complete }, index) =>
-        <button key={id} type="button" aria-label={`${index + 1} · ${stepLabel}`} aria-pressed={step === id} onClick={() => { choseStage.current = true; setStep(id) }}>
-          <span className={`step-mark${complete && step !== id ? ' complete' : ''}`} aria-hidden="true">{complete && step !== id ? <Check size={15}/> : <Icon size={15}/>}</span>{stepLabel}
-        </button>)}
+    <header className="vision-studio-header">
+      <div><div className="vision-studio-title"><h2>Vision Studio</h2><span className="context-chip">Preview</span></div>
+        <p>{role === 'viewer' ? 'Inspect the detector published for this application.' : 'Label images, evaluate a detector, and test a published revision.'}</p>
+      </div>
+    </header>
+    {role !== 'viewer' && <nav className="vision-steps" aria-label="Vision steps">
+      {stages.map(({ id, label }, index) => {
+        const complete = id === 'dataset' ? Boolean(validation) : id === 'train' ? Boolean(draft) : Boolean(saved) && !pendingPublication
+        return <button key={id} type="button" disabled={busy} aria-label={`${index + 1} · ${label}`}
+          aria-current={step === id ? 'step' : undefined} onClick={() => chooseStage(id)}>
+          <span className="vision-step-number" data-complete={complete && step !== id} aria-hidden="true">
+            {complete && step !== id ? <Check size={15}/> : index + 1}
+          </span><span>{label}</span>
+        </button>
+      })}
     </nav>}
-    {error && <p role="alert" className="feedback error">{error}</p>}{status && <p role="status">{status}</p>}
-    {busy && <button className="manage-button" onClick={() => action.current?.abort()}>Cancel vision operation</button>}
-    {role !== 'viewer' && <>
-      <section className="studio-panel" hidden={step !== 'dataset'} aria-label="Vision dataset"><div className="studio-panel-heading"><h4>Image dataset</h4><span>{images.length} / 32 images</span></div>
-        <p>Draw up to 16 boxes per image. Export to save your annotations. Workers receive cropped regions when you start a run.</p>
-        <div className="heading-buttons"><button className="manage-button" disabled={busy || images.length > 0} onClick={() => { setImages(sampleDataset()); setSelected(0); invalidate() }}>Load box detection sample</button><button className="manage-button" disabled={busy || !images.length} onClick={() => downloadJson('mesh-vision-dataset.json', { version: 1, images })}>Export labeled dataset</button></div>
-        <div className="dataset-inputs"><label>Add training images<input type="file" multiple accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={event => {
-          const files = Array.from(event.target.files ?? []); event.currentTarget.value = ''
-          void perform(async () => { if (images.length + files.length > 32) throw new Error('Use up to 32 images'); const next: VisionImage[] = []; for (const file of files) next.push(await readVisionImage(file, file.name)); setImages(validateDataset({ version: 1, images: [...images, ...next] })); invalidate() })
-        }}/></label>
-        <label>Import labeled dataset<input type="file" accept=".json,application/json" disabled={busy || images.length > 0} onChange={event => {
-          const file = event.target.files?.[0]; event.currentTarget.value = ''
-          if (file) void perform(async () => { if (file.size > 8 * 1024 * 1024) throw new Error('Dataset exceeds 8 MiB'); setImages(validateDataset(JSON.parse(await file.text()))); setSelected(0); invalidate() })
-        }}/></label></div>
-        {current && <div className="vision-layout">
-          <div className="vision-image-area">
-            <div className="vision-image-title"><strong>{current.name}</strong><span>{current.boxes.length} boxes</span></div>
-            <BoxCanvas image={current} onBox={busy ? undefined : addBox}/>
-            <div className="vision-filmstrip" role="group" aria-label="Dataset images">
-              {images.map((image, index) => <button key={index} type="button" disabled={busy}
-                aria-label={`Image ${index + 1}: ${image.name}`} aria-pressed={index === selected}
-                onClick={() => setSelected(index)}><img src={image.data} alt=""/><span>{index + 1}</span></button>)}
-            </div>
-          </div>
-          <div className="application-form vision-inspector">
-            <h5>Annotations</h5>
-            <label>Object label<input disabled={busy || background} value={label} maxLength={40} onChange={event => setLabel(event.target.value)}/></label>
-            <label><input type="checkbox" disabled={busy} checked={background} onChange={event => setBackground(event.target.checked)}/>Label background (no target objects)</label>
-            <label>Use this image for<select disabled={busy} value={current.split} onChange={event => { setImages(images.map((image, index) => index === selected ? { ...image, split: event.target.value as VisionImage['split'] } : image)); invalidate() }}><option value="train">Training</option><option value="validation">Held-out validation</option></select></label>
-            <details><summary>Enter a box with the keyboard</summary><p>Coordinates are fractions of the full image, from 0 to 1.</p>{(['x', 'y', 'width', 'height'] as const).map(key => <label key={key}>Box {key}<input type="number" min="0" max="1" step="0.01" value={numeric[key]} onChange={event => setNumeric({ ...numeric, [key]: Number(event.target.value) })}/></label>)}<button disabled={busy} className="manage-button" onClick={() => addBox(numeric)}>Add bounding box</button></details>
-            <ul>{current.boxes.map((box, index) => <li key={index}>{box.label === backgroundLabel ? 'background' : box.label} · {box.x.toFixed(2)}, {box.y.toFixed(2)} <button className="manage-button small" disabled={busy} onClick={() => { setImages(images.map((image, i) => i === selected ? { ...image, boxes: image.boxes.filter((_, b) => b !== index) } : image)); invalidate() }}>Remove box {index + 1}</button></li>)}</ul>
-            <button className="manage-button danger" disabled={busy} onClick={() => { setImages(images.filter((_, index) => index !== selected)); setSelected(0); invalidate() }}>Remove selected image</button>
-          </div></div>}
-        <button className="manage-button primary" disabled={!images.length} onClick={() => setStep('train')}>Continue to training</button>
-      </section>
-      <section className="studio-panel" hidden={step !== 'train'}><h4>Detector training</h4><p>{images.filter(image => image.split === 'train').length} training images · {images.filter(image => image.split === 'validation').length} validation images</p>
-        <button className="manage-button primary" disabled={busy || !loaded || !images.length} onClick={() => void perform(train)}>Train detector on cluster</button>
-        {draft && <><p>Detector draft · {validation ? `${workers} contributing browsers · ` : ''} {draft.counts.reduce((a, b) => a + b, 0)} training regions</p><label>Minimum similarity<input type="number" min="0" max="1" step="0.05" disabled={busy} value={draft.threshold} onChange={event => setDraft({ ...draft, threshold: Math.max(0, Math.min(1, Number(event.target.value))) })}/></label>
-          {metrics && <>{metrics.precision < 0.5 && <p className="feedback error">Validation has more false positives than correct detections. Add varied background examples or raise the similarity threshold before relying on this detector.</p>}<div className="validation-results" data-testid="detection-validation"><strong>Held-out detection at IoU ≥ 0.5</strong><dl><div><dt>Precision</dt><dd>{(metrics.precision * 100).toFixed(0)}%</dd></div><div><dt>Recall</dt><dd>{(metrics.recall * 100).toFixed(0)}%</dd></div><div><dt>Objects found</dt><dd>{metrics.matched}/{metrics.objects}</dd></div><div><dt>Predictions</dt><dd>{metrics.predictions}</dd></div></dl></div><p>Tuning on this validation set makes it unsuitable as a final test set. Test the deployed model on new images.</p>{validation && <details><summary>View validation predictions</summary>{validation.images.map((image, index) => <BoxCanvas key={index} image={image} detections={detect(draft, validation.regions[index])}/>)}</details>}</>}
-          <label>Detector name<input maxLength={80} value={name} disabled={busy} onChange={event => setName(event.target.value)}/></label>
-          <button className="manage-button" disabled={busy} onClick={() => downloadJson('mesh-detector.json', { name, model: draft })}>Download trained model</button>
-          {role === 'owner' && <button className="manage-button primary" disabled={busy || !name.trim()} onClick={() => void perform(async signal => {
-            const deployment = await api<Saved>(endpoint, { method: 'POST', body: JSON.stringify({ name, model: draft, expected_revision_id: revision.current }), signal })
-            setSaved(deployment); setStep('deploy'); setPrediction(null); revision.current = deployment.id; setStatus('Detector deployed. Test it below with new images.')
-          })}>Deploy detector</button>}</>}
-      </section>
-    </>}
-    <section className="studio-panel" hidden={role !== 'viewer' && step !== 'deploy'}><h4>Deployed detector</h4>
-      {!loaded ? <p>Loading model…</p> : !saved ? <p>No custom detector deployed yet.</p> : <div className="detector-layout">
-        <div className="detector-preview">
-          <div className="vision-image-title"><strong>Test preview</strong>{prediction && <span>{prediction.length} predictions</span>}</div>
-          {testImage ? <BoxCanvas image={testImage} detections={prediction ?? []}/> : <div className="detector-empty">Choose a test image to preview detection.</div>}
-          {testImage && prediction && <button className="manage-button" onClick={() => downloadJson('mesh-detections.json', { revision: saved.id, image: testImage.name, boxes: prediction })}>Download bounding boxes</button>}
-        </div>
-        <div className="vision-inspector">
-          <h5>Deployment details</h5><p className="detector-name">{saved.name}</p>
-          <dl className="detector-facts">
-            <div><dt>Revision</dt><dd>{saved.id.slice(0, 8)}</dd></div>
-            <div><dt>Classes</dt><dd>{saved.model.labels.filter(label => label !== backgroundLabel).join(', ')}</dd></div>
-            <div><dt>Minimum similarity</dt><dd>{saved.model.threshold}</dd></div>
-          </dl>
-            <button className="manage-button" onClick={() => downloadJson('mesh-detector.json', { name: saved.name, model: saved.model })}>Download deployed detector</button>
-          <details><summary>Detector settings</summary>
-            <p>Saved {new Date(saved.saved_at_ms).toLocaleString()} · Backbone {saved.model.backbone_revision.slice(0, 12)}</p>
-            {role === 'owner' && <button className="manage-button" disabled={busy} onClick={() => { setDraft(saved.model); setStep('train'); setName(saved.name); revision.current = saved.id; setValidation(null) }}>Edit deployed detector settings</button>}
-            {role === 'owner' && <details><summary>Remove deployed detector</summary><label><input type="checkbox" checked={removeConfirmed} onChange={event => setRemoveConfirmed(event.target.checked)}/>Confirm removal of this detector</label><button className="manage-button danger" disabled={busy || !removeConfirmed} onClick={() => void perform(async signal => { await api(`${endpoint}/${saved.id}`, { method: 'DELETE', signal }); setSaved(null); setDraft(null); setValidation(null); setPrediction(null); setRemoveConfirmed(false); revision.current = null })}>Remove detector</button></details>}
-          </details>
-        </div>
-        {role !== 'viewer' && <section className="detector-upload" aria-label="Test on new image">
-          <h5>Test on new image</h5>
-          <label className="detector-file"><ImageUp size={24} aria-hidden="true"/><span>Test image</span><small>JPEG, PNG or WebP</small><input aria-label="Test image" type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={event => { const file = event.target.files?.[0]; event.currentTarget.value = ''; if (file) void perform(async () => { setTestImage(await readVisionImage(file, file.name)); setPrediction(null) }) }}/></label>
-            <button className="manage-button primary" disabled={busy || !testImage} onClick={() => void perform(async signal => {
-              const windows = regionWindows(); const rows = await features(windows.map(box => ({ image: testImage!, box })), signal)
-              setPrediction(detect(saved.model, windows.map((box, index) => ({ ...box, features: rows[index].features })))); setStatus('Detection complete using the deployed revision.')
-            })}><Play size={16}/>Detect objects on cluster</button>
-        </section>}
-      </div>}
-      {role === 'owner' && <label>Import trained detector<input type="file" accept=".json,application/json" disabled={busy || !loaded} onChange={event => {
-        const file = event.target.files?.[0]; event.currentTarget.value = ''
-        if (file) void perform(async () => { if (file.size > 48 * 1024) throw new Error('Model exceeds 48 KiB'); const value = JSON.parse(await file.text()); setDraft(validateDetector(value.model)); setStep('train'); setName(typeof value.name === 'string' ? value.name.slice(0, 80) : 'Imported detector'); setValidation(null); revision.current = saved?.id ?? null; setStatus('Model imported as a draft. Review and deploy it above.') })
-      }}/></label>}
-      {role === 'owner' && <button className="manage-button" disabled={busy} onClick={() => void perform(async signal => { const value = await api<Saved | null>(endpoint, { signal }); setSaved(value); setLoaded(true); setDraft(null); setPrediction(null); setValidation(null); revision.current = value?.id ?? null })}>Reload deployed detector</button>}
-    </section>
-    {role !== 'viewer' && <div className="vision-compute">
-      <ImageContributor app={app} purpose="Contribute to vision training and detection"/>
-      {canShare && <div><button className="manage-button" disabled={busy} onClick={() => void perform(async () => {
-        const invite = await api<{ token: string }>(`/api/applications/${app}/contributor-invites?ml_only=true`, { method: 'POST' })
-        setLink(`${location.origin}/#ml-invite=${invite.token}`)
-      })}>Invite vision contributors</button>{link && <label>Vision contributor link<input readOnly value={link} onFocus={event => event.currentTarget.select()}/></label>}</div>}
+    {error && <p role="alert" className="feedback error">{error}</p>}
+    {(status || busy) && <div className="vision-operation">
+      <p role="status">{status || 'Working…'}</p>
+      {busy && !confirmation && <button type="button" className="manage-button small" onClick={() => action.current?.abort()}>Cancel operation</button>}
     </div>}
-    <details className="studio-note"><summary>How this preview works</summary><p>Uses frozen MobileNetV4 features and a small prototype head. Cluster workers extract features for each region, then this tab fits the head. Detection searches 35 square windows per image and suppresses overlapping boxes. Small or crowded objects may be missed. Similarity scores are not probabilities.</p></details>
+
+    {role !== 'viewer' && <div hidden={step !== 'dataset'}><VisionDatasetEditor
+      images={images} classes={classes} heldOut={heldOut} busy={busy} dirty={datasetDirty}
+      addImages={files => void addImages(files)} importDataset={file => void importDataset(file)}
+      loadSample={() => changeDataset(sampleDataset(), false)} save={exportDataset} onChange={changeDataset}
+      onContinue={() => chooseStage('train')}/></div>}
+
+    {role !== 'viewer' && step === 'train' && <section className="vision-stage" aria-label="Train and evaluate detector">
+      <div className="vision-stage-header"><div><h3>Train &amp; evaluate</h3>
+        <p>Cluster workers extract image features. Your browser fits the detector and evaluates it on held-out images.</p>
+      </div></div>
+      <div className="vision-stage-grid">
+        <section className="vision-stage-card" aria-label="Training configuration">
+          <h4>Training setup</h4>
+          <dl className="vision-facts">
+            <div><dt>Dataset split</dt><dd>{images.length - heldOut} training images · {heldOut} validation images</dd></div>
+            <div><dt>Compute cluster</dt><dd>{compute ? <a href={compute.url}>{compute.name}</a> : 'Application compute'}</dd></div>
+          </dl>
+          <ol className="vision-training-process">
+            <li>Extract features on cluster workers</li><li>Fit the detector in this browser</li><li>Measure detection on held-out images</li>
+          </ol>
+          {draft && <><p>{pendingPublication ? 'Detector draft' : 'Evaluated detector'}{validation ? ` · ${workers} contributing ${workers === 1 ? 'browser' : 'browsers'}` : ''} · {draft.counts.reduce((sum, count) => sum + count, 0)} training regions</p>
+            <label className="vision-field">Minimum similarity
+              <input type="number" min={0} max={1} step={0.05} disabled={busy} value={draft.threshold} onChange={event => {
+                const threshold = event.currentTarget.valueAsNumber
+                if (Number.isFinite(threshold)) {
+                  setDraft({ ...draft, threshold: Math.max(0, Math.min(1, threshold)) })
+                  setPendingPublication(true)
+                }
+              }}/>
+            </label>
+            <button type="button" className="manage-button" disabled={busy} onClick={() => downloadJson('mesh-detector.json', { name, model: draft })}><Download size={16}/>Download trained model</button>
+          </>}
+        </section>
+        <section className="vision-stage-card" aria-label="Evaluation results">
+          <h4>Evaluation results</h4>
+          {metrics ? <><div className="validation-results" data-testid="detection-validation">
+            <strong>Held-out detection at IoU ≥ 0.5</strong>
+            <dl>
+              <div><dt>Precision</dt><dd>{Math.round(metrics.precision * 100)}%</dd></div>
+              <div><dt>Recall</dt><dd>{Math.round(metrics.recall * 100)}%</dd></div>
+              <div><dt>Objects found</dt><dd>{metrics.matched}/{metrics.objects}</dd></div>
+              <div><dt>Predictions</dt><dd>{metrics.predictions}</dd></div>
+            </dl>
+          </div>
+          {metrics.precision < 0.5 && <p className="vision-warning">False positives outnumber correct detections. Add varied background examples or adjust the similarity threshold.</p>}
+          <p className="vision-muted">Tuning on these {heldOut} held-out images can overfit the evaluation. Use new images to test the published model.</p>
+          {validation && draft && <details className="vision-validation-images"><summary>View validation predictions</summary>
+            {validation.images.map((image, index) => <VisionCanvas key={index} image={image} classes={draft.labels.filter(label => label !== backgroundLabel).sort()}
+              detections={detect(draft, validation.regions[index])}/>)}
+          </details>}</> : <p className="vision-result-empty">Held-out metrics appear after a training run.</p>}
+        </section>
+      </div>
+      <footer className="vision-stage-footer">
+        {draft && role === 'owner' && pendingPublication && <button type="button" className="manage-button primary" disabled={busy} onClick={() => chooseStage('deploy')}>Review detector<ArrowRight size={16}/></button>}
+        <button type="button" className={`manage-button${draft && role === 'owner' && pendingPublication ? '' : ' primary'}`}
+          disabled={busy || !loaded || !images.length} onClick={() => void perform(train)}>
+          {draft ? 'Train again' : 'Train detector on cluster'}
+        </button>
+      </footer>
+    </section>}
+
+    {deployStage && <section className="vision-stage" aria-label="Deploy and test detector">
+      <div className="vision-stage-header"><div><h3>{role === 'viewer' ? 'Published detector' : 'Deploy & test'}</h3>
+        {role !== 'viewer' && <p>Publish a detector draft, then test the deployed revision on a new image.</p>}
+      </div></div>
+      {reviewingDraft && <section className="vision-stage-card vision-detector-draft" aria-label="Unpublished detector">
+        <div><h4>Detector draft</h4><p className="vision-muted">Classes {reviewingDraft.labels.filter(label => label !== backgroundLabel).join(', ')}</p></div>
+        <label className="vision-field">Detector name<input value={name} maxLength={80} disabled={busy} onChange={event => setName(event.target.value)}/></label>
+        {revision.current !== (saved?.id ?? null) && <div className="vision-conflict">
+          <p className="vision-warning">The published detector changed while you were editing this draft.</p>
+          <button type="button" className="manage-button" disabled={busy} onClick={() => {
+            revision.current = saved?.id ?? null
+            setError('')
+            setStatus('Draft is based on the current published revision.')
+          }}>Use latest revision as publish base</button>
+        </div>}
+        <button type="button" className="manage-button primary" disabled={busy || !name.trim() || revision.current !== (saved?.id ?? null)}
+          onClick={() => setConfirmation('publish')}><CloudUpload size={17}/>Publish detector</button>
+      </section>}
+      <div className="vision-stage-grid" data-single={role === 'viewer'}>
+        <section className="vision-stage-card" aria-label="Deployed detector">
+          <h4>Deployment details</h4>
+          {!loaded ? <p role="status">Loading detector…</p> : saved ? <>
+            <dl className="vision-facts">
+              <div><dt>Detector</dt><dd>{saved.name}</dd></div>
+              <div><dt>Revision</dt><dd><code>{saved.id.slice(0, 8)}</code> <span className="published-chip">Published</span></dd></div>
+              <div><dt>Classes</dt><dd><ul className="vision-class-list">{saved.model.labels.filter(label => label !== backgroundLabel).sort().map((label, _, labels) =>
+                <li key={label}><i style={{ background: classColor(label, labels) }}/>{label}</li>)}</ul></dd></div>
+              <div><dt>Minimum similarity</dt><dd>{saved.model.threshold}</dd></div>
+            </dl>
+            <button type="button" className="manage-button" onClick={() => downloadJson('mesh-detector.json', { name: saved.name, model: saved.model })}><Download size={16}/>Download deployed detector</button>
+          </> : <p className="vision-result-empty">No detector is published for this application.</p>}
+          {role === 'owner' && <details className="vision-detector-settings"><summary>Detector settings</summary>
+            <label className="vision-field">Import trained detector<input type="file" accept=".json,application/json" disabled={busy || !loaded || Boolean(reviewingDraft)}
+              onChange={event => {
+                const file = event.currentTarget.files?.[0]
+                event.currentTarget.value = ''
+                if (file) void perform(signal => importDetector(file, signal))
+              }}/></label>
+            <div className="vision-tools">
+              <button type="button" className="manage-button" disabled={busy} onClick={() => void perform(reloadDetector)}>Reload deployed detector</button>
+              {saved && !reviewingDraft && <button type="button" className="manage-button" disabled={busy} onClick={() => {
+                setDraft(saved.model)
+                setPendingPublication(true)
+                setName(saved.name)
+                revision.current = saved.id
+                setValidation(null)
+                chooseStage('train')
+              }}>Edit deployed detector settings</button>}
+              {saved && <button type="button" className="manage-button danger" disabled={busy} onClick={() => setConfirmation('remove')}>Remove detector</button>}
+            </div>
+          </details>}
+        </section>
+        {role !== 'viewer' && <section className="vision-stage-card vision-test" aria-label="Test on new image">
+          <h4>Test on a new image</h4>
+          {saved ? <>
+            <label className="vision-file-control"><ImageUp size={17}/><span>{testImage ? 'Choose a different image' : 'Choose a test image'}</span>
+              <input aria-label="Test image" type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={event => {
+                const file = event.currentTarget.files?.[0]
+                event.currentTarget.value = ''
+                if (file) void perform(async signal => {
+                  const image = await readVisionImage(file, file.name)
+                  signal.throwIfAborted()
+                  setTestImage(image)
+                  setPrediction(null)
+                })
+              }}/>
+            </label>
+            {testImage && <div className="vision-test-preview"><VisionCanvas key={testImage.data} image={testImage} classes={saved.model.labels.filter(label => label !== backgroundLabel).sort()} detections={prediction ?? []}/></div>}
+            {prediction && <p className="vision-muted">{prediction.length ? `${prediction.length} predictions` : 'No objects found'}</p>}
+            <div className="vision-tools">
+              <button type="button" className={`manage-button${reviewingDraft ? '' : ' primary'}`} disabled={busy || !testImage} onClick={() => void perform(testDetector)}><Play size={16}/>Detect objects on cluster</button>
+              {testImage && prediction && <button type="button" className="manage-button" onClick={() => downloadJson('mesh-detections.json', { revision: saved.id, image: testImage.name, boxes: prediction })}>Download bounding boxes</button>}
+            </div>
+          </> : <p className="vision-result-empty">Publish a detector to test it here.</p>}
+        </section>}
+      </div>
+    </section>}
+
+    {role !== 'viewer' && <div hidden={step === 'dataset' && !thisWorkerEnabled} className="vision-compute-tools">
+      <ImageContributor app={app} purpose="Contribute to vision training and detection" secondary onEnabledChange={setThisWorkerEnabled}/>
+      {canShare && step !== 'dataset' && <div>
+        <button type="button" className="manage-button" disabled={busy} onClick={() => void perform(async signal => {
+          const invite = await api<{ token: string }>(`/api/applications/${app}/contributor-invites?ml_only=true`, { method: 'POST', signal })
+          setLink(`${location.origin}/#ml-invite=${invite.token}`)
+        })}>Invite vision contributors</button>
+        {link && <label className="vision-field">Vision contributor link<input readOnly value={link} onFocus={event => event.currentTarget.select()}/></label>}
+      </div>}
+    </div>}
+    {role !== 'viewer' && <details className="vision-note"><summary>How the detector works</summary><p>Cluster workers extract frozen MobileNetV4 features. This browser fits a small prototype head and tests up to 35 windows per image. Small or crowded objects may be missed. Similarity scores measure feature agreement.</p></details>}
+
+    {confirmation === 'publish' && reviewingDraft && <ConfirmAction title="Publish detector?" action="Confirm publish detector"
+      onClose={() => setConfirmation(null)} onConfirm={() => void perform(publishDetector)}>
+      <p>Publish <strong>{name.trim()}</strong> as the active detector for <strong>{appName}</strong>{saved ? `, replacing revision ${saved.id.slice(0, 8)}.` : '.'}</p>
+      <p>Workflow revisions are published separately.</p>
+    </ConfirmAction>}
+    {confirmation === 'remove' && saved && <ConfirmAction title="Remove detector?" action="Confirm remove detector" danger
+      onClose={() => setConfirmation(null)} onConfirm={() => void perform(removeDetector)}>
+      <p>Remove <strong>{saved.name}</strong> (revision {saved.id.slice(0, 8)}) from <strong>{appName}</strong>.</p>
+    </ConfirmAction>}
   </section>
 }

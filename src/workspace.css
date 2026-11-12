@@ -54,7 +54,7 @@
 .manage-button { color: var(--mesh-ink); }
 .manage-button:hover { border-color: var(--mesh-lavender); }
 .manage-button.danger { color: var(--mesh-error); }
-:where(.workspace-nav a, .profile-trigger, .workspace-rail-item, .vision-filmstrip button, .studio-steps button, summary, select, input):focus-visible { outline: 3px solid var(--mesh-lavender); outline-offset: 2px; }
+:where(.workspace-nav a, .profile-trigger, .workspace-rail-item, summary, select, input):focus-visible { outline: 3px solid var(--mesh-lavender); outline-offset: 2px; }
 
 .account-applications { margin: 0; }
 .context-chip, .published-chip {
@@ -70,49 +70,12 @@
   white-space: nowrap;
 }
 .published-chip { color: var(--mesh-good); background: var(--mesh-good-bg); }
-.vision-studio {
-  margin: 0;
-  padding: 16px;
-  border: 1px solid var(--mesh-border);
-  background: #fff;
-  border-radius: 12px;
-}
 .deployment-panel { padding-bottom: 14px; margin-bottom: 16px; border-bottom: 1px solid var(--mesh-border); }
-.deployment-panel > h3, .studio-heading h3 { margin: 0; font-size: 20px; }
+.deployment-panel > h3 { margin: 0; font-size: 20px; }
 .runtime-job { border-color: var(--mesh-border); background: #f9fbfe; }
 .runtime-job > button, .runtime-job > a { margin: 4px 8px 0 0; }
-.vision-compute { margin-top: 14px; }
-.studio-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
-.studio-steps { gap: 5px; margin: 14px 0; padding: 4px; border: 1px solid var(--mesh-border); border-radius: 9px; background: #f0f4fa; }
-.studio-steps button { text-align: center; padding: 8px 6px; background: transparent; border-color: transparent; border-radius: 6px; font-size: 13px; }
-.studio-steps button[aria-pressed="true"] { background: var(--mesh-purple); color: #fff; border-color: var(--mesh-purple); }
-.studio-panel { margin: 14px 0 0; padding: 15px; }
-.vision-layout, .detector-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(205px, 1fr); gap: 14px; align-items: start; }
-.vision-image-area, .detector-preview { min-width: 0; padding: 10px; border-radius: 10px; background: #172236; color: #fff; }
-.vision-image-title { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 13px; overflow-wrap: anywhere; }
-.vision-image-area .vision-canvas, .detector-preview .vision-canvas { max-width: none; margin: 9px 0; }
-.vision-inspector { min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--mesh-border); border-radius: 9px; background: #f7f9fd; }
-.vision-inspector h5 { margin: 0 0 8px; font-size: 14px; }
-.vision-inspector label { margin: 6px 0; }
-.vision-inspector ul { padding-left: 18px; font-size: 13px; }
-.vision-filmstrip { display: flex; gap: 7px; padding: 4px; overflow-x: auto; }
-.vision-filmstrip button { position: relative; flex: none; width: 66px; height: 49px; border: 2px solid #69758b; border-radius: 6px; padding: 0; overflow: hidden; }
-.vision-filmstrip button[aria-pressed="true"] { border-color: #a8c4ff; box-shadow: 0 0 0 2px #4280f6; }
-.vision-filmstrip img { width: 100%; height: 100%; object-fit: cover; }
-.vision-filmstrip span { position: absolute; bottom: 1px; right: 2px; padding: 1px 4px; border-radius: 3px; background: #111827; color: #fff; font-size: 10px; }
-.detector-empty { display: grid; place-items: center; min-height: 180px; padding: 15px; color: #ccdaef; text-align: center; }
-.detector-facts { display: grid; gap: 8px; margin: 0; }
-.detector-facts div { border-bottom: 1px solid var(--mesh-border); padding-bottom: 6px; }
-.detector-facts dt { color: var(--mesh-muted); font-size: 12px; }
-.detector-facts dd { margin: 2px 0 0; font-size: 13px; font-weight: 700; }
 .contributor-options input { accent-color: var(--mesh-purple); }
-
-@media (max-width: 730px) {
-  .vision-layout, .detector-layout { grid-template-columns: minmax(0, 1fr); }
-}
 @media (max-width: 430px) {
   .profile-trigger > span:nth-child(2) { display: none; }
   .manage-top .header-auth .manage-button { min-height: 34px; height: 34px; padding: 0 7px; }
-  .vision-studio, .studio-panel { padding: 10px; }
-  .studio-steps button { font-size: 12px; }
 }
