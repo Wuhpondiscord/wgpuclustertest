@@ -38,6 +38,7 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
   const [runtimeSummary, setRuntimeSummary] = useState<RunSummary | null>(null)
   const [deploymentSummary, setDeploymentSummary] = useState<{ appId: string; name?: string; revision?: string } | null>(null)
   const [visionSummary, setVisionSummary] = useState<VisionSummary | null>(null)
+  const [visionComputeSlot, setVisionComputeSlot] = useState<HTMLDivElement | null>(null)
   const [studioTab, setStudioTab] = useState<'overview' | 'deployments' | 'runs' | 'access'>('overview')
   const [deploymentTab, setDeploymentTab] = useState<'workflow' | 'vision'>('workflow')
   const [editName, setEditName] = useState('')
@@ -174,7 +175,7 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
   const operators = selected?.members.filter(item => item.role === 'operator').length ?? 0
   const currentTab = studioTab === 'access' && selected?.role !== 'owner' ? 'overview' : studioTab
   const showVision = currentTab === 'deployments' && deploymentTab === 'vision'
-  const showContext = Boolean(selected) && !showVision && currentTab !== 'access'
+  const showContext = Boolean(selected) && currentTab !== 'access'
   const tools = [
     { id: 'overview', label: 'Overview', icon: House },
     { id: 'deployments', label: 'Deployments', icon: FileCode2 },
@@ -223,7 +224,7 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
         </> : clusterPicker}
       </>}</WorkspaceRail>
 
-      <article className={`workspace-detail${showContext ? ' with-context' : ''}`}>
+      <article className={`workspace-detail${showContext ? ' with-context' : ''}${showVision ? ' vision-workspace' : ''}`}>
         <header className="workspace-overview">
           <div className="workspace-title">
             <h1>{selected?.name ?? (appRoute ? 'Private application' : 'Applications')}</h1>
@@ -292,7 +293,10 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
               </section>
             </>}
             {currentTab === 'deployments' && <section className="deployment-workspace-header">
-              <h2>Deployments</h2>
+              <div className="vision-studio-title">
+                <h2>{showVision ? 'Vision Studio' : 'Deployments'}</h2>
+                {showVision && <span className="context-chip">Preview</span>}
+              </div>
               <nav className="deployment-tabs" aria-label="Deployment tools">
                 <button type="button" aria-pressed={deploymentTab === 'workflow'} onClick={() => setDeploymentTab('workflow')}><FileCode2 size={17}/>Workflow</button>
                 <button type="button" aria-pressed={deploymentTab === 'vision'} onClick={() => setDeploymentTab('vision')}><ImageIcon size={17}/>Vision detector</button>
@@ -303,7 +307,7 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
               onShowRuns={() => setStudioTab('runs')}
               onRunsChange={setRuntimeSummary} onDeploymentChange={setDeploymentSummary}/>
             <div hidden={!showVision}><VisionStudio key={`vision-${selected.id}`} app={selected.id} appName={selected.name} role={selected.role}
-              canShare={Boolean(selected.can_share_compute)} compute={compute && clusterUrl ? { name: compute.name, url: clusterUrl } : undefined}
+              canShare={Boolean(selected.can_share_compute)} computeSlot={visionComputeSlot}
               onSummary={setVisionSummary}/></div>
             <div hidden={currentTab !== 'runs'}>
               <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
@@ -356,7 +360,7 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
             </div>}
           </>}
         </div>
-        {selected && showContext && <aside className="workspace-inspector application-inspector" aria-label="Application context">
+        {selected && <aside className="workspace-inspector application-inspector" aria-label="Application context" hidden={!showContext}>
           <section className="inspector-card">
             <h2>Compute source</h2>
             {compute ? <div className="inspector-identity"><Monitor size={21}/><a href={clusterUrl}>{compute.name}</a></div>
@@ -364,7 +368,8 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
             {compute && <div className="inspector-status"><Users size={20}/><span>Workers<strong>{compute.online_nodes} online / {compute.nodes} registered</strong></span></div>}
             {currentTab !== 'runs' && <div className="inspector-status"><Activity size={20}/><span>Active jobs<strong>{runs?.activeRuns ?? '—'}</strong></span></div>}
           </section>
-          {selected.role !== 'viewer' && <section className="inspector-card">
+          {selected.role !== 'viewer' && <div hidden={!showVision} ref={setVisionComputeSlot}/>}
+          {selected.role !== 'viewer' && <section className="inspector-card" hidden={showVision}>
             <h2>Contributor link</h2>
             <p>Invite a trusted worker to contribute compute to {compute?.name ?? 'this application'}.</p>
             {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}><Link2 size={16}/>Share contributor link</button>}

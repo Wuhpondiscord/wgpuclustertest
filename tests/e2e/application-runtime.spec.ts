@@ -410,13 +410,14 @@ test('vision labeling edits, resizes, and exports normalized bounding boxes', as
   const f = await fixture(browser)
   try {
     const { page } = f
+    await page.setViewportSize({ width: 1440, height: 900 })
     await openVision(page)
     const dataset = page.getByRole('region', { name: 'Vision dataset' })
     await dataset.getByRole('button', { name: 'Load box detection sample' }).click()
     const canvas = dataset.getByLabel('Image annotation canvas').locator('.vision-frame')
     await canvas.getByRole('img').scrollIntoViewIfNeeded()
     const frame = (await canvas.boundingBox())!
-    expect(frame.width).toBeGreaterThan(400)
+    expect(frame.width).toBeGreaterThan(350)
     await page.mouse.move(frame.x + frame.width * 0.69, frame.y + frame.height * 0.67)
     await page.mouse.down()
     await page.mouse.move(frame.x + frame.width * 0.84, frame.y + frame.height * 0.81, { steps: 5 })
@@ -471,24 +472,37 @@ test('vision studio trains a boxed dataset on a real browser worker and reloads 
     await expect(datasetStage).toBeVisible()
     await expect(trainingStage).toBeHidden()
     await expect(deployStage).toBeHidden()
-    await expect(page.getByRole('complementary', { name: 'Application context' })).toBeHidden()
-    if (process.env.MESH_TEST_PREVIEW) {
-      await page.setViewportSize({ width: 1440, height: 1000 })
+    const context = page.getByRole('complementary', { name: 'Application context' })
+    const workers = context.getByRole('region', { name: 'Vision compute' })
+    await expect(workers.getByRole('button', { name: 'Start ML worker' })).toBeVisible()
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 1280, height: 800 }]) {
+      await page.setViewportSize(viewport)
       await page.evaluate(() => window.scrollTo(0, 0))
-      await page.screenshot({ path: 'test-results-ui/vision-labeling-desktop.png', fullPage: true })
+      const [editor, sidebar, thumbnails] = await Promise.all([
+        datasetStage.locator('.vision-editor').boundingBox(),
+        context.boundingBox(),
+        datasetStage.getByRole('group', { name: 'Dataset images' }).boundingBox(),
+      ])
+      expect(editor!.x + editor!.width).toBeLessThan(sidebar!.x)
+      expect(thumbnails!.y + thumbnails!.height).toBeLessThanOrEqual(viewport.height)
+    }
+    await page.setViewportSize({ width: 1440, height: 900 })
+    if (process.env.MESH_TEST_PREVIEW) {
+      await page.evaluate(() => window.scrollTo(0, 0))
+      await page.screenshot({ path: 'test-results-ui/vision-labeling-fit.png' })
     }
     await studio.getByRole('button', { name: 'Continue to training' }).click()
     await expect(datasetStage).toBeHidden()
     await expect(trainingStage).toBeVisible()
     await expect(studio.getByText('6 training images · 2 validation images', { exact: true })).toBeVisible()
-    await studio.getByRole('button', { name: 'Start ML worker' }).click()
+    await workers.getByRole('button', { name: 'Start ML worker' }).click()
     await studio.getByRole('button', { name: 'Train detector on cluster' }).click()
     await expect(studio.getByTestId('detection-validation')).toContainText('Held-out detection', { timeout: 240_000 })
     console.log('Vision sample:', await studio.getByTestId('detection-validation').innerText())
     await expect(studio.getByText('Detector draft · 1 contributing browser', { exact: false })).toBeVisible()
     if (process.env.MESH_TEST_PREVIEW) {
       await page.evaluate(() => window.scrollTo(0, 0))
-      await page.screenshot({ path: 'test-results-ui/vision-training-desktop.png' })
+      await page.screenshot({ path: 'test-results-ui/vision-training-fit.png' })
     }
     await trainingStage.getByRole('button', { name: 'Review detector' }).click()
     await expect(trainingStage).toBeHidden()
@@ -512,11 +526,18 @@ test('vision studio trains a boxed dataset on a real browser worker and reloads 
     await expect(studio.getByRole('button', { name: 'Detect objects on cluster' })).toBeEnabled()
     await studio.getByRole('button', { name: 'Detect objects on cluster' }).click()
     await expect(studio.getByText('Detection complete using the deployed revision.', { exact: true })).toBeVisible({ timeout: 120_000 })
-    await studio.getByRole('button', { name: 'Stop ML worker' }).click()
+    await workers.getByRole('button', { name: 'Stop ML worker' }).click()
     await expect(deployStage.getByRole('img', { name: 'new-test.jpg' })).toBeVisible()
+    await page.evaluate(() => window.scrollTo(0, 0))
+    const [preview, upload] = await Promise.all([
+      deployStage.getByRole('region', { name: 'Test preview' }).boundingBox(),
+      deployStage.getByRole('region', { name: 'Test on new image' }).boundingBox(),
+    ])
+    expect(preview!.x + preview!.width).toBeLessThan(upload!.x)
+    expect(preview!.y + preview!.height).toBeLessThanOrEqual(900)
     if (process.env.MESH_TEST_PREVIEW) {
       await page.evaluate(() => window.scrollTo(0, 0))
-      await page.screenshot({ path: 'test-results-ui/vision-deploy-desktop.png', fullPage: true })
+      await page.screenshot({ path: 'test-results-ui/vision-deploy-fit.png' })
     }
     await page.setViewportSize({ width: 390, height: 844 })
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true)
