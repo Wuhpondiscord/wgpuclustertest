@@ -167,7 +167,7 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
     })
     await expect(panel.getByText('Workflow preview', { exact: true })).toBeVisible()
     await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
-    await expect(panel.getByText(uploaded.name, { exact: true })).toBeVisible()
+    await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(uploaded.name, { exact: true })).toBeVisible()
 
     const sha = 'a'.repeat(40)
     const repository = 'mesh-test/workflow'
@@ -189,7 +189,7 @@ test('the built-in sample runs on a contributor and can be replaced by an upload
     await panel.getByText('Workflow preview', { exact: true }).click()
     await expect(panel.getByText(sha, { exact: true })).toBeVisible()
     await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
-    await expect(panel.getByText(imported.name, { exact: true })).toBeVisible()
+    await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(imported.name, { exact: true })).toBeVisible()
     const replacement = await api<{ id: string; source: unknown }>(`/api/applications/${f.app.id}/deployment`)
     expect(replacement.id).not.toBe(saved.id)
     expect(replacement.source).toEqual({ kind: 'github', repository, commit: sha })
@@ -349,7 +349,7 @@ test('application studio separates cluster controls and edits deployed workflow 
     await panel.getByLabel('Workflow JSON').fill(JSON.stringify(updated))
     await panel.getByRole('button', { name: 'Preview changes' }).click()
     await panel.getByRole('button', { name: 'Publish revision', exact: true }).click()
-    await expect(panel.getByText(updated.name, { exact: true })).toBeVisible()
+    await expect(panel.locator('.deployment-row').filter({ hasText: 'Published' }).getByText(updated.name, { exact: true })).toBeVisible()
     const after = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     expect(after.id).not.toBe(before.id)
     await panel.getByRole('button', { name: 'Edit deployed workflow' }).click()
