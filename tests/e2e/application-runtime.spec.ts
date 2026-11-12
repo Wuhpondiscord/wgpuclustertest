@@ -329,6 +329,14 @@ test('application studio separates cluster controls and edits deployed workflow 
     await panel.getByRole('button', { name: 'Load sample workflow' }).click()
     await panel.getByRole('button', { name: 'Save deployment', exact: true }).click()
     await expect(panel.getByRole('button', { name: 'Edit deployed workflow' })).toBeVisible()
+    const summary = page.getByRole('definition').filter({ hasText: 'Numerical checks' })
+    await expect(summary).toBeVisible()
+    await expect(page.getByRole('complementary', { name: 'Application context' }).getByRole('link', { name: 'application runtime e2e' })).toHaveAttribute('href', new RegExp(`cluster=${f.cluster.id}`))
+    if (process.env.MESH_TEST_PREVIEW) {
+      await page.setViewportSize({ width: 1440, height: 1000 })
+      await page.evaluate(() => window.scrollTo(0, 0))
+      await page.screenshot({ path: 'test-results-ui/applications-desktop.png' })
+    }
     const before = await api<{ id: string }>(`/api/applications/${f.app.id}/deployment`)
     await panel.getByRole('button', { name: 'Edit deployed workflow' }).click()
     const updated = { ...manifest, name: 'Edited numerical workflow' }

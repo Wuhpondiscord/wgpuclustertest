@@ -71,10 +71,11 @@ async function importFromGithub(value: string, ref: string): Promise<Candidate> 
   return { manifest, source: { kind: 'github', repository, commit } }
 }
 
-export function ApplicationDeployment({ appId, role, onQueued }: {
+export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChange }: {
   appId: string
   role: 'owner' | 'operator' | 'viewer'
   onQueued: (jobs: ApplicationJob[]) => void
+  onDeploymentChange: (summary: { appId: string; name?: string; revision?: string }) => void
 }) {
   const path = `/api/applications/${appId}/deployment`
   const [active, setActive] = useState<Deployment | null>(null)
@@ -101,6 +102,10 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
     })
     return () => controller.abort()
   }, [path])
+
+  useEffect(() => {
+    if (loaded) onDeploymentChange({ appId, name: active?.manifest.name, revision: active?.id.slice(0, 8) })
+  }, [active, appId, loaded, onDeploymentChange])
 
   async function perform(action: () => Promise<void>) {
     if (busy) return
@@ -151,22 +156,12 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
     setMessage(`Queued ${jobs.length} workflow job${jobs.length === 1 ? '' : 's'}.`)
   }
 
-  return <section className="deployment-panel" aria-label="Application deployment">
-    <h3>Workflow deployment</h3>
-    <p>A <code>mesh.json</code> manifest defines up to eight independent jobs using vector add, matrix multiply, or text embeddings. Save a deployment, then run it on your approved cluster workers.</p>
+  return <section className="deployment-panel workspace-panel" aria-label="Application deployment">
+    <div className="workspace-panel-heading"><div><h3>Workflow deployment</h3><p>Preview a workflow definition, publish a revision, and run it on your cluster.</p></div></div>
     {error && <p role="alert" className="feedback error">{error}</p>}
     {message && <p role="status">{message}</p>}
-    {loaded && !active && <p>No workflow deployed.</p>}
-    {role === 'owner' && <div className="application-form">
-      <button className="manage-button" type="button" disabled={busy || !loaded} onClick={() => {
-        setError('')
-        setMessage('')
-        setEditor(null)
-        setCandidate({ manifest: template, source: { kind: 'upload' } })
-      }}>Load sample workflow</button>
-      <p>One contributing node is enough to run the sample. Expect <code>[4, 6]</code> from vector addition and <code>[19, 22, 43, 50]</code> from matrix multiplication.</p>
-    </div>}
-    {active && <article className="runtime-job">
+    {loaded && !active && <div className="deployment-empty">No workflow deployed.</div>}
+    {active && <article className="runtime-job deployed-workflow">
       <div className="application-title"><strong>{active.manifest.name}</strong><span className="published-chip">Deployed</span></div>
       <p>{active.manifest.jobs.length} jobs · {active.source.kind === 'github' ? `${active.source.repository} @ ${active.source.commit.slice(0, 12)}` : 'Local manifest'}</p>
       <p>Revision <code>{active.id.slice(0, 8)}</code> · Saved {new Date(active.deployed_at_ms).toLocaleString()}</p><details><summary>View deployed manifest</summary><pre>{JSON.stringify(active.manifest, null, 2)}</pre></details>
@@ -191,6 +186,15 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
     </section>}
     {role === 'owner' && <details open={!active || !!candidate}>
       <summary>{active ? 'Replace deployment' : 'Upload or import a workflow'}</summary>
+    {role === 'owner' && <div className="application-form">
+      <button className="manage-button" type="button" disabled={busy || !loaded} onClick={() => {
+        setError('')
+        setMessage('')
+        setEditor(null)
+        setCandidate({ manifest: template, source: { kind: 'upload' } })
+      }}>Load sample workflow</button>
+      <p>One contributing node is enough to run the sample. Expect <code>[4, 6]</code> from vector addition and <code>[19, 22, 43, 50]</code> from matrix multiplication.</p>
+    </div>}
       <div className="application-form">
         <a download="mesh.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(template, null, 2))}`}>Download example mesh.json</a>
         <label>Upload mesh.json<input type="file" accept=".json,application/json" disabled={busy || !loaded} onChange={event => {
@@ -213,7 +217,7 @@ export function ApplicationDeployment({ appId, role, onQueued }: {
         <button type="submit" className="manage-button" disabled={busy || !loaded}>Preview GitHub workflow</button>
       </form>
       {candidate && <div className="runtime-job">
-        <strong>Workflow preview</strong>
+        <div className="application-title"><strong>Workflow preview</strong><span className="context-chip">Draft</span></div>
         {candidate.source.kind === 'github' && <p>{candidate.source.repository} @ <code>{candidate.source.commit}</code></p>}
         <pre>{JSON.stringify(candidate.manifest, null, 2)}</pre>
         <button type="button" className="manage-button primary" disabled={busy} onClick={() => void perform(deploy)}>{active ? 'Replace deployment' : 'Save deployment'}</button>

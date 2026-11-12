@@ -1,5 +1,5 @@
 import { createPortal } from 'react-dom'
-import { Boxes, ChevronDown, FileCode2, Image as ImageIcon, LockKeyhole, Settings2, Users } from 'lucide-react'
+import { Activity, ArrowLeft, Boxes, ChevronDown, FileCode2, Image as ImageIcon, Link2, LockKeyhole, Monitor, Settings2, Users } from 'lucide-react'
 import { prepareAvatar } from './profile-picture'
 import { ApplicationRuntime } from './ApplicationRuntime'
 import { VisionStudio } from './VisionStudio'
@@ -32,6 +32,8 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
 }) {
   const [account, setAccount] = useState<Account | null>(null)
   const [applications, setApplications] = useState<Application[]>([])
+  const [runtimeSummary, setRuntimeSummary] = useState<{ appId: string; activeRuns: number } | null>(null)
+  const [deploymentSummary, setDeploymentSummary] = useState<{ appId: string; name?: string; revision?: string } | null>(null)
   const [studioTab, setStudioTab] = useState<'workflows' | 'vision' | 'access'>('workflows')
   const [editName, setEditName] = useState('')
   const [selected, setSelected] = useState<Application | null>(null)
@@ -161,6 +163,10 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
     </button>
     : <div className="header-auth"><button className="manage-button small" onClick={() => openMode('login')}>Sign in</button><button className="manage-button small primary" onClick={() => openMode('signup')}>Create account</button></div>
   const compute = clusters.find(cluster => cluster.id === (selected?.cluster_id ?? clusterId))
+  const deployment = deploymentSummary?.appId === selected?.id ? deploymentSummary : null
+  const activeRuns = runtimeSummary?.appId === selected?.id ? runtimeSummary?.activeRuns : undefined
+  const viewers = selected?.members.filter(item => item.role === 'viewer').length ?? 0
+  const operators = selected?.members.filter(item => item.role === 'operator').length ?? 0
   const currentTab = studioTab === 'access' && selected?.role !== 'owner' ? 'workflows' : studioTab
   const tools = [
     { id: 'workflows', label: 'Workflows & runs', icon: FileCode2 },
@@ -171,10 +177,11 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
     {profileSlot && createPortal(controls, profileSlot)}
     {error && !mode && <p className="feedback error" role="alert">{error}</p>}
     {notice && mode !== 'profile' && <p role="status" className="feedback success">{notice}</p>}
-    <div className="application-content" hidden={workspace !== 'applications'}>
+    {workspace === 'applications' && !appRoute && !selected && <header className="workspace-intro"><h1>Applications</h1><p>Choose an application to manage its workflows, runs, and detectors.</p></header>}
+    <div className="application-content" data-view={currentTab} data-app-selected={Boolean(selected)} hidden={workspace !== 'applications'}>
       <aside className="application-rail">
-        <h2>{appRoute ? 'Application' : 'Your applications'}</h2>
-        {appRoute && <a className="rail-back" href="/#applications">All applications</a>}
+        {appRoute ? <a className="rail-back" href="/#applications"><ArrowLeft size={15}/>All applications</a> : <h2>Your applications</h2>}
+        {appRoute && selected && <div className="selected-app-name"><Boxes size={18}/><span><b>{selected.name}</b><small><LockKeyhole size={12}/>Private application</small></span></div>}
         {clusterPicker}
         {clusterId && <div className="application-links">{applications.map(app => <button key={app.id} className="app-list-button" aria-pressed={selected?.id === app.id} onClick={() => { if (app.id === selected?.id) return; setSelected(app); setDeleteConfirmed(false); setStudioTab('workflows') }}><Boxes size={16}/><span>{app.name} · {app.role}</span></button>)}{!applications.length && <p>No applications shared with this account.</p>}</div>}
         {account?.activated && clusterId && <details open={!applications.length}><summary>Create an application</summary><form className="application-form" onSubmit={event => void create(event)}><label>Application name<input required maxLength={80} value={name} onChange={e => setName(e.target.value)}/></label><label>Application slug<input required pattern="[a-z0-9][a-z0-9-]{1,30}[a-z0-9]" value={appSlug} onChange={e => setSlug(e.target.value)} placeholder="my-app" aria-describedby="application-slug-hint"/></label><p id="application-slug-hint">Suggested from the name. You can edit this part of the project URL.</p><button className="manage-button primary" disabled={busy}>Create private application</button></form></details>}
@@ -183,30 +190,31 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
             <button key={id} type="button" className="app-list-button" aria-pressed={currentTab === id} onClick={() => setStudioTab(id)}><Icon size={16}/>{label}</button>
           )}
         </nav>}
-        {compute && <div className="compute-context"><span>Compute source</span><b>{compute.name}</b><small>{compute.online_nodes} online / {compute.nodes} registered</small></div>}
+
       </aside>
       {!selected && <div className="application-empty resource-card"><Boxes size={26}/><h3>{appRoute ? 'Private application' : 'Applications'}</h3>
         <p>{appRoute ? 'Sign in with an account that has access to this application.' : !clusterId ? 'Create or join a cluster before choosing an application.' : applications.length ? 'Select an application to manage workflows, runs, or a detector.' : 'Applications appear here when you create one or receive access.'}</p>
         {!clusterId && !appRoute && <a href="/#clusters">Open clusters</a>}
       </div>}
       {selected && <article className="application-detail">
-        <header className="application-overview resource-card">
-          <div><div className="application-title"><h3>{selected.name}</h3><span className="context-chip"><LockKeyhole size={13}/>Private</span></div>
-            <a href={selected.url}>{selected.url}</a>
-            <p>Private management page · Browser job runtime</p>
-          </div>
-          <div className="application-context">
-            <span><Users size={16}/><b>{selected.members.length}</b> {selected.members.length === 1 ? 'app member' : 'app members'}</span>
-          </div>
-          {selected.role !== 'viewer' && <div className="application-actions">
-            <button className="manage-button" disabled={busy} onClick={() => void run(() => startBrowser(selected.cluster_id))}>Contribute from this browser</button>
-            {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}>Share contributor link</button>}
-            {appRoute && <a href="/#clusters">Open cluster controls</a>}
-          </div>}
+        <header className="application-overview">
+          <p className="app-breadcrumb"><span>Applications</span><span aria-hidden="true">/</span><span>{currentTab === 'vision' ? 'Vision studio' : currentTab === 'access' ? 'Settings & access' : 'Workflows & runs'}</span></p>
+          <div className="application-title"><h3>{selected.name}</h3><span className="context-chip"><LockKeyhole size={13}/>Private</span></div>
+          <p className="application-location">Private management page · Browser job runtime</p>
+          <a className="app-permalink" href={selected.url}>{selected.url}</a>
+          {currentTab === 'vision' && compute && <a className="app-compute-link" href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}><Monitor size={14}/>{compute.name}</a>}
+          <dl className="app-metrics" aria-label="Application summary">
+            <div><dt><FileCode2 size={17}/>Workflow</dt><dd>{deployment ? deployment.name ?? 'None deployed' : '—'}</dd></div>
+            <div><dt><Boxes size={17}/>Deployed revision</dt><dd>{deployment?.revision ?? '—'}</dd></div>
+            <div><dt><Monitor size={17}/>Cluster workers</dt><dd>{compute ? `${compute.online_nodes} online / ${compute.nodes} registered` : '—'}</dd></div>
+            <div><dt><Activity size={17}/>Active application runs</dt><dd>{activeRuns ?? '—'}</dd></div>
+          </dl>
         </header>
+        <div className="application-body">
+        <div className="application-primary">
         <div hidden={currentTab !== 'vision'}><VisionStudio key={`vision-${selected.id}`} app={selected.id} role={selected.role} canShare={Boolean(selected.can_share_compute)}/></div>
         <div hidden={currentTab !== 'workflows'}>
-        <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role}/>
+        <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role} onRunsChange={setRuntimeSummary} onDeploymentChange={setDeploymentSummary}/>
         <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
         </div><div hidden={currentTab !== 'access'}>
         <div className="application-settings resource-card">
@@ -218,6 +226,30 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
           <div><label><input type="checkbox" checked={deleteConfirmed} onChange={event => setDeleteConfirmed(event.target.checked)}/>Confirm deletion of this application record</label><button className="manage-button danger" disabled={busy || !deleteConfirmed} onClick={() => void run(async () => { await api(`/api/applications/${selected.id}`, { method: 'DELETE' }); setSelected(null); setDeleteConfirmed(false); await refresh() })}>Delete application</button></div>
         </details>}
         </div></div>
+        </div>
+        <aside className="application-inspector" aria-label="Application context" hidden={currentTab === 'vision'}>
+          {compute && <section className="inspector-card">
+            <h4><Monitor size={17}/>Compute source</h4>
+            <a href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}>{compute.name}</a>
+            <p>{compute.online_nodes} online / {compute.nodes} registered</p>
+          </section>}
+          {selected.role !== 'viewer' && <section className="inspector-card">
+            <h4><Link2 size={17}/>Contributors</h4>
+            <p>Start this browser or invite someone you trust to run jobs.</p>
+            <button className="manage-button" disabled={busy} onClick={() => void run(() => startBrowser(selected.cluster_id))}>Contribute from this browser</button>
+            {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}>Share contributor link</button>}
+          </section>}
+          <section className="inspector-card">
+            <h4><Users size={17}/>App access</h4>
+            <dl className="access-counts">
+              <div><dt>Owners</dt><dd>{selected.members.length - viewers - operators}</dd></div>
+              <div><dt>Operators</dt><dd>{operators}</dd></div>
+              <div><dt>Viewers</dt><dd>{viewers}</dd></div>
+            </dl>
+            {selected.role === 'owner' && currentTab !== 'access' && <button className="manage-button" onClick={() => setStudioTab('access')}>Manage access</button>}
+          </section>
+        </aside>
+        </div>
       </article>}
     </div>
     {mode === 'profile' && account && <div className="dialog-shade"><section className="credentials-dialog profile-dialog" role="dialog" aria-modal="true" aria-label="Your profile">
