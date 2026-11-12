@@ -762,7 +762,9 @@ test('reconstructs a 2+1 checkpoint after one peer goes offline', async ({ brows
     await api(identities[0], `/api/nodes/${unavailable.node_id}/pause`, 'POST')
     await waitFor(async () => api<Array<{ id: string; paused: boolean }>>(identities[0], nodesPath),
       nodes => nodes.some(node => node.id === unavailable.node_id && node.paused), 'a shard peer to pause')
+    await openClusterView(peers[0].page, 'Workers')
     await expect(peers[0].page.locator('.node-row').filter({ hasText: 'Paused' })).toBeVisible()
+    await openClusterView(peers[0].page, 'Diagnostics')
     await peers[0].page.getByRole('button', { name: 'Test restore' }).click()
     await expect(peers[0].page.getByText(/Recovered batch 1 from 2 verified shard\(s\); full artifact SHA-256 matches\./)).toBeVisible({ timeout: 45_000 })
   } finally {
