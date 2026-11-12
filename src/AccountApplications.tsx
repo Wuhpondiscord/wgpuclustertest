@@ -1,11 +1,12 @@
 import { createPortal } from 'react-dom'
-import { Activity, ArrowLeft, Boxes, ChevronDown, FileCode2, Image as ImageIcon, Link2, LockKeyhole, Monitor, Play, Settings2, Users } from 'lucide-react'
+import { Activity, ArrowLeft, ArrowRight, Boxes, ChevronDown, FileCode2, Image as ImageIcon, Link2, LockKeyhole, Monitor, Play, Settings2, Users } from 'lucide-react'
 import { prepareAvatar } from './profile-picture'
 import { ApplicationRuntime } from './ApplicationRuntime'
 import { VisionOverview, VisionStudio, type VisionStage, type VisionStageRequest, type VisionSummary } from './VisionStudio'
 import { ImageBatchRuntime } from './ImageBatchRuntime'
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { api, setIdentity } from './api'
+import { WorkspaceRail } from './WorkspaceRail'
 
 type Account = { username: string; activated: boolean; recovery_session?: boolean; two_factor_enabled: boolean; recovery_codes_remaining: number; avatar?: string | null }
 type Application = { id: string; cluster_id: string; name: string; slug: string; owner: string; url: string; role: 'owner' | 'operator' | 'viewer'; members: Array<{ username: string; role: string }>; runtime_status: string; can_share_compute?: boolean }
@@ -21,11 +22,12 @@ type Setup = { secret: string; challenge: string; uri: string }
 const clearDeviceCredentials = () => {
   for (const key of ['mesh.node-tokens', 'mesh.remembered-node-tokens', 'mesh.contribution-settings']) { sessionStorage.removeItem(key); localStorage.removeItem(key) }
 }
-export function AccountApplications({ clusterId, changed, startBrowser, shareCompute, clusters, clusterPicker, workspace = 'applications' }: {
+export function AccountApplications({ clusterId, changed, startBrowser, shareCompute, clusters, clusterPicker, status, workspace = 'applications' }: {
   workspace?: 'clusters' | 'applications'
   clusterId?: string
   clusters: ComputeCluster[]
   clusterPicker?: ReactNode
+  status?: ReactNode
   changed: () => void
   startBrowser: (clusterId: string) => Promise<void>
   shareCompute: (appId: string, clusterId: string) => Promise<void>
@@ -182,92 +184,181 @@ export function AccountApplications({ clusterId, changed, startBrowser, shareCom
     setStudioTab('vision')
   }
   const currentVision = visionSummary?.appId === selected?.id ? visionSummary : null
-  return <section className="account-applications" aria-label="Account and private applications">
-    {profileSlot && createPortal(controls, profileSlot)}
+  const clusterUrl = compute && `/?cluster=${encodeURIComponent(compute.id)}#clusters`
+  const accountFeedback = <>
     {error && !mode && <p className="feedback error" role="alert">{error}</p>}
     {notice && mode !== 'profile' && <p role="status" className="feedback success">{notice}</p>}
-    {workspace === 'applications' && !appRoute && !selected && <header className="workspace-intro"><h1>Applications</h1><p>Choose an application to manage its workflows, runs, and detectors.</p></header>}
-    <div className="application-content" data-view={currentTab} data-app-selected={Boolean(selected)} hidden={workspace !== 'applications'}>
-      <aside className="application-rail">
-        {appRoute ? <a className="rail-back" href="/#applications"><ArrowLeft size={15}/>All applications</a> : <h2>Your applications</h2>}
-        {appRoute && selected && <div className="selected-app-name"><Boxes size={18}/><span><b>{selected.name}</b><small><LockKeyhole size={12}/>Private application</small></span></div>}
-        {clusterPicker}
-        {clusterId && <div className="application-links">{applications.map(app => <button key={app.id} className="app-list-button" aria-pressed={selected?.id === app.id} onClick={() => { if (app.id === selected?.id) return; setSelected(app); setDeleteConfirmed(false); setStudioTab('workflows') }}><Boxes size={16}/><span>{app.name} · {app.role}</span></button>)}{!applications.length && <p>No applications shared with this account.</p>}</div>}
-        {account?.activated && clusterId && <details open={!applications.length}><summary>Create an application</summary><form className="application-form" onSubmit={event => void create(event)}><label>Application name<input required maxLength={80} value={name} onChange={e => setName(e.target.value)}/></label><label>Application slug<input required pattern="[a-z0-9][a-z0-9-]{1,30}[a-z0-9]" value={appSlug} onChange={e => setSlug(e.target.value)} placeholder="my-app" aria-describedby="application-slug-hint"/></label><p id="application-slug-hint">Suggested from the name. You can edit this part of the project URL.</p><button className="manage-button primary" disabled={busy}>Create private application</button></form></details>}
-        {selected && <nav className="studio-tabs" aria-label="Application tools">
-          {tools.filter(tool => tool.id !== 'access' || selected.role === 'owner').map(({ id, label, icon: Icon }) =>
-            <button key={id} type="button" className="app-list-button" aria-pressed={currentTab === id} onClick={() => setStudioTab(id)}><Icon size={16}/>{label}</button>
-          )}
-        </nav>}
+  </>
+  function openApplication(app: Application) {
+    setSelected(app)
+    setStudioTab('workflows')
+    setDeleteConfirmed(false)
+    setEditName('')
+    setMember('')
+    setError('')
+  }
 
-      </aside>
-      {!selected && <div className="application-empty resource-card"><Boxes size={26}/><h3>{appRoute ? 'Private application' : 'Applications'}</h3>
-        <p>{appRoute ? 'Sign in with an account that has access to this application.' : !clusterId ? 'Create or join a cluster before choosing an application.' : applications.length ? 'Select an application to manage workflows, runs, or a detector.' : 'Applications appear here when you create one or receive access.'}</p>
-        {!clusterId && !appRoute && <a href="/#clusters">Open clusters</a>}
-      </div>}
-      {selected && <article className="application-detail">
-        <header className="application-overview">
-          <div className="application-title">
-            <h3>{selected.name}</h3>
-            <span className="context-chip"><LockKeyhole size={13}/>Private</span>
-            <a className="app-permalink" href={selected.url} aria-label="Open application URL" title="Open application URL"><Link2 size={16}/></a>
+  return <section className="account-applications" aria-label="Account and private applications">
+    {profileSlot && createPortal(controls, profileSlot)}
+    {workspace === 'clusters' && (error || notice) && <div className="workspace-global-feedback">{accountFeedback}</div>}
+    <div className="workspace-shell applications-workspace" hidden={workspace !== 'applications'}>
+      <WorkspaceRail label="Application menu">{close => <>
+        {appRoute ? <a className="workspace-rail-item rail-back" href="/#applications"><ArrowLeft size={17}/>All applications</a> : selected
+          ? <button className="workspace-rail-item rail-back" type="button" onClick={() => { setSelected(null); setError(''); close() }}><ArrowLeft size={17}/>All applications</button>
+          : <div className="workspace-rail-label">Applications</div>}
+        {selected ? <>
+          <div className="workspace-identity">
+            <span className="workspace-identity-icon"><Boxes size={20}/></span>
+            <span className="workspace-identity-name"><b>{selected.name}</b><small><LockKeyhole size={12}/>Private</small></span>
           </div>
-          {compute && <p className="application-location">Compute cluster <a className="app-compute-link" href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}>{compute.name}</a></p>}
-          <dl className="app-metrics" aria-label="Application summary">
-            <div><dt><FileCode2 size={17}/>Workflow</dt><dd>{deployment ? deployment.name ?? 'None deployed' : '—'}</dd></div>
-            <div><dt><Boxes size={17}/>Deployed revision</dt><dd>{deployment?.revision ?? '—'}</dd></div>
-            <div><dt><Monitor size={17}/>Cluster workers</dt><dd>{compute ? `${compute.online_nodes} online / ${compute.nodes} registered` : '—'}</dd></div>
-            <div><dt><Users size={17}/>Access status</dt><dd>{viewers} viewers · {operators} operators</dd></div>
-          </dl>
+          <nav className="workspace-rail-nav" aria-label="Application tools">
+            {tools.filter(tool => tool.id !== 'access' || selected.role === 'owner').map(({ id, label, icon: Icon }) =>
+              <button key={id} type="button" className="workspace-rail-item" aria-pressed={currentTab === id}
+                onClick={() => { setStudioTab(id); close() }}><Icon size={18}/>{label}</button>)}
+          </nav>
+        </> : clusterPicker}
+      </>}</WorkspaceRail>
+
+      <article className={`workspace-detail${selected ? ' with-context' : ''}`}>
+        <header className="workspace-overview">
+          <div className="workspace-title">
+            <h1>{selected?.name ?? (appRoute ? 'Private application' : 'Applications')}</h1>
+            {selected && <>
+              <span className="context-chip"><LockKeyhole size={13}/>Private</span>
+              <a className="workspace-permalink" href={selected.url} aria-label="Open application URL" title="Open application URL"><Link2 size={16}/></a>
+            </>}
+          </div>
+          {selected ? <>
+            {compute && <p>Compute cluster <a href={clusterUrl}>{compute.name}</a></p>}
+            <dl className="workspace-metrics" aria-label="Application summary">
+              <div><dt><FileCode2 size={21}/>Workflow</dt><dd>{deployment ? deployment.name ?? 'None deployed' : '—'}</dd></div>
+              <div><dt><Boxes size={21}/>Deployment</dt><dd>{deployment?.revision ?? '—'}</dd></div>
+              <div><dt><Monitor size={21}/>Cluster workers</dt><dd>{compute ? `${compute.nodes} registered / ${compute.online_nodes} online` : '—'}</dd></div>
+              <div><dt><Users size={21}/>Access status</dt><dd>{viewers} viewers · {operators} operators</dd></div>
+            </dl>
+          </> : !appRoute && compute && <p>Compute cluster <a href={clusterUrl}>{compute.name}</a></p>}
         </header>
-        <div className="application-body">
-        <div className="application-primary">
-        <div hidden={currentTab !== 'vision'}><VisionStudio key={`vision-${selected.id}`} app={selected.id} role={selected.role} canShare={Boolean(selected.can_share_compute)} stageRequest={visionRequest} onSummary={setVisionSummary}/></div>
-        <div hidden={currentTab !== 'workflows' && currentTab !== 'runs'}>
-          <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role}
-            view={currentTab === 'runs' ? 'runs' : 'workflows'}
-            onShowRuns={() => setStudioTab('runs')}
-            onRunsChange={setRuntimeSummary} onDeploymentChange={setDeploymentSummary}
-            visionOverview={<VisionOverview summary={currentVision} role={selected.role} openStage={openVisionStage}/>}/>
-          <div hidden={currentTab !== 'runs'}>
-            <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
-          </div>
-        </div><div hidden={currentTab !== 'access'}>
-        <div className="application-settings resource-card">
-        <h3>Settings &amp; access</h3>
-        <p>Application members: {selected.members.map(item => `${item.username} (${item.role})`).join(', ')}</p>
-        {selected.role === 'owner' && <form className="application-form" onSubmit={event => { event.preventDefault(); void run(async () => { setSelected(await api<Application>(`/api/applications/${selected.id}`, { method: 'PATCH', body: JSON.stringify({ name: editName, expected_name: selected.name }) })); setEditName(''); await refresh() }) }}><label>New application name<input required maxLength={80} value={editName} onChange={event => setEditName(event.target.value)}/></label><button className="manage-button" disabled={busy || !editName.trim()}>Save application name</button><p>The application URL stays the same.</p></form>}
-        {selected.role === 'owner' && <details><summary>Manage application access</summary><form className="application-form" onSubmit={event => { event.preventDefault(); void run(async () => { setSelected(await api<Application>(`/api/applications/${selected.id}/members`, { method: 'POST', body: JSON.stringify({ username: member, role }) })); setMember(''); await refresh() }) }}><label>Member username<input required value={member} onChange={event => setMember(event.target.value)}/></label><label>Application role<select value={role} onChange={event => setRole(event.target.value as 'viewer' | 'operator')}><option value="viewer">Viewer</option><option value="operator">Operator</option></select></label><button className="manage-button" disabled={busy}>Grant application access</button></form>
-          {selected.members.filter(m => m.role !== 'owner').map(m => <button key={m.username} className="manage-button small" disabled={busy} onClick={() => void run(async () => { await api(`/api/applications/${selected.id}/members/${encodeURIComponent(m.username)}`, { method: 'DELETE' }); setSelected(await api<Application>(`/api/applications/${selected.id}`)); await refresh() })}>Revoke {m.username}</button>)}
-          <div><label><input type="checkbox" checked={deleteConfirmed} onChange={event => setDeleteConfirmed(event.target.checked)}/>Confirm deletion of this application record</label><button className="manage-button danger" disabled={busy || !deleteConfirmed} onClick={() => void run(async () => { await api(`/api/applications/${selected.id}`, { method: 'DELETE' }); setSelected(null); setDeleteConfirmed(false); await refresh() })}>Delete application</button></div>
-        </details>}
-        </div></div>
+        <div className="workspace-primary">
+          {status}
+          {accountFeedback}
+          {!selected ? (
+            <>
+              {applications.length > 0 && !appRoute ? <section className="workspace-panel" aria-label="Your applications">
+                <div className="workspace-panel-heading"><div><h2>Your applications</h2><p>Open a private application to manage its deployments and runs.</p></div></div>
+                <div className="application-directory">
+                  {applications.map(app => <button className="application-directory-item" type="button" key={app.id} onClick={() => openApplication(app)}>
+                    <span className="workspace-identity-icon"><Boxes size={19}/></span>
+                    <span><strong>{app.name}</strong><small> · {app.role}</small></span>
+                    <span className="directory-open" aria-hidden="true"><ArrowRight size={18}/></span>
+                  </button>)}
+                </div>
+              </section> : <section className="workspace-panel workspace-empty">
+                <span className="workspace-empty-icon"><Boxes size={27}/></span>
+                <h2>{appRoute ? 'Application access' : 'Your applications'}</h2>
+                <p>{appRoute ? 'Sign in with an account that has access to this application.' : !clusterId
+                  ? 'Create or join a cluster to manage applications that use its compute.'
+                  : !account?.activated ? 'Sign in to see applications shared with your account.' : 'This cluster has no applications shared with your account.'}</p>
+                {!clusterId && !appRoute && <a className="manage-button primary" href="/#clusters">Open clusters</a>}
+                {appRoute && !account && <button className="manage-button primary" type="button" onClick={() => openMode('login')}>Sign in to open this application</button>}
+              </section>}
+              {account?.activated && clusterId && !appRoute && <details className="workspace-panel application-create" open={!applications.length || undefined}>
+                <summary>Create an application</summary>
+                <form className="application-form" onSubmit={event => void create(event)}>
+                  <label>Application name<input required maxLength={80} value={name} onChange={event => setName(event.target.value)}/></label>
+                  <label>Application slug<input required pattern="[a-z0-9][a-z0-9-]{1,30}[a-z0-9]" value={appSlug} onChange={event => setSlug(event.target.value)} placeholder="my-app" aria-describedby="application-slug-hint"/></label>
+                  <p id="application-slug-hint">Suggested from the name. You can edit this part of the project URL.</p>
+                  <button className="manage-button primary" disabled={busy}>Create private application</button>
+                </form>
+              </details>}
+            </>
+          ) : <>
+            <div hidden={currentTab !== 'vision'}><VisionStudio key={`vision-${selected.id}`} app={selected.id} role={selected.role} canShare={Boolean(selected.can_share_compute)} stageRequest={visionRequest} onSummary={setVisionSummary}/></div>
+            <div hidden={currentTab !== 'workflows' && currentTab !== 'runs'}>
+              <ApplicationRuntime key={selected.id} appId={selected.id} role={selected.role}
+                view={currentTab === 'runs' ? 'runs' : 'workflows'}
+                onShowRuns={() => setStudioTab('runs')}
+                onRunsChange={setRuntimeSummary} onDeploymentChange={setDeploymentSummary}
+                visionOverview={<VisionOverview summary={currentVision} role={selected.role} openStage={openVisionStage}/>}/>
+              <div hidden={currentTab !== 'runs'}>
+                <ImageBatchRuntime key={`images-${selected.id}`} app={selected.id} canSubmit={selected.role !== 'viewer'} canShare={Boolean(selected.can_share_compute)}/>
+              </div>
+            </div>
+            {selected.role === 'owner' && <div className="app-access-settings" hidden={currentTab !== 'access'}>
+              <section className="workspace-panel" aria-label="Application access">
+                <div className="workspace-panel-heading"><div><h2>Application access</h2><p>Grant dashboard access to an existing Mesh account.</p></div></div>
+                <div className="application-member-list">
+                  {selected.members.map(item => <div className="member-row" key={item.username}>
+                    <Avatar username={item.username}/><span className="node-name"><b>@{item.username}</b></span><span className={`role-chip ${item.role}`}>{item.role}</span>
+                    {item.role !== 'owner' && <button className="manage-button small" disabled={busy} onClick={() => void run(async () => {
+                      await api(`/api/applications/${selected.id}/members/${encodeURIComponent(item.username)}`, { method: 'DELETE' })
+                      setSelected(await api<Application>(`/api/applications/${selected.id}`))
+                      await refresh()
+                    })}>Revoke {item.username}</button>}
+                  </div>)}
+                </div>
+                <form className="application-form access-form" onSubmit={event => { event.preventDefault(); void run(async () => {
+                  setSelected(await api<Application>(`/api/applications/${selected.id}/members`, { method: 'POST', body: JSON.stringify({ username: member, role }) }))
+                  setMember('')
+                  await refresh()
+                }) }}>
+                  <label>Member username<input required value={member} onChange={event => setMember(event.target.value)}/></label>
+                  <label>Application role<select value={role} onChange={event => setRole(event.target.value as 'viewer' | 'operator')}><option value="viewer">Viewer</option><option value="operator">Operator</option></select></label>
+                  <button className="manage-button primary" disabled={busy}>Grant application access</button>
+                </form>
+              </section>
+              <section className="workspace-panel" aria-label="Application settings">
+                <div className="workspace-panel-heading"><div><h2>Application settings</h2><p>Rename your application and find its private URL.</p></div></div>
+                <form className="application-form access-form" onSubmit={event => { event.preventDefault(); void run(async () => {
+                  setSelected(await api<Application>(`/api/applications/${selected.id}`, { method: 'PATCH', body: JSON.stringify({ name: editName, expected_name: selected.name }) }))
+                  setEditName('')
+                  await refresh()
+                }) }}>
+                  <label>New application name<input required maxLength={80} value={editName} onChange={event => setEditName(event.target.value)}/></label>
+                  <button className="manage-button" disabled={busy || !editName.trim()}>Save application name</button>
+                </form>
+                <div className="application-url"><a href={selected.url}>{selected.url}</a></div>
+                <details className="application-delete">
+                  <summary>Delete application</summary>
+                  <label><input type="checkbox" checked={deleteConfirmed} onChange={event => setDeleteConfirmed(event.target.checked)}/>Confirm deletion of this application record</label>
+                  <button className="manage-button danger" disabled={busy || !deleteConfirmed} onClick={() => void run(async () => {
+                    await api(`/api/applications/${selected.id}`, { method: 'DELETE' })
+                    setSelected(null)
+                    setDeleteConfirmed(false)
+                    if (appRoute) location.assign('/#applications')
+                    else await refresh()
+                  })}>Delete application</button>
+                </details>
+              </section>
+            </div>}
+          </>}
         </div>
-        <aside className="application-inspector" aria-label="Application context" hidden={currentTab === 'vision'}>
+        {selected && <aside className="workspace-inspector application-inspector" aria-label="Application context">
           <section className="inspector-card">
-            <h4><Monitor size={17}/>Compute source</h4>
-            {compute && <><a href={`/?cluster=${encodeURIComponent(compute.id)}#clusters`}>{compute.name}</a>
-            <p>{compute.online_nodes} online / {compute.nodes} registered</p></>}
-            <div className="inspector-status"><Activity size={16}/><span>Active application runs</span><b>{activeRuns ?? '—'}</b></div>
+            <h2>Compute source</h2>
+            {compute ? <div className="inspector-identity"><Monitor size={21}/><a href={clusterUrl}>{compute.name}</a></div>
+              : <p>Cluster details are available to cluster members.</p>}
+            <div className="inspector-status"><Activity size={20}/><span>Active jobs<strong>{activeRuns ?? '—'}</strong></span></div>
           </section>
           {selected.role !== 'viewer' && <section className="inspector-card">
-            <h4><Link2 size={17}/>Contributor link</h4>
-            <p>Invite a trusted worker to contribute compute to this application.</p>
-            {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}><Link2 size={15}/>Share contributor link</button>}
-            <button className="manage-button" disabled={busy} onClick={() => void run(() => startBrowser(selected.cluster_id))}>Contribute from this browser</button>
+            <h2>Contributor link</h2>
+            <p>Invite a trusted worker to contribute compute to {compute?.name ?? 'this application'}.</p>
+            {selected.can_share_compute && <button className="manage-button" disabled={busy} onClick={() => void run(() => shareCompute(selected.id, selected.cluster_id))}><Link2 size={16}/>Share contributor link</button>}
+            {selected.can_share_compute && <p>Contributor permission is separate from app access.</p>}
+            <button className="manage-button" disabled={busy} onClick={() => void run(() => startBrowser(selected.cluster_id))}><Monitor size={16}/>Contribute from this browser</button>
           </section>}
           <section className="inspector-card">
-            <h4><Users size={17}/>App access</h4>
+            <h2>App access</h2>
+            <p>Who can use and manage this application.</p>
             <dl className="access-counts">
-              <div><dt>Owners</dt><dd>{selected.members.length - viewers - operators}</dd></div>
-              <div><dt>Operators</dt><dd>{operators}</dd></div>
-              <div><dt>Viewers</dt><dd>{viewers}</dd></div>
+              <div><dt><Users size={15}/>Viewers</dt><dd>{viewers}</dd></div>
+              <div><dt><Settings2 size={15}/>Operators</dt><dd>{operators}</dd></div>
+              <div><dt><LockKeyhole size={15}/>Owners</dt><dd>{selected.members.length - viewers - operators}</dd></div>
             </dl>
-            {selected.role === 'owner' && currentTab !== 'access' && <button className="manage-button" onClick={() => setStudioTab('access')}>Manage access</button>}
+            {selected.role === 'owner' && currentTab !== 'access' && <button className="manage-button" onClick={() => setStudioTab('access')}><Users size={16}/>Manage access</button>}
+            {selected.role !== 'owner' && <a href={selected.url}>Private application URL</a>}
           </section>
-        </aside>
-        </div>
-      </article>}
+        </aside>}
+      </article>
     </div>
     {mode === 'profile' && account && <div className="dialog-shade"><section className="credentials-dialog profile-dialog" role="dialog" aria-modal="true" aria-label="Your profile">
       <button className="dialog-close" aria-label="Close profile" disabled={busy} onClick={() => openMode(null)}>×</button>

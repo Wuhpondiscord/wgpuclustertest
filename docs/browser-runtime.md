@@ -11,7 +11,7 @@ private management pages, not DNS subdomains or always-on HTTP application serve
 2. Select **Contribute from this browser**, or select **Share contributor link**
    and send it to a friend. Your friend opens the link, clicks **Join and
    contribute**, and keeps the tab open. Guests can join without an account.
-3. Click **Run quick test**. Once a browser returns the verified answer, the
+3. Choose **Runs** in the application menu and click **Run quick test**. Once a browser returns the verified answer, the
    test displays `[5,7,9]`. Use the job form to try other inputs.
 4. For embeddings, choose **Text embeddings (ML)** and enter one text per line.
    On each worker, enable **ML inference** to allow the first job to download
@@ -22,18 +22,18 @@ A project contributor link can be created by the owner of both the app and its
 cluster. It grants cluster membership and permission to execute assigned work
 for that app. Workers receive the inputs they need to process, so share links
 with people you trust. Links expire after seven days and can be revoked under
-**Active invites**, which also removes the link's project compute access.
+**Clusters → Members & invites**, which also removes the link's project compute access.
 Cluster membership remains until separately removed. A regular cluster invite
 does not grant private app compute access. App management still uses named
 account roles, including operator access to submit jobs.
 
 ## Browser image batches
 
-Open a private app and expand **Image classification (ML)**. Start this browser
+Open **Runs** in a private app and expand **Image classification (ML)**. Start this browser
 or create an **ML contributor link** and share it with trusted friends. They can
 start a worker from the link without creating an account or registering a
 WebRTC node. The ML link grants access to assigned images for this project.
-It expires after seven days and can be revoked under **Active invites**.
+It expires after seven days and can be revoked under **Clusters → Members & invites**.
 
 Try a sample image or a 32-image batch, or upload up to 1,024 images. The
 submitting browser crops and resizes each image to 96 × 96 pixels. Workers

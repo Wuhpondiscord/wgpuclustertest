@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, getIdentity } from './api'
 import { imageLabels, imageSize, sampleImage } from './image-model'
+import { MeshBrand } from './WorkspaceNav'
 
 type Progress = { id: string; total: number; completed: number; failed: number; active: number; contributors: number }
 type ImageRow = {
@@ -75,9 +76,9 @@ export function ImageInvitePage({ token }: { token: string }) {
     return () => controller.abort()
   }, [token])
   return <div className="manage-app">
-    <header className="manage-top"><a className="manage-brand" href="/">mesh.</a></header>
-    <main className="manage-main">
-      <section className="resource-card" aria-label="ML contributor invitation">
+    <header className="manage-top"><MeshBrand/></header>
+    <main className="manage-main contributor-invite-main">
+      <section className="workspace-panel" aria-label="ML contributor invitation">
         <h1>{preview ? `Contribute to ${preview.application_name}` : 'ML contributor invitation'}</h1>
         {error && <p role="alert">{error}</p>}
         {!error && !preview && <p role="status">Checking the invite link…</p>}

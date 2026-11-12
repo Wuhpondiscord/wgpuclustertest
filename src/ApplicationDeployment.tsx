@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, Eye, Pencil, Play } from 'lucide-react'
+import { Check, Ellipsis, Eye, Pencil, Play, X } from 'lucide-react'
 import { api, ApiError } from './api'
 import type { ApplicationInput, ApplicationJob } from './application-types'
 import template from '../mesh.json'
@@ -91,6 +91,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const importDetails = useRef<HTMLDetailsElement>(null)
+  const deploymentActions = useRef<HTMLDetailsElement>(null)
   const pendingRun = useRef<{ revision: string; key: string } | null>(null)
 
   async function refresh(signal?: AbortSignal) {
@@ -165,7 +166,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
     ? draftManifest.name : 'Workflow draft'
 
   return <section className="deployment-panel workspace-panel" aria-label="Application deployment">
-    <div className="workspace-panel-heading"><div><h3>Deployments</h3><p>Publish a workflow revision and run it on your cluster.</p></div></div>
+    <div className="workspace-panel-heading"><div><h2>Deployments</h2><p>Publish a workflow revision and run it on your cluster.</p></div></div>
     {error && <p role="alert" className="feedback error">{error}</p>}
     {message && <p role="status" className="deployment-message">{message}</p>}
     {loaded && !active && !candidate && <div className="deployment-empty">
@@ -187,12 +188,28 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
           </div>
           <div className="deployment-actions">
             <button className="manage-button small" type="button" aria-expanded={showPublished} onClick={() => setShowPublished(value => !value)}><Eye size={15}/>{showPublished ? 'Close preview' : 'Preview'}</button>
-            {role !== 'viewer' && <button className="manage-button small" type="button" disabled={busy} onClick={() => void perform(() => run(active))}><Play size={14}/>Run deployment</button>}
-            {role === 'owner' && <button className="manage-button small" type="button" disabled={busy} onClick={() => {
-              setEditRevision(active.id)
-              setEditor(JSON.stringify(active.manifest, null, 2))
-              setCandidate(null)
-            }}><Pencil size={14}/>Edit deployed workflow</button>}
+            {role !== 'viewer' && <details className="deployment-menu" ref={deploymentActions}
+              onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false }}
+              onKeyDown={event => {
+                if (event.key === 'Escape' && event.currentTarget.open) {
+                  event.currentTarget.open = false
+                  event.currentTarget.querySelector('summary')?.focus()
+                }
+              }}>
+              <summary className="manage-button small" aria-label="Deployment actions" title="Deployment actions"><Ellipsis size={18}/></summary>
+              <div className="deployment-menu-options">
+                <button type="button" disabled={busy} onClick={() => {
+                  deploymentActions.current?.removeAttribute('open')
+                  void perform(() => run(active))
+                }}><Play size={15}/>Run deployment</button>
+                {role === 'owner' && <button type="button" disabled={busy} onClick={() => {
+                  deploymentActions.current?.removeAttribute('open')
+                  setEditRevision(active.id)
+                  setEditor(JSON.stringify(active.manifest, null, 2))
+                  setCandidate(null)
+                }}><Pencil size={15}/>Edit deployed workflow</button>}
+              </div>
+            </details>}
           </div>
         </div>
         {showPublished && <div className="deployment-expanded">
@@ -215,7 +232,7 @@ export function ApplicationDeployment({ appId, role, onQueued, onDeploymentChang
           <div className="deployment-ident"><strong>{draftName}</strong><small>Unpublished workflow</small></div>
           <div className="deployment-actions">
             <button type="button" className="manage-button primary small" disabled={busy} onClick={() => void perform(deploy)}>Publish revision</button>
-            <button type="button" className="manage-button small" disabled={busy} onClick={() => setCandidate(null)}>Discard preview</button>
+            <button type="button" className="manage-button small" aria-label="Discard preview" title="Discard preview" disabled={busy} onClick={() => setCandidate(null)}><X size={16}/></button>
           </div>
         </div>
         <details className="deployment-expanded">
