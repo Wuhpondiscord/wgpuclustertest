@@ -109,7 +109,7 @@ export function VisionCanvas({ image, classes, detections, editing }: {
     setPreview(null)
   }
   return <div className="vision-frame" data-tool={editing?.tool}
-    style={{ width: aspect ? `min(${zoom}%, ${aspect * 570 * zoom / 100}px)` : `${zoom}%` }}
+    style={{ width: aspect ? `min(${zoom}%, calc(var(--vision-fit-height, 460px) * ${aspect * zoom / 100}))` : `${zoom}%` }}
     onPointerDown={begin} onPointerMove={move} onPointerUp={finish} onPointerCancel={reset} onLostPointerCapture={reset}>
     <img draggable={false} src={image.data} alt={image.name} onLoad={event => {
       const img = event.currentTarget

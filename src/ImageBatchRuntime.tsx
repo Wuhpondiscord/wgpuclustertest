@@ -11,12 +11,11 @@ type ImageRow = {
 type Details = Progress & { results: ImageRow[] | null }
 const describe = (error: unknown) => error instanceof Error ? error.message : 'Image runtime request failed'
 
-export function ImageContributor({ app, invite, purpose = 'Contribute to image classification', secondary = false, onEnabledChange }: {
+export function ImageContributor({ app, invite, purpose = 'Contribute to image classification', compact = false }: {
   app: string
   invite?: string
   purpose?: string
-  secondary?: boolean
-  onEnabledChange?: (enabled: boolean) => void
+  compact?: boolean
 }) {
   const worker = useRef<Worker | null>(null)
   const [device] = useState(() => ({ id: crypto.randomUUID(), key: crypto.randomUUID() }))
@@ -24,7 +23,6 @@ export function ImageContributor({ app, invite, purpose = 'Contribute to image c
   const [enabled, setEnabled] = useState(false)
   const [message, setMessage] = useState('ML contribution is off')
   const [stopping, setStopping] = useState(false)
-  useEffect(() => { onEnabledChange?.(enabled) }, [enabled, onEnabledChange])
   useEffect(() => () => {
     worker.current?.terminate()
     worker.current = null
@@ -64,8 +62,9 @@ export function ImageContributor({ app, invite, purpose = 'Contribute to image c
   }
   return <section className="runtime-job" aria-label="Image worker">
     <strong>{purpose}</strong>
-    <p>This browser downloads about 15 MB of model weights plus the runtime on its first job. It uses WebGPU when available and can fall back to the CPU. Keep this tab open to contribute.</p>
-    <button type="button" className={enabled || secondary ? 'manage-button' : 'manage-button primary'} disabled={stopping} onClick={() => enabled ? stop() : void start()}>{enabled ? 'Stop ML worker' : 'Start ML worker'}</button>
+    <p>{compact ? 'Keep this tab open to run image jobs. The first job downloads the model and runtime.'
+      : 'This browser downloads about 15 MB of model weights plus the runtime on its first job. It uses WebGPU when available and can fall back to the CPU. Keep this tab open to contribute.'}</p>
+    <button type="button" className={enabled || compact ? 'manage-button' : 'manage-button primary'} disabled={stopping} onClick={() => enabled ? stop() : void start()}>{enabled ? 'Stop ML worker' : 'Start ML worker'}</button>
     <p role="status">{message}{enabled && ` · Worker ${device.id.slice(0, 8)}`}</p>
   </section>
 }

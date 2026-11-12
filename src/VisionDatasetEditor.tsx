@@ -92,8 +92,11 @@ export function VisionDatasetEditor({ images, classes, heldOut, busy, dirty, add
 
   return <section className="vision-stage" aria-label="Vision dataset">
     <div className="vision-stage-header">
-      <div><h3>Label images</h3><p>Draw a box around each object and assign its class.</p></div>
-      {files}
+      <h3>Label images</h3>
+      <div className="vision-stage-actions">
+        {files}
+        {current && <button type="button" className="manage-button primary" disabled={busy} onClick={onContinue}>Continue to training<ArrowRight size={16}/></button>}
+      </div>
     </div>
     {current ? <div className="vision-edit-grid">
       <div className="vision-editor">
@@ -126,12 +129,12 @@ export function VisionDatasetEditor({ images, classes, heldOut, busy, dirty, add
       </div>
       <aside className="vision-annotation-panel" aria-label="Dataset and annotations">
         <div className="vision-dataset-summary">
-          <h4>Dataset</h4>
-          <strong>{images.length} / 32 images</strong>
+          <h4>Dataset <span className="context-chip">{images.length} / 32 images</span></h4>
           <p>{images.length - heldOut} training · {heldOut} held out</p>
           {classes.length > 0 && <ul className="vision-class-list" aria-label="Object classes">
             {classes.map(item => <li key={item}><i style={{ background: classColor(item, classes) }}/>{item}</li>)}
           </ul>}
+          {dirty && <small>Local changes · export to keep your dataset.</small>}
         </div>
         <div className="vision-annotation-fields">
           <h4>Annotations <span className="context-chip">{current.boxes.length} / 16</span></h4>
@@ -176,9 +179,5 @@ export function VisionDatasetEditor({ images, classes, heldOut, busy, dirty, add
     </div> : <div className="vision-empty">
       <ImagePlus size={26}/><h4>Add your first images</h4><p>Choose JPEG, PNG, or WebP files, import an exported dataset, or try the built-in sample.</p>
     </div>}
-    <footer className="vision-stage-footer">
-      <small>{dirty ? 'Local changes · export to keep your dataset.' : images.length ? 'Dataset changes stay in this tab.' : 'Images stay in this tab until you start a run.'}</small>
-      <button type="button" className="manage-button primary" disabled={busy || !images.length} onClick={onContinue}>Continue to training<ArrowRight size={16}/></button>
-    </footer>
   </section>
 }
